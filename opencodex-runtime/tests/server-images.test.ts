@@ -21,6 +21,8 @@ import { installIsolatedCodexHome, type IsolatedCodexHome } from "./helpers/isol
 const previousApiToken = process.env.OPENCODEX_API_AUTH_TOKEN;
 const previousOpencodexHome = process.env.OPENCODEX_HOME;
 const previousImagesApiKey = process.env.OPENCODEX_TEST_IMAGES_API_KEY;
+const previousAntigravityClientId = process.env.GOOGLE_ANTIGRAVITY_CLIENT_ID;
+const previousAntigravityClientSecret = process.env.GOOGLE_ANTIGRAVITY_CLIENT_SECRET;
 const originalFetch = globalThis.fetch;
 const TEST_DIR = join(import.meta.dir, ".tmp-server-images-test");
 let isolatedCodexHome: IsolatedCodexHome | null = null;
@@ -32,6 +34,8 @@ beforeEach(() => {
   process.env.OPENCODEX_HOME = TEST_DIR;
   delete process.env.OPENCODEX_API_AUTH_TOKEN;
   process.env.OPENCODEX_TEST_IMAGES_API_KEY = "custom-images-key";
+  process.env.GOOGLE_ANTIGRAVITY_CLIENT_ID = "test-client-id";
+  process.env.GOOGLE_ANTIGRAVITY_CLIENT_SECRET = "test-client-secret";
   isolatedCodexHome = installIsolatedCodexHome("ocx-server-images-codex-");
   clearCodexUpstreamHealth();
   clearThreadAccountMap();
@@ -48,6 +52,10 @@ afterEach(() => {
   else process.env.OPENCODEX_HOME = previousOpencodexHome;
   if (previousImagesApiKey === undefined) delete process.env.OPENCODEX_TEST_IMAGES_API_KEY;
   else process.env.OPENCODEX_TEST_IMAGES_API_KEY = previousImagesApiKey;
+  if (previousAntigravityClientId === undefined) delete process.env.GOOGLE_ANTIGRAVITY_CLIENT_ID;
+  else process.env.GOOGLE_ANTIGRAVITY_CLIENT_ID = previousAntigravityClientId;
+  if (previousAntigravityClientSecret === undefined) delete process.env.GOOGLE_ANTIGRAVITY_CLIENT_SECRET;
+  else process.env.GOOGLE_ANTIGRAVITY_CLIENT_SECRET = previousAntigravityClientSecret;
   isolatedCodexHome?.restore();
   isolatedCodexHome = null;
   clearCodexUpstreamHealth();

@@ -22,7 +22,7 @@ describe("paired-phone desktop updates", () => {
   test("phone status awaits current activity independently of stale or missing sidebar data", async () => {
     let current = { known: true, running: 0 };
     const gateway = Object.assign(Object.create(AndroidRemoteGatewayController.prototype), {
-      assets: { response: () => null },
+      assets: { response: () => null, thumbnailResponse: async () => null },
       auth: { authenticateAccessToken: () => ({ client: { id: "test", scopes: ["terminal:operate"] } }) },
       shellCache: { threads: [{ session: { status: "idle", activeTurnId: null }, latestTurn: { state: "completed" } }] },
       knownActiveTurnIds: new Map(),
@@ -55,7 +55,7 @@ describe("paired-phone desktop updates", () => {
   test("gateway rejects missing or revoked phone credentials before reaching updater", async () => {
     let reached = false;
     const gateway = Object.assign(Object.create(AndroidRemoteGatewayController.prototype), {
-      assets: { response: () => null },
+      assets: { response: () => null, thumbnailResponse: async () => null },
       auth: { authenticateAccessToken: () => null },
       desktopUpdateRoutes: () => { reached = true; return Response.json({}); },
     });

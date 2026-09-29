@@ -26,7 +26,7 @@ test("Connect startup, authenticated activity, and shutdown leave existing clien
   const beforeFiles = readdirSync(codexHome).sort();
   const probe = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
   const port = probe.port!;
-  probe.stop(true);
+  await probe.stop(true);
   const token = randomUUID();
   const child = spawn(process.execPath, [join(import.meta.dir, "../src/cli/connect.ts"), "start", "--port", String(port)], {
     env: { ...isolated.env, OPENCODEX_ADMIN_AUTH_TOKEN: token }, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
@@ -34,38 +34,54 @@ test("Connect startup, authenticated activity, and shutdown leave existing clien
   let output = "";
   child.stdout?.on("data", chunk => { output = (output + chunk).slice(-8000); });
   child.stderr?.on("data", chunk => { output = (output + chunk).slice(-8000); });
-  const closed = new Promise<void>(resolve => child.once("close", () => resolve()));
+  let spawnError: Error | undefined;
+  const exited = new Promise<void>(resolve => {
+    child.once("exit", () => resolve());
+    child.once("error", error => { spawnError = error; resolve(); });
+  });
   const base = `http://127.0.0.1:${port}`;
+  let stage = "startup";
+  const request = (path: string, init?: RequestInit) => {
+    stage = `${init?.method ?? "GET"} ${path}`;
+    return fetch(`${base}${path}`, { ...init, signal: AbortSignal.timeout(5_000) });
+  };
   try {
     let ready = false;
-    for (let attempt = 0; attempt < 100; attempt++) {
-      ready = await fetch(`${base}/readyz`).then(response => response.ok).catch(() => false);
-      if (ready || child.exitCode !== null) break;
+    const startupDeadline = Date.now() + 20_000;
+    while (Date.now() < startupDeadline) {
+      ready = await fetch(`${base}/readyz`, { signal: AbortSignal.timeout(750) })
+        .then(async response => { await response.body?.cancel(); return response.ok; }).catch(() => false);
+      if (ready || child.exitCode !== null || child.signalCode !== null || spawnError) break;
       await Bun.sleep(100);
     }
+    if (spawnError) throw spawnError;
     if (!ready) throw new Error(`Isolated startup failed: ${output}`);
-    expect((await fetch(`${base}/api/connect/activity`)).status).toBe(401);
+    expect((await request("/api/connect/activity")).status).toBe(401);
     const headers = { "x-opencodex-api-key": token };
-    const response = await fetch(`${base}/api/connect/activity`, { headers });
+    const response = await request("/api/connect/activity", { headers });
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-store");
     expect((await response.json()).source).toBe("native-codex");
-    const diagnostics = await fetch(`${base}/api/diagnostics/desktop-log`, { headers }).then(result => result.json());
+    const diagnostics = await request("/api/diagnostics/desktop-log", { headers }).then(result => result.json());
     expect(diagnostics.logPath).toContain("[Connect profile]");
     expect(diagnostics.log).toContain("connected");
     expect(diagnostics.log).not.toContain("PRIVATE_MESSAGE");
     expect(diagnostics.log).not.toContain("PRIVATE_CONTINUATION");
-    expect((await fetch(`${base}/api/integrations`, { method: "PUT", headers, body: "{}" })).status).toBe(404);
-    expect((await fetch(`${base}/v1/responses`, { method: "POST" })).status).toBe(404);
-    expect((await fetch(`${base}/v1/responses`, { headers: { upgrade: "websocket" } })).status).toBe(404);
+    expect((await request("/api/integrations", { method: "PUT", headers, body: "{}" })).status).toBe(404);
+    expect((await request("/v1/responses", { method: "POST" })).status).toBe(404);
+    expect((await request("/v1/responses", { headers: { upgrade: "websocket" } })).status).toBe(404);
+  } catch (error) {
+    throw new Error(`Connect lifecycle failed during ${stage}: ${error instanceof Error ? error.message : String(error)}\n${output}`, { cause: error });
   } finally {
     child.kill("SIGTERM");
     const killTimer = setTimeout(() => child.kill("SIGKILL"), 5000);
-    await closed;
+    await exited;
     clearTimeout(killTimer);
+    child.stdout?.destroy();
+    child.stderr?.destroy();
     try {
       for (const [path, content] of fixtures) expect(readFileSync(path, "utf8")).toBe(content);
       expect(readdirSync(codexHome).sort()).toEqual(beforeFiles);
     } finally { isolated.cleanup(); }
   }
-}, 20_000);
+}, 45_000);

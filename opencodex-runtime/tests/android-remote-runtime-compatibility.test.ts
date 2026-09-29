@@ -10,12 +10,13 @@ test.each(["thread/turns/list", "turn/start"])("oversized %s fails explicitly wi
   const server = Bun.serve({
     hostname: "127.0.0.1", port: 0,
     fetch(request, server) { if (server.upgrade(request)) return; return new Response("ready"); },
-    websocket: { message(socket, bytes) {
+    websocket: { backpressureLimit: 32 * 1024 * 1024, message(socket, bytes) {
       const message = JSON.parse(String(bytes));
       if (message.id === undefined) return;
       if (message.method === method) {
         requests += 1;
-        socket.send(JSON.stringify({ id: message.id, result: "x".repeat(16 * 1024 * 1024) }));
+        const sent = socket.send(JSON.stringify({ id: message.id, result: "x".repeat(16 * 1024 * 1024) }));
+        expect(sent).not.toBe(0);
       } else {
         socket.send(JSON.stringify({ id: message.id, result: message.method === "initialize" ? { userAgent: "codex/0.153.4" } : { ready: true } }));
       }
@@ -24,12 +25,12 @@ test.each(["thread/turns/list", "turn/start"])("oversized %s fails explicitly wi
   const runtime = new AndroidCodexRuntime(server.port!, () => ({ runtime: desktop, desktopVersion: desktop.version }));
   try {
     const client = await runtime.start();
-    await expect(client.request(method, { threadId: "oversized" }, 2_000)).rejects.toBeInstanceOf(AndroidCodexResponseTooLargeError);
+    await expect(client.request(method, { threadId: "oversized" }, 10_000)).rejects.toBeInstanceOf(AndroidCodexResponseTooLargeError);
     expect(requests).toBe(1);
     expect(await client.request("thread/read", { threadId: "oversized", includeTurns: false })).toEqual({ ready: true });
     expect(requests).toBe(1);
   } finally { await runtime.stop(); await server.stop(true); }
-});
+}, 15_000);
 test("automatic Android selection uses the verified Desktop build", () => {
   expect(selectAndroidRuntime(stale, [desktop]).runtime.command).toBe(desktop.command);
   expect(selectAndroidRuntime(stale, []).runtime).toBe(stale);
