@@ -32,3 +32,5 @@ jobs:
         run: bun tests/helpers/websocket-size-probe.ts
       - name: Check oversized response behavior
         run: bun scripts/test.ts tests/android-remote-runtime-compatibility.test.ts
+      - name: Check history worker lifecycle
+        run: bun scripts/test.ts tests/codex-history-job.test.ts

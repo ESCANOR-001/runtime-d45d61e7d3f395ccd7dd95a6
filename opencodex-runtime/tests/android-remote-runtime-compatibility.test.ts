@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import { spawn } from "node:child_process";
+import { join } from "node:path";
 import { AndroidCodexRuntime, AndroidCodexResponseTooLargeError } from "../src/android-remote/codex-app-server";
 import { selectAndroidRuntime, verifyAndroidRuntimePeer } from "../src/android-remote/runtime-compatibility";
 import type { ResolvedCodexRuntime } from "../src/codex/runtime";
@@ -6,31 +8,45 @@ import type { ResolvedCodexRuntime } from "../src/codex/runtime";
 const desktop: ResolvedCodexRuntime = { command: "desktop/codex.exe", version: "0.153.4", source: "path" };
 const stale: ResolvedCodexRuntime = { command: "npm/codex.exe", version: "0.147.0", source: "path" };
 test.each(["thread/turns/list", "turn/start"])("oversized %s fails explicitly without replay and allows a fresh connection", async method => {
-  let requests = 0;
-  const server = Bun.serve({
-    hostname: "127.0.0.1", port: 0,
-    fetch(request, server) { if (server.upgrade(request)) return; return new Response("ready"); },
-    websocket: { backpressureLimit: 32 * 1024 * 1024, message(socket, bytes) {
-      const message = JSON.parse(String(bytes));
-      if (message.id === undefined) return;
-      if (message.method === method) {
-        requests += 1;
-        const sent = socket.send(JSON.stringify({ id: message.id, result: "x".repeat(16 * 1024 * 1024) }));
-        expect(sent).not.toBe(0);
-      } else {
-        socket.send(JSON.stringify({ id: message.id, result: message.method === "initialize" ? { userAgent: "codex/0.153.4" } : { ready: true } }));
-      }
-    } },
+  const peer = spawn(process.execPath, [join(import.meta.dir, "helpers/codex-oversized-peer.ts"), method], {
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
   });
-  const runtime = new AndroidCodexRuntime(server.port!, () => ({ runtime: desktop, desktopVersion: desktop.version }));
+  const exited = new Promise<void>(resolve => {
+    peer.once("exit", () => resolve());
+    peer.once("error", () => resolve());
+  });
+  let diagnostics = "";
+  peer.stderr.on("data", chunk => { diagnostics = (diagnostics + chunk).slice(-2000); });
+  const listening = new Promise<number>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Oversized peer startup timed out: ${diagnostics}`)), 10_000);
+    let output = "";
+    peer.stdout.on("data", chunk => {
+      output += chunk;
+      if (!output.includes("\n")) return;
+      clearTimeout(timer);
+      try { resolve(JSON.parse(output.split("\n")[0]!).port); }
+      catch (error) { reject(error); }
+    });
+    peer.once("error", error => { clearTimeout(timer); reject(error); });
+    peer.once("exit", () => { clearTimeout(timer); reject(new Error(`Oversized peer exited: ${diagnostics}`)); });
+  });
+  let runtime: AndroidCodexRuntime | undefined;
   try {
+    runtime = new AndroidCodexRuntime(await listening, () => ({ runtime: desktop, desktopVersion: desktop.version }));
     const client = await runtime.start();
     await expect(client.request(method, { threadId: "oversized" }, 10_000)).rejects.toBeInstanceOf(AndroidCodexResponseTooLargeError);
-    expect(requests).toBe(1);
-    expect(await client.request("thread/read", { threadId: "oversized", includeTurns: false })).toEqual({ ready: true });
-    expect(requests).toBe(1);
-  } finally { await runtime.stop(); await server.stop(true); }
-}, 15_000);
+    expect(await client.request("thread/read", { threadId: "oversized", includeTurns: false })).toEqual({ ready: true, requests: 1 });
+  } finally {
+    await runtime?.stop();
+    peer.kill("SIGTERM");
+    const killTimer = setTimeout(() => peer.kill("SIGKILL"), 2_000);
+    await exited;
+    clearTimeout(killTimer);
+    peer.stdout.destroy();
+    peer.stderr.destroy();
+  }
+}, 30_000);
 test("automatic Android selection uses the verified Desktop build", () => {
   expect(selectAndroidRuntime(stale, [desktop]).runtime.command).toBe(desktop.command);
   expect(selectAndroidRuntime(stale, []).runtime).toBe(stale);
