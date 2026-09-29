@@ -17,6 +17,10 @@ The Android application, native desktop installer project, credentials, machine 
 
 The root workflow uses standard `windows-2025` and `macos-15` runners, with four shards per OS. It runs on pushes, pull requests, or manual dispatch. It does not run Linux jobs or use repository secrets, publishing permissions, or private-repository checkout tokens.
 
+The manually dispatched **Focused runtime regression checks** workflow runs the oversized-response and history-worker cases on both operating systems without rebuilding the dashboard.
+
+Oversized WebSocket tests await the request using native promises before asserting its error: Bun 1.3.14's asynchronous rejection matcher can stall large incoming frames on Windows. They still verify the size-limit error, no replay, and successful reconnection. Real history-worker checks run in a hidden, disposable child process with the test's isolated environment; this avoids Bun's Windows test-timer assertion when a Worker invokes a synchronous subprocess. The same real workers, repeated jobs, shutdown counts, timeout outcomes, database writes, and hard-error assertions remain covered.
+
 ## Local checks
 
 Requires Bun 1.3.14 and Node.js 20.9 or newer.

@@ -8,19 +8,6 @@ import type { ResolvedCodexRuntime } from "../src/codex/runtime";
 const desktop: ResolvedCodexRuntime = { command: "desktop/codex.exe", version: "0.153.4", source: "path" };
 const stale: ResolvedCodexRuntime = { command: "npm/codex.exe", version: "0.147.0", source: "path" };
 test.each(["thread/turns/list", "turn/start"])("oversized %s fails explicitly without replay and allows a fresh connection", async method => {
-  const originalWebSocket = globalThis.WebSocket;
-  if (process.env.REMODEX_TEST_TRANSPORT_DIAGNOSTICS === "1") {
-    globalThis.WebSocket = class extends originalWebSocket {
-      constructor(url: string | URL, protocols?: string | string[]) {
-        super(url, protocols);
-        this.addEventListener("message", event => console.error(JSON.stringify({
-          client: true, type: typeof event.data, constructor: event.data?.constructor?.name,
-          length: event.data?.length, size: event.data?.size,
-        })));
-        this.addEventListener("close", event => console.error(JSON.stringify({ client: true, closed: event.code })));
-      }
-    };
-  }
   const peer = spawn(process.execPath, [join(import.meta.dir, "helpers/codex-oversized-peer.ts"), method], {
     windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"],
@@ -55,8 +42,6 @@ test.each(["thread/turns/list", "turn/start"])("oversized %s fails explicitly wi
     expect(failure).toBeInstanceOf(AndroidCodexResponseTooLargeError);
     expect(await client.request("thread/read", { threadId: "oversized", includeTurns: false })).toEqual({ ready: true, requests: 1 });
   } finally {
-    globalThis.WebSocket = originalWebSocket;
-    if (diagnostics) console.error(diagnostics);
     await runtime?.stop();
     peer.kill("SIGTERM");
     const killTimer = setTimeout(() => peer.kill("SIGKILL"), 2_000);
