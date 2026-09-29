@@ -1,0 +1,605 @@
+.android-remote-page-head { align-items: flex-start; }
+.android-remote-page-head .page-sub { max-width: 68ch; }
+.android-remote-add { flex: 0 0 auto; }
+
+.android-remote-onboard-progress { display: flex; align-items: center; gap: var(--space-3); margin-block: var(--space-4); line-height: var(--leading-body); }
+.android-remote-onboard-progress svg { flex: 0 0 18px; width: 18px; height: 18px; }
+
+.android-remote-page {
+  display: grid;
+  gap: var(--space-8);
+  max-width: 980px;
+}
+
+/*
+ * Polling must not insert a visible row above the settings while WebKitGTK is
+ * scrolling. Keep the polite live-region announcement, but take its spinner
+ * and geometry out of the document so a five-second refresh cannot move every
+ * section below it or schedule animation frames in the clipped region.
+ */
+.android-remote-refresh-status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  min-height: 0;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.android-remote-refresh-status .spin { display: none; }
+
+.android-remote-error {
+  display: grid;
+  justify-items: start;
+  gap: var(--space-3);
+}
+
+.android-remote-section { display: grid; gap: var(--space-4); }
+.android-remote-section-heading {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--muted);
+}
+.android-remote-section-heading svg { width: 16px; height: 16px; }
+.android-remote-section-heading h3 {
+  color: var(--muted);
+  font-size: var(--text-label);
+  font-weight: 700;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+}
+
+.android-remote-settings-card,
+.android-remote-tunnel-card,
+.android-remote-clients-card {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+
+.android-remote-tunnel-card {
+  display: grid;
+  gap: var(--space-5);
+  padding: var(--space-6);
+}
+
+.android-remote-tunnel-intro {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-5);
+}
+.android-remote-tunnel-intro > div { min-width: 0; }
+.android-remote-tunnel-intro strong { color: var(--text); font-size: var(--text-body); }
+.android-remote-tunnel-intro p {
+  max-width: 68ch;
+  margin-top: var(--space-1);
+  color: var(--muted);
+  font-size: var(--text-control);
+  line-height: var(--leading-body);
+}
+
+.android-remote-tunnel-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+.android-remote-tunnel-option {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-4);
+  background: var(--raised);
+  cursor: pointer;
+}
+.android-remote-tunnel-option.selected {
+  border-color: color-mix(in srgb, var(--accent) 48%, var(--border));
+  background: var(--accent-soft);
+}
+.android-remote-tunnel-option input { margin-top: 3px; accent-color: var(--accent); }
+.android-remote-tunnel-option > span { display: grid; gap: var(--space-1); min-width: 0; }
+.android-remote-tunnel-option strong { color: var(--text); font-size: var(--text-control); }
+.android-remote-tunnel-option small { color: var(--muted); font-size: var(--text-caption); line-height: var(--leading-body); }
+.android-remote-tunnel-option-title { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); }
+.android-remote-tunnel-option-title em {
+  border: 1px solid color-mix(in srgb, var(--green) 32%, var(--border));
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--green) 10%, var(--surface));
+  color: var(--green);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 750;
+  letter-spacing: .025em;
+  line-height: 1;
+  padding: 4px 7px;
+}
+
+.android-remote-tunnel-compare {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--raised);
+  padding: var(--space-4);
+}
+.android-remote-tunnel-compare summary {
+  color: var(--text);
+  cursor: pointer;
+  font-size: var(--text-control);
+  font-weight: 700;
+}
+.android-remote-tunnel-compare-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
+.android-remote-tunnel-compare article {
+  display: grid;
+  align-content: start;
+  gap: var(--space-2);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  padding: var(--space-4);
+}
+.android-remote-tunnel-compare article > strong { color: var(--text); font-size: var(--text-control); }
+.android-remote-tunnel-compare article > p,
+.android-remote-tunnel-compare li,
+.android-remote-tunnel-compare-shared {
+  color: var(--muted);
+  font-size: var(--text-caption);
+  line-height: var(--leading-body);
+}
+.android-remote-tunnel-compare ul {
+  display: grid;
+  gap: var(--space-1);
+  margin: 0;
+  padding-left: 1.1rem;
+}
+.android-remote-tunnel-compare-shared {
+  border-top: 1px solid var(--border-soft);
+  margin-top: var(--space-4);
+  padding-top: var(--space-3);
+}
+
+.android-remote-tunnel-form { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--space-4); }
+.android-remote-tunnel-form label { display: grid; gap: var(--space-2); min-width: 0; }
+.android-remote-tunnel-form label > span { color: var(--muted); font-size: var(--text-label); font-weight: 650; }
+.android-remote-tunnel-form input {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-control);
+  padding: 10px 12px;
+}
+.android-remote-tunnel-form select,
+.android-remote-cloudflare-field input {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-control);
+  padding: 10px 12px;
+}
+.android-remote-tunnel-form input:focus-visible,
+.android-remote-tunnel-form select:focus-visible,
+.android-remote-cloudflare-field input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.android-remote-token-saved {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  color: var(--green);
+  font-size: var(--text-caption);
+}
+.android-remote-token-saved > svg { width: 16px; height: 16px; }
+.android-remote-token-saved .btn { margin-left: auto; }
+
+.android-remote-cloudflare-wizard {
+  display: grid;
+  gap: var(--space-4);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--raised);
+  padding: var(--space-5);
+}
+.android-remote-cloudflare-wizard-copy { display: grid; gap: var(--space-1); }
+.android-remote-cloudflare-wizard-copy strong { color: var(--text); font-size: var(--text-control); }
+.android-remote-cloudflare-wizard-copy p { color: var(--muted); font-size: var(--text-caption); line-height: var(--leading-body); }
+.android-remote-cloudflare-token-guide {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  padding: var(--space-4);
+}
+.android-remote-cloudflare-token-guide summary {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  color: var(--text);
+  cursor: pointer;
+  list-style: none;
+}
+.android-remote-cloudflare-token-guide summary::-webkit-details-marker { display: none; }
+.android-remote-cloudflare-token-guide summary::before {
+  flex: 0 0 auto;
+  color: var(--muted);
+  content: "›";
+  font-size: 20px;
+  line-height: 1;
+  transform: rotate(0deg);
+  transition: transform 140ms ease;
+}
+.android-remote-cloudflare-token-guide[open] summary::before { transform: rotate(90deg); }
+.android-remote-cloudflare-token-guide summary > span { display: grid; gap: var(--space-1); min-width: 0; }
+.android-remote-cloudflare-token-guide summary strong,
+.android-remote-cloudflare-token-guide li strong { color: var(--text); font-size: var(--text-label); }
+.android-remote-cloudflare-token-guide summary small,
+.android-remote-cloudflare-token-guide li p,
+.android-remote-cloudflare-token-guide-finish {
+  color: var(--muted);
+  font-size: var(--text-caption);
+  line-height: var(--leading-body);
+}
+.android-remote-cloudflare-token-guide-body { display: grid; gap: var(--space-4); padding: var(--space-4) 0 0 32px; }
+.android-remote-cloudflare-token-guide-body > .btn { width: fit-content; }
+.android-remote-cloudflare-token-guide ol {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: cloudflare-token-step;
+}
+.android-remote-cloudflare-token-guide li {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: var(--space-3);
+  counter-increment: cloudflare-token-step;
+}
+.android-remote-cloudflare-token-guide li::before {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  content: counter(cloudflare-token-step);
+  font-size: var(--text-caption);
+  font-weight: 750;
+}
+.android-remote-cloudflare-token-guide li > div { display: grid; gap: var(--space-1); min-width: 0; padding-top: 2px; }
+.android-remote-cloudflare-permission-list { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-1); }
+.android-remote-cloudflare-permission-list code {
+  max-width: 100%;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-pill);
+  background: var(--raised);
+  color: var(--text);
+  font-size: var(--text-caption);
+  overflow-wrap: anywhere;
+  padding: 5px 9px;
+}
+.android-remote-cloudflare-token-guide-finish {
+  border-top: 1px solid var(--border-soft);
+  margin: 0;
+  padding-top: var(--space-3);
+}
+.android-remote-cloudflare-field { display: grid; gap: var(--space-2); min-width: 0; }
+.android-remote-cloudflare-field > span,
+.android-remote-tunnel-form label > span { color: var(--muted); font-size: var(--text-label); font-weight: 650; }
+.android-remote-cloudflare-field > small { color: var(--muted); font-size: var(--text-caption); line-height: var(--leading-body); }
+.android-remote-cloudflare-authorize,
+.android-remote-cloudflare-connect { width: fit-content; }
+.android-remote-cloudflare-selection,
+.android-remote-cloudflare-progress { display: grid; gap: var(--space-3); }
+.android-remote-cloudflare-selection {
+  border-top: 1px solid var(--border-soft);
+  padding-top: var(--space-4);
+}
+.android-remote-cloudflare-progress {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  padding: var(--space-3) var(--space-4);
+}
+.android-remote-cloudflare-progress-row { display: flex; align-items: center; gap: var(--space-2); color: var(--muted); font-size: var(--text-control); }
+.android-remote-cloudflare-progress-row > svg,
+.android-remote-progress-dot { width: 16px; height: 16px; flex: 0 0 auto; }
+.android-remote-cloudflare-progress-row.complete { color: var(--green); }
+.android-remote-cloudflare-progress-row.active { color: var(--text); }
+.android-remote-cloudflare-progress-row.active > svg { color: var(--accent); }
+.android-remote-cloudflare-progress-row.failed { color: var(--red); }
+.android-remote-progress-dot { display: block; border: 1.5px solid var(--border); border-radius: 50%; }
+.android-remote-subdomain-input { display: flex; align-items: stretch; min-width: 0; }
+.android-remote-subdomain-input input {
+  flex: 1 1 0;
+  width: auto;
+  min-width: 0;
+  border-radius: var(--radius-sm) 0 0 var(--radius-sm);
+}
+.android-remote-subdomain-input > span {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-left: 0;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: var(--hover);
+  color: var(--muted);
+  padding: 0 10px;
+  white-space: nowrap;
+}
+.android-remote-name-servers { display: flex; flex-wrap: wrap; gap: var(--space-1); margin-top: var(--space-2); }
+.android-remote-name-servers code { border: 1px solid var(--border-soft); border-radius: var(--radius-xs); padding: 2px 5px; }
+.android-remote-manual-setup { margin-top: var(--space-2); }
+.android-remote-manual-setup[open] { display: grid; gap: var(--space-4); }
+
+.android-remote-tunnel-url {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+.android-remote-tunnel-url > div { display: grid; gap: var(--space-2); min-width: 0; }
+.android-remote-tunnel-url span { color: var(--muted); font-size: var(--text-label); font-weight: 650; }
+.android-remote-tunnel-url code {
+  width: fit-content;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  border: 1px solid color-mix(in srgb, var(--green) 30%, var(--border));
+  border-radius: var(--radius-xs);
+  background: color-mix(in srgb, var(--green) 8%, var(--surface));
+  color: var(--green);
+  padding: 6px 8px;
+}
+.android-remote-tunnel-check { flex: 0 0 auto; }
+.android-remote-domain-management {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--raised);
+  padding: var(--space-4);
+}
+.android-remote-domain-management > div:first-child { display: grid; gap: var(--space-2); min-width: 0; }
+.android-remote-domain-management strong { color: var(--text); font-size: var(--text-label); }
+.android-remote-domain-management code { width: fit-content; max-width: 100%; color: var(--text); overflow-wrap: anywhere; }
+.android-remote-domain-management p { color: var(--muted); font-size: var(--text-caption); line-height: var(--leading-body); }
+.android-remote-domain-management-actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; gap: var(--space-2); }
+.android-remote-tunnel-actions { display: flex; flex-wrap: wrap; gap: var(--space-3); }
+.android-remote-tunnel-guide { border-top: 1px solid var(--border-soft); padding-top: var(--space-4); }
+.android-remote-tunnel-guide summary { color: var(--text); font-size: var(--text-control); font-weight: 700; cursor: pointer; }
+.android-remote-tunnel-guide > p,
+.android-remote-tunnel-guide li { color: var(--muted); font-size: var(--text-control); line-height: var(--leading-body); }
+.android-remote-tunnel-guide > p { margin-top: var(--space-3); }
+.android-remote-tunnel-guide ol { display: grid; gap: var(--space-2); margin: var(--space-3) 0 0; padding-left: 1.5rem; }
+.android-remote-tunnel-guide-note { font-weight: 650; }
+
+.android-remote-setting-row,
+.android-remote-client-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-6);
+  min-height: 88px;
+  padding: var(--space-5) var(--space-6);
+}
+
+.android-remote-setting-row + .android-remote-setting-row,
+.android-remote-client-row + .android-remote-client-row,
+.android-remote-client-row + .android-remote-empty-clients {
+  border-top: 1px solid var(--border-soft);
+}
+
+.android-remote-setting-row strong,
+.android-remote-client-copy strong { color: var(--text); font-size: var(--text-body); }
+.android-remote-setting-row p {
+  max-width: 68ch;
+  margin-top: var(--space-1);
+  color: var(--muted);
+  font-size: var(--text-control);
+  line-height: var(--leading-body);
+}
+
+.android-remote-addresses {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+.android-remote-addresses code,
+.android-remote-scopes code {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-xs);
+  background: var(--raised);
+  color: var(--muted);
+  font-size: var(--text-caption);
+  padding: 3px 6px;
+}
+
+.android-remote-gateway-row { background: var(--hover); }
+.android-remote-gateway-badge,
+.android-remote-state-label,
+.android-remote-this-device {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  color: var(--muted);
+  font-size: var(--text-caption);
+  line-height: 1;
+  padding: 5px 8px;
+  white-space: nowrap;
+}
+.android-remote-gateway-badge {
+  border-color: color-mix(in srgb, var(--amber) 34%, var(--border));
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+.android-remote-gateway-badge.ready {
+  border-color: color-mix(in srgb, var(--green) 34%, var(--border));
+  background: color-mix(in srgb, var(--green) 10%, var(--surface));
+  color: var(--green);
+}
+.android-remote-gateway-badge.error {
+  border-color: color-mix(in srgb, var(--red) 34%, var(--border));
+  background: var(--red-soft);
+  color: var(--red);
+}
+.android-remote-gateway-badge.stopped {
+  border-color: var(--border);
+  background: var(--raised);
+  color: var(--muted);
+}
+
+.android-remote-client-main { display: flex; align-items: flex-start; gap: var(--space-3); min-width: 0; }
+.android-remote-status-dot {
+  width: 10px;
+  height: 10px;
+  flex: 0 0 auto;
+  margin-top: 5px;
+  border-radius: var(--radius-round);
+  background: var(--faint);
+}
+.android-remote-status-dot.online { background: var(--green); }
+.android-remote-status-dot.offline { opacity: .55; }
+.android-remote-client-copy { display: grid; gap: var(--space-1); min-width: 0; }
+.android-remote-client-copy > span { color: var(--muted); font-size: var(--text-control); overflow-wrap: anywhere; }
+.android-remote-client-name { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); }
+.android-remote-scopes { display: flex; flex-wrap: wrap; gap: var(--space-1); margin-top: var(--space-1); }
+
+.android-remote-empty-clients {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-5) var(--space-6);
+  color: var(--muted);
+}
+.android-remote-empty-clients > svg { width: 20px; height: 20px; flex: 0 0 auto; }
+.android-remote-empty-clients > div { display: grid; gap: var(--space-1); }
+.android-remote-empty-clients strong { color: var(--text); font-size: var(--text-control); }
+.android-remote-empty-clients span { font-size: var(--text-control); }
+
+.android-remote-dialog { width: min(560px, 100%); }
+.android-remote-dialog-title { display: flex; align-items: center; gap: var(--space-3); }
+.android-remote-dialog-icon {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+}
+.android-remote-dialog-icon svg { width: 18px; height: 18px; }
+.android-remote-readiness {
+  display: grid;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.android-remote-readiness-row {
+  display: flex;
+  gap: var(--space-3);
+  padding: var(--space-4);
+}
+.android-remote-readiness-row + .android-remote-readiness-row { border-top: 1px solid var(--border-soft); }
+.android-remote-readiness-row > svg { width: 18px; height: 18px; flex: 0 0 auto; color: var(--muted); }
+.android-remote-readiness-row.ready > svg { color: var(--green); }
+.android-remote-readiness-row.pending > svg { color: var(--amber); }
+.android-remote-readiness-row > div { display: grid; gap: var(--space-1); }
+.android-remote-readiness-row strong { font-size: var(--text-control); }
+.android-remote-readiness-row span { color: var(--muted); font-size: var(--text-control); line-height: var(--leading-body); }
+.android-remote-pairing-state,
+.android-remote-pairing-failure {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  min-height: 180px;
+  color: var(--muted);
+  font-size: var(--text-control);
+}
+.android-remote-pairing-state > svg { width: 18px; height: 18px; }
+.android-remote-pairing-failure { flex-direction: column; }
+.android-remote-pairing {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: var(--space-6);
+}
+.android-remote-qr-frame {
+  display: grid;
+  width: 236px;
+  height: 236px;
+  place-items: center;
+  overflow: hidden;
+  border: 8px solid #fff;
+  border-radius: var(--radius);
+  background: #fff;
+  box-shadow: 0 0 0 1px var(--border);
+}
+.android-remote-qr-frame svg { display: block; width: 220px; height: 220px; }
+.android-remote-pairing-copy { display: grid; gap: var(--space-2); }
+.android-remote-pairing-copy strong { color: var(--text); font-size: var(--text-body); }
+.android-remote-pairing-copy > span { color: var(--muted); font-size: var(--text-control); line-height: var(--leading-body); }
+.android-remote-pairing-meta { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-2); }
+.android-remote-pairing-expiry {
+  width: fit-content;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--raised);
+  padding: 5px 9px;
+  font-variant-numeric: tabular-nums;
+}
+.android-remote-pairing-meta .btn { min-height: 32px; }
+.android-remote-dialog-actions { justify-content: flex-end; }
+.android-remote-dialog-actions .btn { flex: 0 0 auto; min-width: 96px; }
+
+@media (max-width: 760px) {
+  .app:has(.android-remote-page) { height: 100dvh; overflow: hidden; }
+  .main:has(.android-remote-page) { min-height: 0; overflow-y: auto; }
+  .android-remote-page-head { flex-direction: column; align-items: stretch; }
+  .android-remote-add { width: 100%; justify-content: center; }
+  .android-remote-setting-row,
+  .android-remote-client-row { align-items: flex-start; padding: var(--space-4); }
+  .android-remote-tunnel-card { padding: var(--space-4); }
+  .android-remote-tunnel-options,
+  .android-remote-tunnel-form,
+  .android-remote-tunnel-compare-grid { grid-template-columns: 1fr; }
+  .android-remote-cloudflare-token-guide-body { padding-left: 0; }
+  .android-remote-domain-management { flex-direction: column; }
+  .android-remote-domain-management-actions { width: 100%; }
+  .android-remote-tunnel-url { align-items: stretch; flex-direction: column; }
+  .android-remote-tunnel-check { width: 100%; justify-content: center; }
+  .android-remote-token-saved { grid-column: auto; }
+  .android-remote-tunnel-intro { align-items: flex-start; }
+  .android-remote-setting-row { gap: var(--space-4); }
+  .android-remote-client-row:not(.desktop) { flex-direction: column; }
+  .android-remote-client-row:not(.desktop) .btn { margin-left: 22px; }
+  .android-remote-empty-clients { padding: var(--space-4); }
+  .android-remote-pairing { grid-template-columns: 1fr; justify-items: center; text-align: center; }
+  .android-remote-pairing-copy { justify-items: center; }
+  .android-remote-qr-frame { width: min(236px, 100%); height: auto; aspect-ratio: 1; }
+  .android-remote-qr-frame svg { width: 100%; height: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .android-remote-page *, .android-remote-dialog * { scroll-behavior: auto; }
+}

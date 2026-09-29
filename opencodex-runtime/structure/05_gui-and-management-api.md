@@ -1,0 +1,327 @@
+# GUI And Management API SOT
+
+## Dashboard serving
+
+The bundled React dashboard is built into `gui/dist` and served by the same Bun proxy. `ocx gui`
+starts the proxy when needed and opens `http://localhost:<port>`.
+
+All ordinary HTTP responses (excluding successful WebSocket upgrades) include `X-Frame-Options: DENY` and
+`Content-Security-Policy: frame-ancestors 'none'`. This prevents another page from framing the local
+dashboard or management responses. Embedding the dashboard in an iframe is intentionally
+unsupported; deployments that previously relied on such embedding must open it as a top-level page.
+
+## Authentication boundaries
+
+Remodex uses three mutually exclusive admission credential classes:
+
+| Credential class | Sources | Allowed surface |
+| --- | --- | --- |
+| Data plane | `OPENCODEX_API_AUTH_TOKEN`, the `service-api-token` file loaded through `OCX_API_TOKEN_FILE`, and `config.apiKeys` | `/v1/*` HTTP endpoints and new data-plane WebSocket handshakes only |
+| Management plane | `OPENCODEX_ADMIN_AUTH_TOKEN` or the independent protected `admin-api-token` file | `/api/*` only |
+| GUI session | A short-lived token issued only with a legitimate same-origin local dashboard page | `/api/*` only, bound to the issuing origin |
+
+The service token file remains a delivery mechanism for the data-plane environment token; it is not
+a fourth credential class. A management credential that equals any configured data-plane credential
+does not enable management access. The data plane may continue to start, but `/api/*` remains closed.
+CLI health collection follows the same boundary: `rmx status` and `rmx doctor` use the configured
+management credential for `/api/codex-auth/accounts`, never the service/data-plane token. Their
+output distinguishes a missing proxy, rejected management authentication, and an unexpected
+management response so a reachable `401` cannot be reported as "proxy not running."
+
+Before either CLI command attaches the management bearer, it challenges the listener and verifies
+an HMAC proof bound to the proxy PID and port. The per-process proof key lives only in the protected
+`runtime-port.json`; the public `/healthz` identity marker alone is never sufficient to receive a
+management credential. Legacy or configured-port-only listeners still satisfy ordinary liveness,
+but their account-health detail remains unavailable until an attested runtime record exists.
+
+[Decision Log]
+- 목적과 의도: Keep a lower-privileged local process from collecting the management bearer by impersonating `/healthz` on an unused port.
+- 기존 구현 및 제약 조건: Liveness must remain public and backward-compatible, but its service string and reported PID are assertions made by the listener itself.
+- 검토한 주요 대안: Require only a runtime source and non-null PID; stop showing account health; authenticate the listener with a protected per-process challenge secret.
+- 선택한 방식: Store a random secret in the mode-protected runtime record and require a challenge/PID/port HMAC before the CLI sends Authorization.
+- 다른 대안 대신 이 방식을 선택한 이유: PID and command-line checks are not cryptographic listener identity, while removing live account health would regress diagnostics unnecessarily.
+- 장점, 단점 및 영향: The long-lived token never reaches a listener without the runtime secret; an old running proxy remains visible but cannot provide detailed CLI account health until restarted on the new version.
+
+Management authentication never has a loopback bypass. If no management credential is available, or
+management token creation, validation, or permission hardening fails, every `/api/*` request returns
+503 while `/v1/*` and unauthenticated `/healthz` continue to operate. Windows ACL hardening results
+must be checked explicitly because an `icacls` timeout is a soft failure in the shared secret helper.
+
+Local dashboard page entry requires a loopback binding, a valid parseable loopback `Host`, and an
+exact request origin. A non-loopback dashboard uses the management token flow instead. The server
+issues an in-memory session for five minutes, capped at 128 live sessions. The session is bound to the
+exact protocol, host, and port; state-changing requests additionally require the session CSRF token.
+The dashboard never attaches its management session to `/v1/*` requests, and pages containing a
+session bootstrap are served with `Cache-Control: no-store`.
+
+Proxy admission credentials must never reach an upstream provider. The forwarding guard rejects the
+`ocx_data_`, `ocx_admin_`, and `ocx_session_` prefixes, historical keys matching
+`^ocx_[0-9a-f]{40}$`, both environment tokens by constant-time comparison, and manually configured
+data keys by constant-time comparison.
+
+Audit item #16 remains partially deferred. This credential split protects new WebSocket handshakes,
+but the following established-connection controls are intentionally outside this batch and must not
+be treated as implemented:
+
+- revoke an already established connection when its data key is deleted;
+- enforce an idle timeout;
+- reauthenticate subsequent frames after the handshake.
+
+## API ownership
+
+`src/server/index.ts` authenticates and routes `/api/*`, then delegates to
+`src/server/management-api.ts`, which composes the route modules under `src/server/management/`.
+Codex account routes live in `src/codex/auth-api.ts` because they own the credential store, not
+because they are a different plane.
+
+The registered route set is larger than the areas described below; the code is the route SOT. What
+this document owns is which module holds which area and what invariant that area must not break.
+
+| Endpoint area | Responsibility |
+| --- | --- |
+| Config/settings | Read safe config/settings views; mutate supported settings only. Full `PUT /api/config` is disabled so masked secrets are not round-tripped. `PUT /api/settings` accepts `codexAutoStart`, `streamMode`, integer `appOwnedMemoryBudgetMb` (64..4096), and/or strict boolean `codexAccountPickerEnabled` (each optional, at least one required). Picker enable initializes an empty UI-managed selector map, persists before one bounded catalog convergence, and reports only `catalogRefreshPending`; allocation/save failure restores every touched live field and skips convergence. Budget changes synchronously enforce the process-wide evictable retained-state cap; this is separate from RSS/native memory. `streamMode` persists the #314 stream-shape selection in config.json (Windows services need persisted input; macOS eager relay is explicit-only). |
+| Startup safety | `GET /api/startup-health` reports whether injected Codex routing is restart-safe, with secret-free service/shim diagnostics. `POST /api/startup-action` provides allowlisted one-click installation for the background service or launcher shim. On Windows a healthy script shim is CLI-only; Codex Desktop requires the background service for full protection. |
+| Windows tray | `GET/POST /api/windows-tray` controls an owned, per-user HKCU login tray. The tray delegates fixed actions to the CLI and is never a proxy supervisor or restart-protection signal. |
+| Updates | `GET /api/update/check`, `POST /api/update/run`, and `GET /api/update/status` own `@remodex/rmx` npm package update state. A launched worker PID is persisted in `update-job.json`; dead PIDs recover immediately, while legacy active records without a PID recover only after ten minutes. Live PIDs remain exclusive regardless of record age. Successful installs record the exact version and local install time; checks return that time only for the running version and link to its fixed GitHub release tag. If replacement fails after the proxy is stopped, the worker attempts captured-port recovery while retaining `status: "failed"`. `GET /api/update/badge` backs the sidebar badge: it reports that an update exists and links to the update surface rather than gating other actions. There is no native desktop-installer route or bridge. |
+| Providers | Create/update/delete ordinary provider configs and enrich registry metadata. The reserved `openai` card exposes Pool(default)/Direct account mode; `openai-apikey` remains the separate API route. |
+| Models | Fetch routed model lists, disabled model visibility, and catalog-facing ids. |
+| OAuth | Login/status/logout for OAuth-backed providers, plus multiauth account management: `GET /api/oauth/accounts`, `PUT /api/oauth/accounts/active`, `PUT /api/oauth/accounts/alias`, `DELETE /api/oauth/accounts` list masked accounts per provider, switch the active one, edit its display-only alias, and remove one. The login flow itself is `GET /api/oauth/providers`, `POST /api/oauth/login`, `POST /api/oauth/login/code`, `POST /api/oauth/login/cancel`, `POST /api/oauth/logout`, and `GET /api/oauth/status`; pool controls are `GET/PUT/PATCH /api/oauth/accounts/pool` and `POST /api/oauth/accounts/clear-cooldown`. Login accepts `addAccount: true` to force a fresh browser identity. Device flows return a structured `deviceCode`; the GUI highlights and copies it before the user opens the verification page. |
+| Key providers | `GET /api/key-providers` exposes API-key provider presets for setup and dashboard flows, and `GET/POST/DELETE /api/keys` owns the proxy's own admission keys. Multi-key pool per key-auth provider: `GET /api/providers/keys`, `POST /api/providers/keys`, `PUT /api/providers/keys/active`, `PUT /api/providers/keys/alias`, `DELETE /api/providers/keys` masked list, add (upsert + activate), switch, rename, and remove keys. `provider.apiKey` always mirrors the active pool entry so routing stays single-key. |
+| OpenAI account mode | Report one OpenAI Codex card with Pool/Direct controls and one API-key card. Mode PATCH persists live without restart or catalog identity changes; Pool owns account/quota controls and Direct uses caller/main login only. Main-account DTOs report real credential presence and terminal `needsReauth` state instead of treating missing/invalid native auth as an unknown quota. Selection order has its own route: `PUT /api/codex-auth/accounts/priority` takes `{ id, priority }`, where `priority` is an integer -100..100 or `null` to restore the default, accepts `__main__`, 404s an unknown id, and echoes the stored value. Re-ordering never clears thread affinity, so the response carries no `appliesImmediately`, but it does release any pin — see [`08_openai-provider-tiers.md`](08_openai-provider-tiers.md) for why. `PUT /api/codex-auth/active` with a null id releases one too, but that drops the operator's account selection along with it, so this route is the only operator-facing way to clear a pin while leaving the selected account in place. `GET /api/codex-auth/active` reports `pinned`, true only while the manually selected account is still the effective active one, plus `pinnedAccountId`, which names the pinned account whether or not it is the active one. Surfaces should render `pinnedAccountId`: under round-robin and fill-first the pin caps the tier ceiling at its own tier while the strategy cursor moves freely inside that tier, so `pinned` goes false on a sibling's turn even though the pin is still suppressing every higher tier — which is why the dashboard badges `pinnedAccountId` and the GUI controller tracks only the id. `pinned` answers the narrower question of whether routing is *currently* on the operator's choice; no surface in this repo asks it, and a new one almost certainly wants the id instead. |
+| Subagents | Read/write the featured `subagentModels` list capped at five ids. `GET/PUT /api/injection-model` manages the shared delegation model/effort selection, the independent Remodex guidance switch, and the default-off `syncCodexSubagentDefaults` opt-in for native Codex subagent defaults. When Remodex owns the active Codex routing, native `[agents]` defaults apply to newly created Codex tasks after sync/restart; external user-managed provider configs remain untouched. The defaults do not cause delegation and preserve existing user-owned defaults rather than overwriting them. PUT is partial-update: absent keys are unchanged, `null` clears, and non-object bodies are rejected with 400 before field validation. `syncCodexSubagentDefaults: true` requires a nonblank `model` and a supported Codex reasoning effort when effort is set; clearing `model` (null/empty) always clears effort and disables native-default sync even when the stored effort was invalid. |
+| V2 / Multi-agent mode | `GET/PUT /api/v2` — reports/sets the codex `multi_agent_v2` feature flag, the 3-state `multiAgentMode` override (`v1`/`default`/`v2`), and the logical maximum thread count. Selecting `v2` enables the native flag and migrates `[agents] max_threads` to the v2 key; selecting `v1` disables it and migrates the same value back. `default` leaves the native flag unchanged. PUT accepts `enabled`, `multiAgentMode`, and/or the compatibility-named `maxConcurrentThreadsPerSession`; contradictory mode/flag pairs are rejected before writes. Every transition is rollback-safe and resyncs the catalog. |
+| Logs & Debug | One sidebar entry (`/#logs`) with two tabs. Logs tab: request/runtime logs for local diagnosis. Debug tab (`/#logs/debug`; legacy `/#debug` deep links redirect there): provider + usage toggles, refresh/follow log viewer. `GET/PUT /api/debug`; `GET /api/debug/logs` and `GET /api/debug/usage-logs` (monotonic `after` cursor, legacy `since` accepted). CLI: `rmx debug provider|usage …` (both streams via running proxy API). |
+| Usage | `GET /api/usage` aggregate read-only summary derived from `~/.remodex/usage.jsonl`; measured / reported / unreported / unsupported / estimated counts, daily zero-filled grid, model and provider breakdowns. Never exposes prompts. |
+| System | `POST /api/system/restart` restarts the proxy in place. Local CLI/tray callers first attest the exact runtime PID and port, then send a process-scoped HMAC capability bound to that method, path, PID, and port; the capability authorizes no other management route and is invalid after replacement. The caller observes one absolute deadline and accepts success only after a different runtime PID is healthy on the same port. `GET /api/system/memory` — service-process runtime/memory identity (pid, Bun version/revision, optional `bunRuntimeSource` provenance, platform, RSS/heap/external/ArrayBuffers scalars, observed memory = max(RSS, external, ArrayBuffers), `bun:jsc` heap context, streamMode + eager-relay gate decision, watchdog snapshot sliced to the last 60 samples) plus privacy-safe `appOwnedBytes` retained-store totals/counters under static store ids. Scalar-only payload; rides the standard management auth gate and must never move to unauthenticated `/healthz`. Consumed by `rmx doctor`'s Memory/runtime section and the dashboard Memory observability card. |
+| Stop | `POST /api/stop` — fence new turns, restore only Remodex-owned Codex and Grok state, stop any installed service, and exit the proxy. A lifecycle, ownership, or safe-restoration conflict returns 409 and leaves the proxy live. |
+| Diagnostics/sync | `src/server/management/config-routes.ts` — `GET /api/diagnostics/project-config` reports project-level Codex config that bypasses managed routing; `POST /api/sync` re-runs catalog/config sync. A body with both `takeoverExistingRouting: true` and `hardRestartDesktop: true` is the dashboard-confirmed path: it temporarily takes over global Codex routing and hard-restarts one identity-checked Codex/ChatGPT Desktop client. Omitting the pair retains external-provider coexistence and never restarts Desktop. The diagnostic reports project bypasses; it does not rewrite project files. |
+| Android Remote | `src/server/management/android-remote-routes.ts` — `GET /api/android-remote`, `PUT /api/android-remote/settings`, `PUT /api/android-remote/tunnel`, `POST /api/android-remote/tunnel/retry`, `DELETE /api/android-remote/tunnel/token`, `DELETE /api/android-remote/tunnel/domain`, `POST /api/android-remote/pairing`, and `DELETE /api/android-remote/clients/<id>` own the dashboard control surface. The domain-delete route clears only the local hostname and connector credential and returns to Quick Tunnel; Cloudflare-side resources are not represented as deleted. `src/android-remote/` owns the LAN gateway, managed Quick/Named Cloudflare Tunnel lifecycle, short-lived pairing and socket tickets, phone credentials, Codex app-server bridge, task projection, attachment staging, bounded recent-history pages, sequence-numbered replay, stable message/activity/plan updates, and the optional Codex Desktop live owner. Quick Tunnel is the default and may install a checksum-pinned `cloudflared`; Named Tunnel stores its connector token only in the OS credential store and passes it through `TUNNEL_TOKEN`, never arguments or serialized state. Both target only `http://127.0.0.1:10105`; a public URL is advertised only after health and environment-ID verification. Verified route changes appear in pairing payloads and revisioned `remodexMobileConnection` config events. Its server config merges private app-server `model/list` metadata with the canonical non-disabled management model rows, deduplicates by the Codex-facing selector, and emits native/routed/custom/combo provider groups mirrored in `settings.providerInstances`; the 30-second cache and five-second config subscription poll make later catalog changes converge without repairing the phone. A shell subscriber receives an immediate cached or empty readiness snapshot, then the 25 most recent active tasks, while the complete active and archived task scan continues in the background. Native plan, safe reasoning-summary, MCP-progress, command, and file-patch notifications update their existing timeline rows; raw reasoning and high-frequency raw output never become Android Markdown or trigger a whole-task read. Command Execution is live-only Android progress and is omitted from completed Android task projection. Tool text and structured data are bounded before publication. Workspace image references are exposed only through one-hour, process-local, exact-file capabilities after canonical path containment and image-signature validation; the public URL carries no Android bearer and accepts only GET/HEAD. For Android-started work, `desktop-ipc.ts` connects to Codex Desktop's existing local pipe on Windows or Unix socket on macOS and Linux, claims only the native task id started by this gateway, opens that task once through `codex://threads/<id>`, sends a complete revisioned Desktop state followed by bounded patches, and routes follower Send, Stop, steer, model/reasoning, approval, user-input, and MCP responses back to the same private Codex app-server. For an existing task already open in Desktop, Android sends first use `thread-follower-start-turn` so the exclusive task writer is reused instead of competing with Desktop. Android prompt editing uses Desktop's version-2 `thread-follower-edit-last-user-turn` operation so rollback, local-history replacement, and the edited replacement turn are one owner-side transaction; only an unavailable Desktop owner falls back to private app-server resume, rollback, and start. It never starts a replacement IPC router and never cold-launches Desktop when its real bus is absent; Android continues normally when Desktop is closed. State lives in protected `android-remote.json`; only credential digests, tunnel mode, and Named Tunnel hostname are stored there, never the Cloudflare token. The gateway is reachable on port `10105` only while enabled; its private Codex app-server stays loopback-only on `127.0.0.1:10106`. Android credentials remain separate from data-plane, management-plane, and GUI-session credentials. The saved keep-awake preference does not yet change operating-system sleep behavior. |
+| Sidecar/shadow-call settings | `src/server/management/config-routes.ts` — `GET/PUT /api/sidecar-settings` and `GET/PUT /api/shadow-call-settings`. PUT accepts model and backend plus optional `webSearch.reasoning` and `vision.maxDescriptionsPerTurn`; the read and PUT-response payload reports model, backend, and the vision per-turn limit. Credentials live in the provider and OAuth stores instead. Both shadow-call responses also report the resolved `sourceModels` — the prefixes the runtime actually intercepts (`src/lib/shadow-call.ts`, default `gpt-5.4-mini` + `gpt-5.6-luna`), so no client hard-codes a helper slug that a Codex release can invalidate. |
+| Storage | `src/server/management/logs-usage-routes.ts` — `GET /api/storage`, `POST /api/storage/cleanup/preview` and `/api/storage/cleanup`, `GET /api/storage/trash`, `POST /api/storage/trash/restore`, and `GET/PUT /api/storage/cleanup-policy` plus `POST /api/storage/cleanup-policy/run`. `GET /api/storage/cleanup-policy/test-stream` and `GET /api/storage/trash/restore/test-stream` exist for progress-stream testing. Cleanup takes an explicit `mode`: `quarantine` moves to trash and is restorable, `permanent` is not. The caller must name the mode — there is no default that silently deletes. |
+| Provider quotas and tests | `src/server/management/provider-routes.ts` — `GET /api/provider-quotas`, `POST /api/providers/test`, `GET/PUT /api/provider-context-caps`, `GET /api/provider-presets`. A quota read may be served from cache or force-refreshed; absent quota data is reported as unknown rather than as a measured zero. |
+| Models and visibility | `src/server/management/model-routes.ts` — `GET /api/models`, `PUT /api/disabled-models`, `PUT /api/model-visibility`, `PUT /api/selected-models`, `GET/POST /api/custom-models`. Visibility writes trigger catalog sync through the owning server path. |
+| Effort and fallback | `src/server/management/agent-settings-routes.ts` — `GET/PUT /api/effort-caps`, `/api/subagent-models`, `/api/subagent-model-fallback`. Caps clamp; they do not reject. |
+| Grok and Claude integrations | `src/server/management/agent-settings-routes.ts` — `GET /api/grok`, `PUT /api/grok/selection`, `POST /api/grok/apply`, `GET/PUT /api/claude-desktop`, `POST /api/claude-desktop/apply`, `GET /api/claude-desktop/status`, `GET/PUT /api/claude-code`. Apply writes an external app's profile, so its status probe must read the same resolved path it writes (see [`04_transports-and-sidecars.md`](04_transports-and-sidecars.md)). |
+| Combos | `src/server/management/combo-routes.ts` — `GET/PUT/DELETE /api/combos` own provider combination and failover definitions. |
+| Codex accounts | `src/codex/auth-api.ts` — `GET/POST/DELETE /api/codex-auth/accounts`, `PUT /api/codex-auth/accounts/alias`, `PUT /api/codex-auth/accounts/pause`, `PUT /api/codex-auth/accounts/pause-exhausted`, `POST /api/codex-auth/accounts/clear-cooldown`, `GET/PUT /api/codex-auth/active`, `PUT /api/codex-auth/auto-switch`, `PUT /api/codex-auth/pool-strategy`, `PUT /api/codex-auth/failover`, `GET /api/codex-auth/quota`, `GET /api/codex-auth/reset-credits` with `POST /api/codex-auth/reset-credits/consume`, and the login flow `POST /api/codex-auth/login`, `POST /api/codex-auth/login/code`, `POST /api/codex-auth/login/cancel`, `GET /api/codex-auth/login-status`. Account ids are opaque handles and are serialized so the GUI can address an account; emails are masked and tokens are never serialized. New-account config commits add UI-managed selector bindings in the same config save; deletion deliberately retains existing bindings for fail-closed exact routing and re-add stability. Account mutations request catalog convergence only after config durability and expose only the boolean `catalogRefreshPending` completion projection. |
+| Sidebar | `src/server/management/sidebar-routes.ts` — `GET/POST /api/github/star` and `GET /api/update/badge`. Sidebar state is cosmetic; a failed fetch degrades silently. |
+| Logs | `src/server/management/logs-usage-routes.ts` — `GET /api/logs`, `GET /api/claude/inbound-debug`, and `GET /api/debug/injection-logs` join the debug streams described above. |
+
+Android Remote also owns `POST /api/android-remote/cloudflare/discover` and
+`POST /api/android-remote/cloudflare/provision`. Discovery is read-only and returns only bounded
+account/zone metadata. Provisioning creates Cloudflare resources and therefore requires
+`ManagementContext.principal === "gui-session"`; undefined direct-dispatch and raw-admin-token
+principals fail closed before the one-time API token body is read. The response never contains the
+API token or connector token. `src/android-remote/cloudflare-provisioning.ts` owns the fixed API
+destination, response/time bounds, active-zone and single-subdomain validation, exact-tunnel reuse,
+DNS conflict refusal, connector-token retrieval, and best-effort rollback.
+
+Provider writes must not round-trip masked API keys as real secrets. Dashboard actions that change
+model visibility or subagent selection should trigger catalog/cache sync behavior through the server
+path that owns it.
+
+The UI must show one provider card and one Models group for Codex-login OpenAI, describe Pool and
+Direct accurately, and keep the main account inside Pool. Public model state keeps virtual Pro ids
+even though transport logs may additionally report the resolved base model. Detailed rules live in
+[`08_openai-provider-tiers.md`](08_openai-provider-tiers.md).
+
+User aliases are display metadata only. Codex pool aliases live on `CodexAccount`, OAuth aliases on
+`ProviderAccount`, and API-key aliases reuse the existing key `label`; account ids, credential
+identity, active selection, and routing never consult these fields. The matching CLI is
+`ocx account alias <provider> <id> <display-name|->` (`rename` is accepted as a synonym).
+
+Selection order is the opposite case and must not be folded into the alias route. `codexAccountPriorities`
+is routing metadata that Pool selection consults, it lives in config rather than on `CodexAccount` so the
+`__main__` Desktop login can carry one, and the alias route's rejection of `__main__` would be wrong for
+it. The matching CLI is `ocx account priority <provider> <id|main> [<value>]`, reading the current order
+when the value is omitted. Ordering invariants live in
+[`08_openai-provider-tiers.md`](08_openai-provider-tiers.md).
+
+## Start / Stop Proxy control
+
+The dashboard sidebar includes one health-derived lifecycle control. In the persistent desktop
+shell it invokes the serialized native bridge: an offline runtime shows **Start Proxy**, a ready or
+degraded runtime shows **Stop Proxy**, and transitions are disabled as **Starting…** or
+**Stopping…**. The shell and loaded dashboard remain available after stop so one later click can
+start the bundled runtime again. The Tauri command verifies that calls come from the exact loopback
+origin identity-checked when the dashboard window opened; the last trusted origin remains recorded
+while the proxy is offline so the loaded page can request Start.
+
+An ordinary browser has no process-launch bridge and therefore keeps the stop-only behavior through
+`POST /api/stop`. Both paths ask for confirmation before stop. The endpoint fences new turns,
+restores only Remodex-owned client state, stops the service, and exits. If restoration or lifecycle
+ownership is unsafe it returns 409 and keeps the proxy running.
+
+## Bun runtime provenance
+
+`GET /api/system/memory` may report `bunRuntimeSource` — one of `override`, `bundled`, or
+`process` — describing how the **running service** obtained its Bun binary.
+
+The value is stamped into the launched process's environment as a pair —
+`OCX_BUN_RUNTIME_SOURCE` plus `OCX_BUN_RUNTIME_PATH`, the binary it was minted for — by whichever
+launcher selected that binary: the npm Node launcher, the Windows Task Scheduler wrapper, the
+native WinSW service, launchd, systemd, the Codex autostart shim, and the Windows tray host. Both
+halves come from a single `durableBunRuntime()` resolution at each site, so the marker can never
+describe a different binary than the one actually baked.
+
+Launchers that re-exec `process.execPath` instead of resolving a binary — `ocx ensure`, GUI/Claude/
+OpenCode start, `POST /api/system/restart`, and the update relaunch — go through
+`withProcessRuntimeProvenance()`. An inherited marker is carried forward only when its recorded
+path is the executable about to run, compared through `realpath` so symlinks, junctions, and
+Windows case differences do not break a valid match. The recorded path is what settles this rather
+than re-deriving the original selection: a service installed with a shell-local override keeps
+neither that shell nor its `OPENCODEX_BUN_PATH`, so re-deriving would demote a correct `override`
+to `process` on the first relaunch. A marker that describes some other binary — inheritance
+travels down a process tree and can outlive the binary it was minted for — is dropped in favor of
+what is actually executing.
+
+The Codex shims scope the pair to their `ensure` invocation (an assignment prefix in `sh`,
+`setlocal`/`endlocal` in `cmd`, save-and-restore in PowerShell) rather than exporting it. A shim
+wraps the real `codex`, so an exported marker would be inherited by Codex and everything it
+spawns.
+
+**Trust rule: a reporting surface must never resolve provenance for itself.** Calling
+`durableBunRuntime()` at report time answers "what would this process pick right now", which is
+a different question from "what was the service started with" — and the two diverge exactly when
+the answer matters, such as a `doctor` run in a shell whose `OPENCODEX_BUN_PATH` differs from the
+installed service's. Read-back goes through `reportedBunRuntimeSource()`, which allowlists the
+three values and returns `undefined` for anything else.
+
+**Backward compatibility: absent is a real answer.** A service installed before this marker
+existed reports no provenance, the endpoint omits the field, and consumers must say the origin is
+unknown rather than infer one. `rmx doctor` relies on this to avoid its previous behavior of
+telling a user to set `OPENCODEX_BUN_PATH` when the override was already active (#848). An
+unrecognized wire value is treated as absent rather than passed through.
+
+`bunRevision` remains informational and carries no capability meaning. Provenance does not feed
+the eager-relay decision: the conservative `auto-known-bad` result for canary and otherwise
+unvalidated Bun builds is unchanged (`src/lib/bun-stream-caps.ts`).
+
+## Startup safety
+
+**Startup safety** is reachable by route (`/#startup`) and rendered by the app, but it is not a
+sidebar entry: it is entered from the dashboard's startup-state row, which links there whether the
+current state needs remediation or merely reports how routing is protected. Its warning state is derived from active
+Codex routing plus the actual service and launcher-shim installation state; the
+`codexAutoStart` preference alone is never presented as proof of restart protection. The page shows
+copyable repair commands (`rmx service repair` for an installed service or `rmx service install` when none is registered, `rmx codex-shim install`, and `rmx restore`). On
+Windows it can also install an owned, per-user system tray. The resident tray owns only its icon,
+home-scoped singleton, and HKCU Run registration; fixed proxy actions delegate to the CLI so drain,
+service conflict handling, native restore, and PID identity remain centralized. Tray presence never
+makes `startup.status` protected.
+
+Windows Task Scheduler create failures must not depend solely on localized `schtasks.exe` text.
+When the owned fixed-shape `/create /tn opencodex-proxy /xml ... /f` command exits with status 1,
+the effective-token elevation probe may classify it as access denied only when the token is known
+to be non-elevated. An unavailable probe remains `other` and cannot trigger UAC. Query, run, delete,
+native-service, file-write, and foreign task failures never use this fallback.
+
+```text
+[Decision Log]
+- 목적과 의도: Make Windows scheduler installation recovery work on non-English systems without broadening the commands that may request UAC.
+- 기존 구현 및 제약 조건: Access-denied classification parsed English and German stderr. Chinese OEM output decoded as UTF-8 became mojibake, so the fixed scheduler-create failure lost its machine marker and the dashboard could not select its existing elevation transaction.
+- 검토한 주요 대안: Add translations and code-page decoders; elevate every scheduler failure; always launch installation elevated; or combine a native effective-token probe with the already fixed command shape and exit status.
+- 선택한 방식: Preserve text detection, then use the native token probe only for status-1 creation of the owned `opencodex-proxy` XML task. Unknown probe results fail closed.
+- 다른 대안 대신 이 방식을 선택한 이유: Windows localization and OEM code pages are open-ended, while the token state and owned command shape are stable security signals already bounded by the elevated transaction protocol.
+- 장점, 단점 및 영향: Non-English users receive stable guidance and dashboard UAC recovery. A non-permission status-1 failure from the exact owned command may be retried once elevated, but foreign operations cannot cross the elevation boundary and the elevated transaction still fails closed.
+```
+
+Dashboard updates persist their detached worker PID before returning success. The worker is launched
+outside the proxy service's process group (a transient `systemd-run --user` unit on Linux, a
+one-shot `launchctl submit` job on macOS, and PowerShell `Start-Process` on Windows), so stopping
+the managed proxy cannot terminate the updater before recovery. This lets a later run
+distinguish a live installer from a worker that crashed. Records created by older versions do not
+have a PID, so they remain exclusive for a conservative ten-minute window before automatic
+recovery; operators no longer need to delete `update-job.json` after a dead worker.
+
+```text
+[Decision Log]
+- 목적과 의도: Prevent a crashed dashboard update worker from permanently blocking every later update.
+- 기존 구현 및 제약 조건: The job file was written before spawn, the returned PID was not persisted, and active status had no liveness or freshness check.
+- 검토한 주요 대안: Require manual deletion; expire all jobs by age; or persist PID and use age only for legacy no-PID records.
+- 선택한 방식: Persist and verify PID liveness, with a ten-minute fallback only for legacy records.
+- 다른 대안 대신 이 방식을 선택한 이유: It recovers known-dead workers promptly without allowing a second installer beside a long-running live worker.
+- 장점, 단점 및 영향: New jobs self-recover after worker death and spawn failures become visible; legacy crashes may remain blocked for up to ten minutes.
+```
+
+## UX boundary
+
+The dashboard is a local control surface, not a separate service. It should reflect the same config
+and catalog invariants documented in this folder rather than inventing parallel state.
+
+## Dashboard surfaces
+
+The sidebar page list lives in `gui/src/App.tsx` (`NAV`). Several are workspace shells rather than
+single forms, and the shell pattern is the part worth keeping stable:
+
+| Surface | Shape |
+| --- | --- |
+| Providers | Rail of configured providers plus a detail pane whose tabs are Overview, Models, Usage, then Accounts or API Keys when the provider has an auth surface, then Settings (`gui/src/components/provider-workspace/ProviderDetails.tsx`). |
+| API keys | Rail plus per-key detail; masked values only (`gui/src/components/apikeys-workspace/`). |
+| Storage | Rail plus cleanup and trash detail (`gui/src/components/storage-workspace/`). |
+| Subagents | Featured-roster selection workspace (`gui/src/components/subagents-workspace/`). |
+| Combos | Rail, detail panel, and an add flow (`gui/src/components/ComboWorkspace.tsx`). |
+| Add provider | Catalog browser plus form and OAuth panes (`gui/src/components/provider-catalog/`, `gui/src/components/AddProviderModal.tsx`). |
+| Codex accounts | Account pool cards, add-account flow, switch and reset modals (`gui/src/components/CodexAccountPool.tsx`, `gui/src/components/AddCodexAccountModal.tsx`), plus the generic account-targeting picker opt-in on `gui/src/pages/CodexAuth.tsx`. Add/delete/login completion is projected to one boolean before presentation; pending catalog work is a warning, not a failed account mutation. |
+| Dashboard overview | Overview, Providers, and Models tabs at the page level (`gui/src/pages/Dashboard.tsx`), the 30-day token and coverage stats in the overview head (`gui/src/pages/dashboard-overview-head.tsx`), and the effort-cap, injection, maintenance, sidecar, and memory panels below it (`gui/src/pages/dashboard-overview-panels.tsx`). |
+| Android Remote | A compact gateway, Cloudflare Tunnel, QR pairing, and authorized-client surface (`gui/src/pages/AndroidRemote.tsx`). It displays the real gateway and tunnel states, defaults to Quick Tunnel, marks **Use my domain** as recommended, automates scoped-token account/domain discovery and tunnel/DNS creation, keeps hostname/connector-token entry under Advanced manual setup, creates five-minute one-use QR codes only when a LAN or verified public route exists, and revokes active phone sockets immediately. Sleep prevention remains explicitly pending. |
+
+Rail selection is component-local state today, so a reload returns to the workspace's default
+selection rather than the previously selected row. An OAuth ToS warning is shown before a login that
+requires acceptance (`gui/src/components/OAuthTosWarningModal.tsx`).
+
+The `/#codex-auth` add-account modal has a three-step manual-code UX contract on top of the existing
+OAuth polling API: submit request, waiting-for-login completion, and terminal success/failure. Once
+`POST /api/codex-auth/login/code` succeeds, the GUI must keep the input disabled, expose an
+`aria-live` status message that the code was accepted, and surface repeated `login-status` polling
+network failures as a visible warning instead of silently looking idle again.
+
+The account-targeting control reads the effective flag from `GET /api/settings`; it must not infer
+state from the redacted config DTO or expose selector mappings. It renders no actionable off switch
+before hydration, serializes rapid clicks, rejects stale poll results that started before a mutation,
+and accepts the server-confirmed state after PUT. Product copy describes arbitrary public selectors
+and exact account binding only—there are no built-in Personal/Work roles. A pending catalog refresh
+keeps the saved state and renders fixed `rmx sync` guidance without server/account detail.
+
+## Usage accounting
+
+`src/usage/log.ts` writes append-only JSONL to `~/.remodex/usage.jsonl` with file mode `0o600`.
+`src/usage/summary.ts` turns that file into the `/api/usage` shape — totals, daily zero-filled
+grid, model and provider breakdowns, and `measured / reported / unreported / unsupported / estimated` counts.
+A missing `usage.jsonl` returns a zeroed summary with 200, not an error: a fresh install has no
+usage and must not render as a failure. What the shape must never do is present an unmeasured
+request as a measured zero — that is what the `measured / reported / unreported / unsupported /
+estimated` split exists for, and why coverage is reported alongside totals. The dashboard Usage tab renders the same shape, and the
+main Dashboard surfaces a 30d token / coverage summary. The in-memory `requestLog` is capped at
+200 entries and is **not** the source of truth for aggregation — the JSONL on disk is.
+
+The management API caches only the compact summary for an exact file revision and query; it never
+retains normalized per-request rows after a response. The cache invalidates on any identity, size, or
+timestamp change and at the next range expiry or local-day boundary. Rebuilds parse in bounded
+batches and yield between them, so unrelated management requests remain serviceable even for a large
+existing log. The Dashboard polls its 30-day usage summary independently once per minute, so usage
+work cannot delay health/provider/settings state or run every five seconds.
+
+[Decision Log]
+- 목적과 의도: Keep dashboard and management requests responsive as `usage.jsonl` grows.
+- 기존 구현 및 제약 조건: The JSONL file remains the durable source of truth and may be truncated, replaced, or hand-edited.
+- 검토한 주요 대안: Retain normalized rows, maintain a second database, or cache only revision-keyed summaries and cooperatively rebuild them.
+- 선택한 방식: Keep only bounded summary results, share full reads by exact file identity, yield during parsing, and poll usage separately at a slower cadence.
+- 다른 대안 대신 이 방식을 선택한 이유: It bounds resident heap and avoids a second persistence format while keeping unrelated endpoints responsive.
+- 장점, 단점 및 영향: Unchanged queries are cheap and memory stays bounded; a changed large log still consumes rebuild CPU, but cooperatively and at most once per observed revision/query.
+
+For diagnosing upstream-shape / usage-extraction issues run `rmx debug usage on` (or set
+`OPENCODEX_USAGE_DEBUG=1` before start). The proxy then writes a rolling debug record per finalized
+request to `~/.remodex/usage-debug.jsonl` (mode `0o600`, auto-trimmed to the most-recent 100 lines
+once it exceeds 200) with the upstream content-type, body kind (`sse / json / other / none`), a 2KB
+body sample, and the extracted usage. Off by default; the hot path is guarded so production stays
+untouched.
+
+## Provider debug logging
+
+Provider transport diagnostics (dropped SSE frames, adapter dial/stream events, etc.) are opt-in:
+`rmx debug provider on` / `rmx debug provider off` on the running proxy, the Debug-page toggle, or `OCX_DEBUG=1` on
+the next start (legacy `OCX_DEBUG_FRAMES` still enables the same path). Lines
+use the `[ocx:<adapter>:<event>]` prefix, go to the proxy terminal, and are buffered for
+`rmx debug provider logs` / `rmx debug provider logs -f`. Usage JSONL tails with
+`rmx debug usage logs [-f]`. Separate from provider buffered logs above.

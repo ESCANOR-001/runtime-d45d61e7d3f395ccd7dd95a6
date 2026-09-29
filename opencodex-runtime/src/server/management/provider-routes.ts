@@ -1,0 +1,781 @@
+import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import type { CatalogModel } from "../../codex/catalog";
+import { catalogModelSlug, invalidateCodexModelsCache, nativeModelRows, uniqueCatalogModelsForPublicList } from "../../codex/catalog";
+import {
+  DEFAULT_SUBAGENT_MODELS,
+  codexAutoStartEnabled,
+  hasOwnProvider,
+  isValidProviderName,
+  multiAgentGuidanceEnabled,
+  providerBaseUrlConfigError,
+  providerHeadersConfigError,
+  saveConfigPreservingClaudeCode,
+  withConfigMutationLockSync,
+} from "../../config";
+import {
+  clearLoginState,
+  getLoginStatus,
+  isPublicOAuthProvider,
+  listOAuthProviders,
+  startLoginFlow,
+  submitManualLoginCode,
+  upsertOAuthProvider,
+} from "../../oauth";
+import { removeCredential } from "../../oauth/store";
+import { providerDestinationResolvedError } from "../../lib/destination-policy";
+import { reconcileLiveStateStores } from "../../lib/state-store-registrations";
+import { ProviderOutboundPolicyError, providerOutboundGet, providerOutboundPost, providerRedirectError } from "../../lib/provider-outbound";
+import { parseAntigravityAvailableModels } from "../../providers/antigravity-models";
+import { enrichProviderFromCatalog, listKeyLoginProviders } from "../../oauth/key-providers";
+import { deriveProviderPresets } from "../../providers/derive";
+import { effectiveGoogleMode, providerCodexAccountMode, providerMatchesRegistryTransport } from "../../providers/registry";
+import {
+  extractModelEnvelopeRows,
+  extractProviderModelItems,
+  readBoundedDiscoveryJson,
+  resolveProviderModelDiscovery,
+} from "../../providers/model-discovery";
+import { routedSlug, slugEquals } from "../../providers/slug-codec";
+import { clearProviderQuotaCache, fetchProviderQuotaReports } from "../../providers/quota";
+import { CODEX_FORWARD_BASE_URL, isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
+import { codexAccountNamespaceProviderCollisionError } from "../../codex/account-namespace-match";
+import { clearThreadAccountMap } from "../../codex/routing";
+import { primeCodexPoolQuotas } from "../../codex/auth-api";
+import { getProviderDiscoveryStatus } from "../../codex/model-cache";
+import { DEFAULT_PROVIDER_CONTEXT_CAP, globalContextCapValue, providerContextCap, providerContextCaps, setAllProviderContextCaps, setGlobalContextCapValue, setProviderContextCap } from "../../providers/context-cap";
+import { resolveCodexHomeDir } from "../../codex/home";
+import { readUsageEntries } from "../../usage/log";
+import { getUsageDebugLogEntries } from "../../usage/debug";
+import { parseRange, parseUsageSurface, summarizeUsage } from "../../usage/summary";
+import { stripCodexRuntimeProviderFields } from "../../codex/auth-context";
+import { getProviderRegistryEntry } from "../../providers/registry";
+import { getDebugLogEntries } from "../../lib/debug-log-buffer";
+import { getInjectionDebugLogEntries } from "../../lib/injection-debug-log";
+import {
+  clearDebugSettings,
+  clearDebugSetting,
+  getDebugSettings,
+  setDebugSettings,
+  type DebugFlag,
+} from "../../lib/debug-settings";
+import type { OcxClaudeCodeConfig, OcxConfig, OcxCustomModel, OcxProviderConfig } from "../../types";
+import { drainAndShutdown } from "../lifecycle";
+import { filterRequestLogs, getRequestLogEntries, type RequestLogEntry } from "../request-log";
+import { estimateComboCost, estimateRequestCost, normalizeCostTokens, tokensPerSecond } from "../../usage/cost";
+import type { PersistedUsageAttempt } from "../../usage/log";
+import { isAllowedRequestOrigin, jsonResponse, providerManagementConfigError, publicProviderBaseUrl, safeConfigDTO } from "../auth-cors";
+import { applySystemEnvToggle } from "../system-env";
+import { modelSourceVisible } from "../../model-sources";
+
+import { isPlainRecord, parseDebugLogQuery, tokPerSecondResult, unavailableCostReason, costResult, requestLogDto, stripRegistryOnlyStaticHeaders, fetchAllModels } from "./shared";
+import type { MetricUnavailableReason, TokPerSecondResult, CostEstimateReason, CostResult, MetricSource } from "./shared";
+import type { ManagementContext } from "./context";
+import { readManagementJsonBody, rethrowManagementBodyTooLarge } from "./body";
+
+type ProviderPatchApplication =
+  | { error: string }
+  | {
+      next: OcxProviderConfig;
+      touched: boolean;
+      editorTouched: boolean;
+      enablingOpenAi: boolean;
+      headersTouched: boolean;
+    };
+
+/**
+ * Apply the recognized PATCH field mask onto a provider copy. The caller runs this once
+ * for validation and again inside the config mutation lock against the newest provider,
+ * so a concurrent PATCH cannot be erased by a save of a stale snapshot. Only synchronous
+ * checks live here; the async destination probe stays in the route.
+ */
+function applyProviderPatchFields(
+  name: string,
+  provider: OcxProviderConfig,
+  rawBody: Record<string, unknown>,
+  keys: string[],
+  config: OcxConfig,
+): ProviderPatchApplication {
+  const next: OcxProviderConfig = { ...provider };
+  let touched = false;
+  let headersTouched = false;
+
+  if (Object.hasOwn(rawBody, "disabled")) {
+    if (typeof rawBody.disabled !== "boolean") return { error: "disabled must be a boolean" };
+    if (rawBody.disabled && name === config.defaultProvider) {
+      return { error: "cannot disable the default provider; set another default first" };
+    }
+    next.disabled = rawBody.disabled;
+    touched = true;
+  }
+  if (Object.hasOwn(rawBody, "adapter")) {
+    if (typeof rawBody.adapter !== "string" || !rawBody.adapter.trim()) return { error: "adapter must be a non-empty string" };
+    next.adapter = rawBody.adapter.trim();
+    touched = true;
+  }
+  if (Object.hasOwn(rawBody, "baseUrl")) {
+    if (typeof rawBody.baseUrl !== "string" || !rawBody.baseUrl.trim()) return { error: "baseUrl must be a non-empty string" };
+    next.baseUrl = rawBody.baseUrl.trim();
+    touched = true;
+  }
+  if (Object.hasOwn(rawBody, "defaultModel")) {
+    if (typeof rawBody.defaultModel !== "string") return { error: "defaultModel must be a string" };
+    const dm = rawBody.defaultModel.trim();
+    if (dm) next.defaultModel = dm;
+    else delete next.defaultModel;
+    touched = true;
+  }
+  if (Object.hasOwn(rawBody, "authMode")) {
+    if (typeof rawBody.authMode !== "string") return { error: "authMode must be a string" };
+    const mode = rawBody.authMode.trim();
+    if (mode === "key" || mode === "forward" || mode === "oauth" || mode === "local") {
+      next.authMode = mode;
+      touched = true;
+    } else if (mode === "") {
+      delete next.authMode;
+      touched = true;
+    } else {
+      return { error: "authMode must be key, forward, oauth, or local" };
+    }
+  }
+  if (Object.hasOwn(rawBody, "apiKeyTransport")) {
+    const transport = rawBody.apiKeyTransport;
+    if (transport === "x-api-key" || transport === "bearer") {
+      next.apiKeyTransport = transport;
+      touched = true;
+    } else if (transport === "") {
+      delete next.apiKeyTransport;
+      touched = true;
+    } else {
+      return { error: "apiKeyTransport must be x-api-key, bearer, or empty to clear" };
+    }
+  }
+  if (Object.hasOwn(rawBody, "note")) {
+    if (typeof rawBody.note !== "string") return { error: "note must be a string" };
+    const note = rawBody.note.trim();
+    if (note) next.note = note;
+    else delete next.note;
+    touched = true;
+  }
+  if (Object.hasOwn(rawBody, "allowPrivateNetwork")) {
+    if (typeof rawBody.allowPrivateNetwork !== "boolean") return { error: "allowPrivateNetwork must be a boolean" };
+    next.allowPrivateNetwork = rawBody.allowPrivateNetwork;
+    touched = true;
+  }
+  if (Object.hasOwn(rawBody, "liveModels")) {
+    if (typeof rawBody.liveModels !== "boolean") return { error: "liveModels must be a boolean" };
+    next.liveModels = rawBody.liveModels;
+    touched = true;
+  }
+  // The Models page edits the catalog hints in place; keep them on the existing
+  // provider mutation path so validation, cache invalidation, and convergence stay unified (#1073).
+  if (Object.hasOwn(rawBody, "contextWindow")) {
+    const value = rawBody.contextWindow;
+    if (value === null) {
+      delete next.contextWindow;
+    // `Number.isInteger(1e100)` is true, so an integer check alone admits a value that
+    // serializes into the catalog as an enormous number and can make Codex reject the whole
+    // file. Safe-integer is the real bound for something that ends up in a JSON int field.
+    } else if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) {
+      next.contextWindow = value;
+    } else {
+      return { error: "contextWindow must be a positive safe integer or null" };
+    }
+    touched = true;
+  }
+  if (Object.hasOwn(rawBody, "modelContextWindows")) {
+    const value = rawBody.modelContextWindows;
+    if (value === null) {
+      delete next.modelContextWindows;
+    } else {
+      if (!isPlainRecord(value)) return { error: "modelContextWindows must be a plain object or null" };
+      const windows: Record<string, number> = { ...(next.modelContextWindows ?? {}) };
+      for (const [model, window] of Object.entries(value)) {
+        if (!model.trim()) return { error: "modelContextWindows keys must be nonblank model ids" };
+        if (window === null) {
+          delete windows[model];
+          continue;
+        }
+        if (typeof window !== "number" || !Number.isSafeInteger(window) || window <= 0) {
+          return { error: "modelContextWindows values must be positive safe integers or null" };
+        }
+        windows[model] = window;
+      }
+      if (Object.keys(windows).length > 0) next.modelContextWindows = windows;
+      else delete next.modelContextWindows;
+    }
+    touched = true;
+  }
+
+  // headers is the one object-valued field in the mask. PATCH semantics merge it
+  // shallowly into the existing block so a single fingerprint header can be added
+  // without wiping the rest; null or an empty object clears user-managed headers.
+  if (Object.hasOwn(rawBody, "headers")) {
+    const headersValue = rawBody.headers;
+    if (headersValue === null || (isPlainRecord(headersValue) && Object.keys(headersValue).length === 0)) {
+      // Registry-owned static metadata (e.g. opencode-free's x-opencode-client marker)
+      // is not user-managed: restoring it keeps the upstream transport intact after a
+      // clear instead of deleting the whole block.
+      const entry = getProviderRegistryEntry(name);
+      if (entry?.staticHeaders && providerMatchesRegistryTransport(name, next)) {
+        next.headers = { ...entry.staticHeaders };
+      } else {
+        delete next.headers;
+      }
+    } else {
+      if (!isPlainRecord(headersValue)) return { error: "headers must be an object" };
+      const headersError = providerHeadersConfigError(headersValue);
+      if (headersError) return { error: headersError };
+      // Header names are case-insensitive on the wire. Drop any existing key whose
+      // lowercase name collides with an incoming one, or Headers normalization would
+      // send a combined "x-custom: v1, v2" value upstream.
+      const incoming = new Map(
+        Object.entries(headersValue as Record<string, string>).map(([key, value]) => [key.toLowerCase(), [key, value] as const]),
+      );
+      const merged: Record<string, string> = {};
+      for (const [key, value] of Object.entries(next.headers ?? {})) {
+        if (!incoming.has(key.toLowerCase())) merged[key] = value;
+      }
+      for (const [key, value] of incoming.values()) merged[key] = value;
+      next.headers = merged;
+    }
+    touched = true;
+    headersTouched = true;
+  }
+
+  if (!touched) return { error: "no recognized fields to update" };
+
+  // A disabled-only toggle preserves the v2 fast lane for non-openai providers: it changes
+  // routing eligibility, not the provider shape. Re-enabling `openai` is different — a
+  // malformed disabled row must not come back online unchanged, so canonicalize/reject
+  // against the same built-in gate used by mode PATCH and POST.
+  const editorTouched = keys.some(key => key !== "disabled");
+  const enablingOpenAi = name === "openai"
+    && Object.hasOwn(rawBody, "disabled")
+    && rawBody.disabled === false
+    && provider.disabled === true;
+  if (!editorTouched && enablingOpenAi) {
+    if (!isCanonicalOpenAiForwardProvider(next)) {
+      return { error: "provider openai must be the canonical built-in provider" };
+    }
+    // Persist the byte-identical canonical URL so config.ts startup checks (case-sensitive)
+    // accept the row after we fill mode. Equivalent hosts like CHATGPT.com/:443 normalize here.
+    next.baseUrl = CODEX_FORWARD_BASE_URL;
+    // Fill missing mode so a disabled canonical row becomes a complete live openai entry.
+    if (next.codexAccountMode !== "pool" && next.codexAccountMode !== "direct") {
+      next.codexAccountMode = "pool";
+    }
+    if (next.disabled === false) delete next.disabled;
+    // Canonical openai never uses private-network opt-in; drop a stale flag that
+    // was ignored for the DNS probe so it cannot linger on the live row.
+    delete next.allowPrivateNetwork;
+  }
+  return { next, touched, editorTouched, enablingOpenAi, headersTouched };
+}
+
+export async function handleProviderRoutes(ctx: ManagementContext): Promise<Response | null> {
+  const { req, url, config, deps, convergeCodexCatalog, syncClaudeAgentDefsBestEffort } = ctx;
+
+  if (url.pathname === "/api/provider-quotas" && req.method === "GET") {
+    const forceRefresh = url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true";
+    return jsonResponse(await fetchProviderQuotaReports(config, forceRefresh));
+  }
+
+  if (url.pathname === "/api/providers" && req.method === "GET") {
+    return jsonResponse(Object.entries(config.providers).map(([name, p]) => ({
+      name, adapter: p.adapter, baseUrl: publicProviderBaseUrl(p.baseUrl), defaultModel: p.defaultModel,
+      hasApiKey: !!p.apiKey,
+      // Presence only (#959 review): header names and values never leave the process.
+      hasHeaders: !!p.headers && Object.keys(p.headers).length > 0,
+      allowPrivateNetwork: p.allowPrivateNetwork === true,
+      liveModels: p.liveModels !== false,
+      models: p.models ?? [],
+      contextWindow: p.contextWindow,
+      modelContextWindows: p.modelContextWindows,
+      authMode: p.authMode,
+      apiKeyTransport: p.apiKeyTransport,
+      disabled: p.disabled === true,
+      modelSourceVisible: modelSourceVisible(config, name),
+      codexAccountMode: providerCodexAccountMode(name, p),
+      discovery: p.liveModels === false ? undefined : getProviderDiscoveryStatus(name),
+    })));
+  }
+
+  // Add (or overwrite) a single provider. Merges into the live in-memory config and
+  // persists — existing providers' real keys are never round-tripped (unlike PUT /api/config,
+  // which would re-save the masked keys from GET). Live routing picks it up immediately.
+  if (url.pathname === "/api/providers" && req.method === "POST") {
+    let body: { name?: unknown; provider?: unknown; setDefault?: boolean };
+    try { body = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    const providerError = providerManagementConfigError(name, body.provider);
+    if (providerError) return jsonResponse({ error: providerError }, 400);
+    const prov = body.provider ? stripCodexRuntimeProviderFields(body.provider as OcxProviderConfig) : undefined;
+    if (!name || !prov?.adapter || !prov?.baseUrl) {
+      return jsonResponse({ error: "name, provider.adapter and provider.baseUrl are required" }, 400);
+    }
+    if (!isValidProviderName(name)) {
+      return jsonResponse({ error: "provider name must use letters, numbers, dot, underscore, or hyphen and cannot be a reserved object key" }, 400);
+    }
+    const namespaceCollision = codexAccountNamespaceProviderCollisionError(config.codexAccountNamespaces, name);
+    if (namespaceCollision) {
+      return jsonResponse({ error: namespaceCollision }, 409);
+    }
+    // Hostname destinations additionally get a DNS-resolved SSRF check at write time —
+    // the sync check above only classifies literal IPs (review finding, PR #96).
+    // Canonical openai still runs the resolver: only Clash fake-IP (198.18.0.0/15)
+    // answers are ignored; loopback/RFC1918/metadata/mixed sets still fail.
+    const allowBenchmarkAddresses = name === "openai" && isCanonicalOpenAiForwardProvider(prov);
+    const resolvedError = await providerDestinationResolvedError(name, prov, { allowBenchmarkAddresses });
+    if (resolvedError) return jsonResponse({ error: resolvedError }, 400);
+    if (body.setDefault !== undefined && typeof body.setDefault !== "boolean") {
+      return jsonResponse({ error: "setDefault must be a boolean" }, 400);
+    }
+    if (body.setDefault === true && prov.disabled) {
+      return jsonResponse({ error: "cannot set a disabled provider as default", code: "default_provider_disabled" }, 400);
+    }
+    // Catalog providers (e.g. ollama-cloud) carry a models + vision/reasoning classification the GUI
+    // doesn't send — merge it in so the sidecars are gated correctly.
+    enrichProviderFromCatalog(name, prov);
+    const { saveConfigPreservingClaudeCode: save } = await import("../../config");
+    // Overwriting an existing provider must not drop its multi-key pool: carry it over, then
+    // let the (possibly new) apiKey join the pool as the active entry.
+    const existingPool = config.providers[name]?.apiKeyPool;
+    if (existingPool && !prov.apiKeyPool) prov.apiKeyPool = existingPool;
+    config.providers[name] = stripRegistryOnlyStaticHeaders(name, prov);
+    if (body.setDefault === true) config.defaultProvider = name;
+    save(config);
+    reconcileLiveStateStores();
+    if (prov.apiKey && prov.apiKeyPool) {
+      const { addProviderApiKey } = await import("../../providers/api-keys");
+      addProviderApiKey(config, name, prov.apiKey);
+    }
+    const { clearModelCache } = await import("../../codex/model-cache");
+    clearModelCache(name);
+    const catalogRefresh = await convergeCodexCatalog();
+    deps.androidRemoteController?.notifyModelCatalogChanged();
+    return jsonResponse({ success: true, name, catalogRefresh });
+  }
+
+  if (url.pathname === "/api/providers" && req.method === "PATCH") {
+    const name = url.searchParams.get("name")?.trim();
+    if (!name || !isValidProviderName(name) || !hasOwnProvider(config.providers, name)) return jsonResponse({ error: "unknown provider" }, 404);
+    let rawBody: unknown;
+    try { rawBody = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
+    if (!isPlainRecord(rawBody)) return jsonResponse({ error: "provider patch body must be a plain object" }, 400);
+    const keys = Object.keys(rawBody);
+    const hasMode = Object.hasOwn(rawBody, "codexAccountMode");
+    const hasSetDefault = Object.hasOwn(rawBody, "setDefault");
+
+    // codexAccountMode keeps its dedicated side-effect path (quota cache clear, thread map
+    // clear, pool prime) and is mutually exclusive with every other patch field.
+    if (hasMode) {
+      if (keys.length !== 1) {
+        return jsonResponse({ error: "codexAccountMode cannot be combined with other patch fields" }, 400);
+      }
+      if (name !== "openai") return jsonResponse({ error: "codexAccountMode is valid only for provider openai" }, 400);
+      const mode = rawBody.codexAccountMode;
+      if (mode !== "pool" && mode !== "direct") {
+        return jsonResponse({ error: "codexAccountMode must be pool or direct" }, 400);
+      }
+      const provider = config.providers.openai;
+      if (!provider || !isCanonicalOpenAiForwardProvider(provider)) {
+        return jsonResponse({ error: "provider openai must be the canonical built-in provider" }, 400);
+      }
+      const { saveConfigPreservingClaudeCode: save } = await import("../../config");
+      config.providers.openai = { ...provider, codexAccountMode: mode };
+      save(config);
+      reconcileLiveStateStores();
+      (deps.clearProviderQuotaCache ?? clearProviderQuotaCache)();
+      (deps.clearThreadAccountMap ?? clearThreadAccountMap)();
+      if (mode === "pool") {
+        try {
+          const prime = deps.primeCodexPoolQuotas ?? primeCodexPoolQuotas;
+          void Promise.resolve(prime(config, "mode-change")).catch(() => undefined);
+        } catch {
+          // Quota priming is best-effort; the persisted live mode is already authoritative.
+        }
+      }
+      return jsonResponse({ success: true, name: "openai", codexAccountMode: mode });
+    }
+
+    // Default-provider changes must be a deliberate, standalone action. This keeps
+    // routing changes out of ordinary provider edits and lets the dashboard expose a
+    // simple "Set as default" control without round-tripping the full config.
+    if (hasSetDefault) {
+      if (keys.length !== 1 || rawBody.setDefault !== true) {
+        return jsonResponse({ error: "setDefault must be true and cannot be combined with other patch fields" }, 400);
+      }
+      if (config.providers[name]!.disabled) {
+        return jsonResponse({ error: "cannot set a disabled provider as default", code: "default_provider_disabled" }, 400);
+      }
+      const { saveConfigPreservingClaudeCode: save } = await import("../../config");
+      config.defaultProvider = name;
+      save(config);
+      reconcileLiveStateStores();
+      deps.androidRemoteController?.notifyModelCatalogChanged();
+      return jsonResponse({ success: true, name, defaultProvider: name });
+    }
+
+    // Field-mask editor: apply recognized fields onto a copy, then validate the MERGED
+    // provider (canonical-seed guard covers openai; local-guard covers registry key providers).
+    // API keys are never writable here — the api-keys endpoints own pool-integrated key writes.
+    if (Object.hasOwn(rawBody, "apiKey")) {
+      return jsonResponse({ error: "apiKey cannot be patched here; use the provider API-key endpoints" }, 400);
+    }
+    const applied = applyProviderPatchFields(name, config.providers[name]!, rawBody, keys, config);
+    if ("error" in applied) return jsonResponse({ error: applied.error }, 400);
+    const next = applied.next;
+
+    if (applied.editorTouched) {
+      const providerError = providerManagementConfigError(name, next);
+      if (providerError) return jsonResponse({ error: providerError }, 400);
+      const resolvedError = await providerDestinationResolvedError(name, next);
+      if (resolvedError) return jsonResponse({ error: resolvedError }, 400);
+    } else if (applied.enablingOpenAi) {
+      // Same DNS gate as POST: Clash fake-IP only. Never honor a persisted
+      // allowPrivateNetwork on this path — it must not bypass the built-in guard.
+      const resolvedError = await providerDestinationResolvedError(
+        "openai",
+        { baseUrl: CODEX_FORWARD_BASE_URL },
+        { allowBenchmarkAddresses: true },
+      );
+      if (resolvedError) return jsonResponse({ error: resolvedError }, 400);
+    }
+
+    // The live config is shared and the destination probe above is awaited. Re-apply the
+    // mask onto the newest provider under the mutation lock right before saving, so two
+    // concurrent PATCHes updating different fields/headers both survive instead of the
+    // later save clobbering the earlier snapshot.
+    let replayError: string | undefined;
+    withConfigMutationLockSync(() => {
+      const replay = applyProviderPatchFields(name, config.providers[name]!, rawBody, keys, config);
+      if ("error" in replay) {
+        replayError = replay.error;
+        return;
+      }
+      if (replay.editorTouched) {
+        const syncError = providerManagementConfigError(name, replay.next);
+        if (syncError) {
+          replayError = syncError;
+          return;
+        }
+      } else if (replay.enablingOpenAi && !isCanonicalOpenAiForwardProvider(replay.next)) {
+        replayError = "provider openai must be the canonical built-in provider";
+        return;
+      }
+      // A PATCH that managed headers owns the resulting block: the clear path restores
+      // registry static headers, so exact-match stripping must not erase them again.
+      config.providers[name] = replay.headersTouched ? replay.next : stripRegistryOnlyStaticHeaders(name, replay.next);
+      saveConfigPreservingClaudeCode(config);
+    });
+    if (replayError !== undefined) return jsonResponse({ error: replayError }, 409);
+    reconcileLiveStateStores();
+    if (applied.editorTouched) {
+      const { clearModelCache } = await import("../../codex/model-cache");
+      clearModelCache(name);
+    }
+    const catalogRefresh = await convergeCodexCatalog();
+    deps.androidRemoteController?.notifyModelCatalogChanged();
+    return jsonResponse({
+      success: true,
+      name,
+      disabled: config.providers[name]!.disabled === true,
+      hasApiKey: !!config.providers[name]!.apiKey,
+      catalogRefresh,
+    });
+  }
+
+  // Lightweight connectivity probe: perform the provider's live /models fetch DIRECTLY and
+  // report only real upstream evidence. The catalog aggregate (fetchAllModels) deliberately
+  // hides fetch failures behind stale/static fallbacks, so a catalog-presence check would
+  // let a static-catalog provider with a fake key "pass" — this endpoint never uses it.
+  if (url.pathname === "/api/providers/test" && req.method === "POST") {
+    const name = url.searchParams.get("name")?.trim();
+    if (!name || !isValidProviderName(name) || !hasOwnProvider(config.providers, name)) {
+      return jsonResponse({ error: "unknown provider" }, 404);
+    }
+    const prov = config.providers[name]!;
+    if (prov.disabled) {
+      return jsonResponse({ ok: false, error: "Provider is disabled", latencyMs: 0 });
+    }
+    if (prov.authMode === "forward") {
+      return jsonResponse({
+        ok: true,
+        latencyMs: 0,
+        message: "Passthrough provider is configured (forwards your Codex login; no upstream /models).",
+      });
+    }
+    if (prov.liveModels === false) {
+      // A static catalog has no live discovery endpoint to test. This is neither
+      // positive connectivity evidence nor an outage, and it must stay before
+      // credential resolution/network access for providers such as Antigravity.
+      return jsonResponse({ applicable: false, reason: "static_catalog", latencyMs: 0 });
+    }
+    const { buildModelsRequest, getValidAccessTokenSnapshot, resolveModelsAuthToken } = await import("../../oauth");
+    const antigravity = effectiveGoogleMode(name, prov) === "cloud-code-assist";
+    const snapshot = antigravity
+      ? await getValidAccessTokenSnapshot(name).catch(() => undefined)
+      : undefined;
+    const apiKey = snapshot?.accessToken ?? await resolveModelsAuthToken(name, prov);
+    if (prov.authMode === "oauth" && !apiKey) {
+      return jsonResponse({ ok: false, latencyMs: 0, error: "static catalog only — upstream not verified (not logged in)" });
+    }
+    const project = prov.project ?? snapshot?.projectId;
+    if (antigravity && !project) {
+      return jsonResponse({ ok: false, latencyMs: 0, error: "Antigravity project unavailable — re-run `rmx login google-antigravity`" });
+    }
+    const { method, url: modelsUrl, headers } = buildModelsRequest(prov, apiKey, name);
+    const discovery = resolveProviderModelDiscovery(name, prov);
+    const started = Date.now();
+    try {
+      const res = method === "POST"
+        ? await providerOutboundPost(name, prov, modelsUrl, {
+          headers,
+          body: JSON.stringify({ project }),
+          signal: AbortSignal.timeout(8000),
+        })
+        : await providerOutboundGet(name, prov, modelsUrl, {
+          headers,
+          signal: AbortSignal.timeout(8000),
+        });
+      const latencyMs = Date.now() - started;
+      const redirectError = await providerRedirectError(res, modelsUrl);
+      if (redirectError) {
+        return jsonResponse({
+          ok: false,
+          latencyMs,
+          error: redirectError,
+        });
+      }
+      if (!res.ok) {
+        try {
+          void res.body?.cancel().catch(() => undefined);
+        } catch {
+          // Best-effort release for non-conforming response streams.
+        }
+        return jsonResponse({ ok: false, latencyMs, error: `upstream model discovery returned ${res.status}` });
+      }
+      const bounded = await readBoundedDiscoveryJson(res, discovery.maxResponseBytes);
+      if (!bounded.ok) {
+        return jsonResponse({
+          ok: false,
+          latencyMs,
+          error: bounded.reason === "response_too_large"
+              ? `upstream model discovery exceeded the ${discovery.maxResponseBytes}-byte response limit`
+              : "upstream model discovery returned invalid JSON",
+        });
+      }
+      const ccaModels = antigravity ? parseAntigravityAvailableModels(bounded.value, discovery.maxModels) : undefined;
+      if (antigravity && !ccaModels) {
+        return jsonResponse({ ok: false, latencyMs, error: "upstream CCA model discovery returned an unexpected shape" });
+      }
+      // OpenAI-style lists (and Together top-level arrays) use the same validation/dedupe/filter
+      // as catalog discovery. Google's /v1beta/models uses `models[].name` and remains a
+      // connectivity-only count because it is not an authoritative catalog source.
+      const record = bounded.value !== null && typeof bounded.value === "object" && !Array.isArray(bounded.value)
+        ? bounded.value as Record<string, unknown>
+        : undefined;
+      const extracted = ccaModels
+        ? undefined
+        : Array.isArray(bounded.value) || Array.isArray(record?.data)
+        ? extractProviderModelItems(bounded.value, discovery)
+        : extractModelEnvelopeRows(bounded.value, discovery.maxModels, ["models"]);
+      if (extracted && !extracted.ok) {
+        return jsonResponse({
+          ok: false,
+          latencyMs,
+          error: extracted.reason === "too_many_models"
+            ? `upstream /models exceeded the ${discovery.maxModels}-row model limit`
+            : "upstream /models returned an unexpected shape",
+        });
+      }
+      const models = ccaModels?.length ?? ("items" in extracted! ? extracted!.items.length : extracted!.rows.length);
+      return jsonResponse({
+        ok: true,
+        latencyMs,
+        models,
+        message: `Connected — ${models} model${models === 1 ? "" : "s"} available.`,
+      });
+    } catch (err) {
+      return jsonResponse({
+        ok: false,
+        latencyMs: Date.now() - started,
+        error: err instanceof ProviderOutboundPolicyError
+          ? `upstream /models blocked by destination policy: ${err.message}`
+          : err instanceof Error ? err.message : "Connection test failed",
+      });
+    }
+  }
+
+  if (url.pathname === "/api/providers" && req.method === "DELETE") {
+    const name = url.searchParams.get("name")?.trim();
+    if (!name || !isValidProviderName(name) || !hasOwnProvider(config.providers, name)) return jsonResponse({ error: "unknown provider" }, 404);
+    // Config validation requires a default provider. Reassigning before deletion keeps
+    // the persisted config valid and makes removal of the current default a one-step UI
+    // operation. Prefer the first remaining *enabled* provider so DELETE cannot leave a
+    // disabled default that setDefault / disable already refuse. Object-key order is the
+    // documented configuration order and is stable through JSON persistence.
+    const fallbackDefault = name === config.defaultProvider
+      ? Object.entries(config.providers)
+        .find(([provider, providerConfig]) => provider !== name && providerConfig.disabled !== true)
+        ?.[0]
+      : undefined;
+    if (name === config.defaultProvider && !fallbackDefault) {
+      return jsonResponse({
+        error: "cannot delete the default provider when no enabled replacement remains",
+        code: "last_provider",
+      }, 409);
+    }
+    const dependentCombos = Object.entries(config.combos ?? {})
+      .filter(([, combo]) => combo.targets.some(target => target.provider === name))
+      .map(([id]) => id)
+      .sort((a, b) => a.localeCompare(b));
+    if (dependentCombos.length > 0) {
+      return jsonResponse({
+        error: `cannot delete provider "${name}" while combos depend on it`,
+        code: "provider_has_dependent_combos",
+        combos: dependentCombos,
+      }, 409);
+    }
+    const { saveConfigPreservingClaudeCode: save } = await import("../../config");
+    if (fallbackDefault) config.defaultProvider = fallbackDefault;
+    delete config.providers[name];
+    const { dropProviderCustomModels } = await import("../../providers/provider-id-rewrite");
+    const droppedCustomModels = dropProviderCustomModels(config, name);
+    setProviderContextCap(config, name, false);
+    save(config);
+    reconcileLiveStateStores();
+    const { clearModelCache: clearCache } = await import("../../codex/model-cache");
+    clearCache(name);
+    const catalogRefresh = await convergeCodexCatalog();
+    deps.androidRemoteController?.notifyModelCatalogChanged();
+    return jsonResponse({
+      success: true,
+      ...(fallbackDefault ? { defaultProvider: fallbackDefault } : {}),
+      ...(droppedCustomModels > 0 ? { droppedCustomModels } : {}),
+      catalogRefresh,
+    });
+  }
+
+  if (url.pathname === "/api/provider-context-caps" && req.method === "GET") {
+    return jsonResponse({ cap: DEFAULT_PROVIDER_CONTEXT_CAP, value: globalContextCapValue(config), caps: providerContextCaps(config) });
+  }
+
+  if (url.pathname === "/api/provider-context-caps" && req.method === "PUT") {
+    let rawBody: unknown;
+    try { rawBody = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
+    // Reject non-object payloads (e.g. `{"provider": true}` or a bare array) before any
+    // property access, with the route's consistent 400 response.
+    if (!isPlainRecord(rawBody)) return jsonResponse({ error: "provider-context-caps body must be a plain object" }, 400);
+    const body = rawBody as { provider?: unknown; enabled?: unknown; value?: unknown; setAll?: unknown };
+    const { saveConfigPreservingClaudeCode: save } = await import("../../config");
+    const { clearModelCache } = await import("../../codex/model-cache");
+    const respond = (catalogRefresh: Awaited<ReturnType<typeof convergeCodexCatalog>>) => jsonResponse({
+      ok: true,
+      cap: DEFAULT_PROVIDER_CONTEXT_CAP,
+      value: globalContextCapValue(config),
+      caps: providerContextCaps(config),
+      catalogRefresh,
+    });
+
+    // Reject malformed and mixed payloads before branch selection: `provider` and `enabled`
+    // must appear together with their expected types, and provider updates cannot be
+    // combined with `setAll` (which would otherwise be silently ignored).
+    const hasProviderFields = Object.hasOwn(body, "provider") || Object.hasOwn(body, "enabled");
+    if (hasProviderFields) {
+      if (typeof body.provider !== "string" || typeof body.enabled !== "boolean") {
+        return jsonResponse({ error: "provider and enabled are required together" }, 400);
+      }
+      if (Object.hasOwn(body, "setAll")) {
+        return jsonResponse({ error: "setAll cannot be combined with provider updates" }, 400);
+      }
+    }
+
+    // Branch 1: per-provider toggle (checked first: a per-provider request may carry an
+    // explicit `value`, which must never fall through to the global-value branch). Enable
+    // writes the current global default unless an explicit per-provider value is supplied;
+    // that value is never copied to other providers.
+    if (typeof body.provider === "string" && typeof body.enabled === "boolean") {
+      const provider = body.provider.trim();
+      if (!isValidProviderName(provider)) {
+        return jsonResponse({ error: "provider name must use letters, numbers, dot, underscore, or hyphen and cannot be a reserved object key" }, 400);
+      }
+      if (!hasOwnProvider(config.providers, provider)) {
+        return jsonResponse({ error: "unknown provider" }, 404);
+      }
+      // Validate a supplied per-provider value before mutating anything: it must be a
+      // finite number, and after flooring it must still be >= 1 — a value like 0.5 would
+      // otherwise floor to 0 and silently fall back to the global default.
+      if (body.value !== undefined && (typeof body.value !== "number" || !Number.isFinite(body.value))) {
+        return jsonResponse({ error: "value must be a positive number" }, 400);
+      }
+      const perProviderValue = typeof body.value === "number" ? Math.floor(body.value) : undefined;
+      if (perProviderValue !== undefined && perProviderValue < 1) {
+        return jsonResponse({ error: "value must be a positive number" }, 400);
+      }
+      setProviderContextCap(config, provider, body.enabled, perProviderValue);
+      save(config);
+      reconcileLiveStateStores();
+      clearModelCache(provider);
+      const catalogRefresh = await convergeCodexCatalog();
+      deps.androidRemoteController?.notifyModelCatalogChanged();
+      return respond(catalogRefresh);
+    }
+
+    // Branch 2: set the global cap value. When `setAll` accompanies it (dashboard "apply to
+    // every routed provider" toggle), re-point every enabled provider; otherwise keep each
+    // provider's own cap value and only change the default for future toggles.
+    if (body.value !== undefined) {
+      // Same normalization as the per-provider branch: floor before validating so a value
+      // that floors to zero is rejected rather than silently stored.
+      if (typeof body.value !== "number" || !Number.isFinite(body.value)) {
+        return jsonResponse({ error: "value must be a positive number" }, 400);
+      }
+      const normalizedValue = Math.floor(body.value);
+      if (normalizedValue < 1) {
+        return jsonResponse({ error: "value must be a positive number" }, 400);
+      }
+      if (body.setAll !== undefined && typeof body.setAll !== "boolean") {
+        return jsonResponse({ error: "setAll must be a boolean" }, 400);
+      }
+      const affected = Object.keys(providerContextCaps(config));
+      const applyToAll = body.setAll === true;
+      setGlobalContextCapValue(config, normalizedValue, applyToAll);
+      save(config);
+      reconcileLiveStateStores();
+      if (applyToAll) {
+        for (const provider of affected) clearModelCache(provider);
+      }
+      const catalogRefresh = await convergeCodexCatalog();
+      deps.androidRemoteController?.notifyModelCatalogChanged();
+      return respond(catalogRefresh);
+    }
+
+    // Branch 3: enable/clear the cap for every provider at once.
+    if (body.setAll !== undefined) {
+      if (typeof body.setAll !== "boolean") {
+        return jsonResponse({ error: "setAll must be a boolean" }, 400);
+      }
+      const before = Object.keys(providerContextCaps(config));
+      const names = Object.keys(config.providers);
+      setAllProviderContextCaps(config, names, body.setAll);
+      save(config);
+      reconcileLiveStateStores();
+      for (const provider of new Set([...before, ...names])) clearModelCache(provider);
+      const catalogRefresh = await convergeCodexCatalog();
+      deps.androidRemoteController?.notifyModelCatalogChanged();
+      return respond(catalogRefresh);
+    }
+
+    // Unrecognized payload: reject rather than silently succeeding.
+    return jsonResponse({ error: "provider string and enabled boolean are required" }, 400);
+  }
+
+  // Complete GUI picker presets, derived from the canonical provider registry. The GUI is a
+  // standalone Vite package, so it consumes this runtime view instead of importing repo-root src.
+  if (url.pathname === "/api/provider-presets" && req.method === "GET") {
+    return jsonResponse({ providers: deriveProviderPresets() });
+  }
+  return null;
+}

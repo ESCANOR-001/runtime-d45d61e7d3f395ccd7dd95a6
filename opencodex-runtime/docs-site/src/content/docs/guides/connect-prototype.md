@@ -1,0 +1,52 @@
+---
+title: Connect prototype
+description: Native Codex activity and read-only configuration in the unpublished Connect fork.
+---
+
+This page describes the **unpublished, private Connect fork**, not the existing npm release. Other universal-provider documentation in this source copy describes the legacy product and does not enable those features in Connect.
+
+Connect remains the `@remodex/rmx` npm package with the `rmx` command and a browser dashboard. There is no separate desktop application or native installer in this product's build or npm payload.
+
+## Dashboard sections
+
+Connect offers Android Remote, Logs & Debug, Usage, Storage, Guide, and Advanced Settings. Sign in using Codex itself. There are no Claude, Grok, custom-provider, account-pool, or model-injection controls. The private fork does not run the published package's automatic updater.
+
+The sidebar retains **Check for updates**. Its dialog checks the published Remodex npm package on the latest or preview channel, shows version details and available release notes, and offers Retry after a failed check. These are read-only checks. Installation remains disabled in the unpublished Connect copy, with an explanation: installing the existing published package would replace it with the old app, not upgrade this private fork.
+
+Android Remote retains its connection controls and authorized clients. Connection methods stays visible; only the difference explanation, Cloudflare token instructions, and advanced manual setup start collapsed. Add phone opens the pairing dialog with progress feedback.
+
+Update checks distinguish network failures, timeouts, unavailable release channels, and npm rate limits. A failed check does not mean automatic installation needs to be enabled. Retry starts a fresh check after failure rather than reusing a cached error; simultaneous checks still share one request. If a channel has no published release, select another channel. If npm rate-limits checks, wait a few minutes before retrying. The paired-phone update endpoints enforce the same check-only restriction and cannot start installation or activate the legacy automatic updater.
+
+## Onboarding without service installation
+
+On Windows, macOS, and Linux, `rmx onboard` prepares local settings, reuses a verified running instance or starts a hidden background process for the current user, then verifies a usable connection before reporting QR pairing ready. It does not install, repair, or require an operating-system service. Progress messages continue while waiting. Existing Codex settings remain untouched.
+
+Fresh Connect profiles prefer port 10110. If the preferred dashboard port is occupied when onboarding starts the user runtime, setup selects an available port and saves it only in Connect's own settings. Other listeners are left running. An explicit `rmx start --port` or installed-service port is not automatically moved. Gateway startup uses the same bounded retries on Windows, macOS, and Linux, showing a starting state while retrying.
+
+Advanced manual tunnel setup displays the actual Android gateway address returned by the server. Use that address, not the management dashboard port or the old app's gateway port.
+
+The managed Cloudflare helper supports Windows x64, macOS Intel/Apple Silicon, and Linux x64/ARM64. On Windows ARM64 it uses the checksum-verified x64 helper via [Windows 11 emulation](https://learn.microsoft.com/en-us/windows/arm/apps-on-arm-x86-emulation), not a native ARM binary. Setup validates the executable before completing installation. If emulation is unavailable, use Local Wi-Fi or provide a compatible executable through `OPENCODEX_CLOUDFLARED_PATH`.
+
+This user-level process is not a service: it has no guaranteed restart after a crash, sign-out, or computer reboot. Run `rmx onboard` again when needed. Onboarding does not uninstall or disable an existing service. Network policy or a firewall can still block connectivity; setup never bypasses those protections or claims that an unusable QR code is ready.
+
+Advanced Settings contains only the optional background-service setup, not provider or Codex configuration. Opening the page reads status. Enabling or repairing a stopped service requires an explicit confirmation; Windows may then show an OS administrator prompt, while macOS and Linux use per-user service managers. Setup runs in a separate hidden worker so it can complete when the current server stops. Status survives the server handoff; duplicate actions are blocked while setup or elevation reconciliation remains pending. On failure, the worker attempts to restart the ordinary user-level server without claiming service installation succeeded.
+
+Do not repair a currently supervised server from inside its own service process: its service manager could terminate the repair worker along with the server. For that case, inspect `rmx service status` and run `rmx service repair` separately on the computer. Unsupported service managers or a service owned by another profile are not changed. No administrator password is collected by the dashboard.
+
+## Current activity and usage
+
+Logs, Debug, and Usage read native Codex session events and refresh every five seconds while visible. They do not rely on historical requests that happened to pass through the old proxy. Manual refresh, loading indicators, and stale-data errors distinguish an empty history from a failed request.
+
+Usage deduplicates cumulative counters and copied sessions, excludes inherited initial totals, and groups measured increments by UTC event day and model. Cached input is already included in input. This is **not account billing or the remaining ChatGPT quota**. Turn status reflects the last observed event, not a live connection check.
+
+Large histories are indexed incrementally with bounded memory. At most 200 recent session files are considered, with capped per-file history. Warnings identify incomplete indexing, retained-history limits, inherited counters, and skipped or unreadable records. Empty or partial results must not be treated as complete subscription usage.
+
+Debug shows local reader health, not raw request capture. Session prompts, responses, secrets, and file paths are not returned by the activity endpoint. No failure report is uploaded automatically. Desktop logs retain their existing redacted report workflow.
+
+## Existing configuration stays unchanged
+
+The Connect entry point refuses provider/configuration mutation even when older settings contain write consent. Startup, shutdown, and pairing do not inject or restore provider entries, rewrite `config.toml` or `config.yml`, install shell hooks, or replace model catalogs. Existing legacy settings are left in place, not silently repaired. Phone access selects OpenAI with temporary process arguments. Codex itself continues to own its sign-in and session persistence.
+
+Connect settings and pairing records default to `~/.remodex-connect`; native activity is read from the existing Codex home. An isolated preview must use its own runtime profile and unoccupied ports, not the old service's settings. Storage cleanup is still an explicit user action and can delete the selected history.
+
+This fork still needs fresh Windows installation and real-phone pairing checks before publication. It does not establish that a pairing or trial-conversion issue is resolved.

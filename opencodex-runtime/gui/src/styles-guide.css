@@ -1,0 +1,303 @@
+.guide-page {
+  padding-bottom: var(--space-8);
+}
+
+.guide-page .page-sub {
+  margin-bottom: var(--space-5);
+}
+
+.guide-audience {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-5);
+  padding: var(--space-5);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+
+.guide-audience-copy {
+  min-width: 0;
+}
+
+.guide-eyebrow {
+  display: block;
+  margin-bottom: var(--space-1);
+  color: var(--muted);
+  font-size: var(--text-label);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+}
+
+.guide-audience h3,
+.guide-block h3,
+.guide-flow h3,
+.guide-section-card h4,
+.guide-quick-start h4 {
+  margin: 0;
+}
+
+.guide-audience h3,
+.guide-block h3,
+.guide-flow h3 {
+  font-size: var(--text-subtitle);
+}
+
+.guide-audience p,
+.guide-block-head p,
+.guide-flow > p,
+.guide-section-card > p,
+.guide-quick-start p {
+  margin: var(--space-1-5) 0 0;
+  color: var(--muted);
+  font-size: var(--text-body);
+  line-height: var(--leading-body);
+}
+
+.guide-mode-switch {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: var(--space-0-5);
+  padding: var(--space-0-5);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--raised);
+}
+
+.guide-mode-switch button {
+  min-height: var(--control-md);
+  padding: 0 var(--space-4);
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--text-control);
+  font-weight: var(--weight-medium);
+}
+
+.guide-mode-switch button:hover {
+  color: var(--text);
+}
+
+.guide-mode-switch button.active {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 1px 3px light-dark(rgba(0, 0, 0, 0.09), rgba(0, 0, 0, 0.24));
+  font-weight: var(--weight-semibold);
+}
+
+.guide-content {
+  display: grid;
+  gap: var(--space-6);
+  margin-top: var(--space-6);
+}
+
+.guide-block,
+.guide-flow {
+  min-width: 0;
+}
+
+.guide-block-head {
+  margin-bottom: var(--space-4);
+}
+
+.guide-quick-start {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: guide-step;
+}
+
+.guide-quick-start li {
+  position: relative;
+  min-width: 0;
+  padding: var(--space-5) var(--space-4) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  counter-increment: guide-step;
+}
+
+.guide-quick-start li::before {
+  content: counter(guide-step);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin-bottom: var(--space-3);
+  border-radius: var(--radius-round);
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-size: var(--text-label);
+  font-weight: var(--weight-semibold);
+}
+
+.guide-quick-start h4,
+.guide-section-card h4 {
+  color: var(--text);
+  font-size: var(--text-body);
+  font-weight: var(--weight-semibold);
+}
+
+.guide-flow {
+  padding: var(--space-5);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--raised);
+}
+
+.guide-flow-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 48px minmax(0, 1fr) 48px minmax(0, 1fr);
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+}
+
+.guide-flow-row > div {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  min-width: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  text-align: center;
+}
+
+.guide-flow-row svg {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+.guide-flow-row strong {
+  min-width: 0;
+  font-size: var(--text-control);
+}
+
+.guide-flow-center {
+  border-color: var(--accent-ring) !important;
+}
+
+.guide-flow-line {
+  height: 1px;
+  background: var(--border);
+}
+
+.guide-section-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+
+.guide-section-card {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.guide-section-card-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.guide-section-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  border-radius: var(--radius-sm);
+  background: var(--raised);
+  color: var(--text);
+}
+
+.guide-section-icon svg {
+  width: 17px;
+  height: 17px;
+}
+
+.guide-section-card dl {
+  margin: var(--space-4) 0 0;
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-soft);
+}
+
+.guide-section-card dt {
+  color: var(--faint);
+  font-size: var(--text-label);
+  font-weight: var(--weight-semibold);
+}
+
+.guide-section-card dd {
+  margin: var(--space-1) 0 0;
+  color: var(--muted);
+  font-size: var(--text-control);
+  line-height: var(--leading-body);
+}
+
+.guide-section-card a {
+  align-self: flex-start;
+  margin-top: auto;
+  padding-top: var(--space-4);
+  color: var(--text);
+  font-size: var(--text-control);
+  font-weight: var(--weight-semibold);
+  text-decoration: underline;
+  text-decoration-color: var(--border);
+  text-underline-offset: 3px;
+}
+
+.guide-section-card a:hover {
+  text-decoration-color: currentColor;
+}
+
+@media (max-width: 760px) {
+  .guide-audience {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .guide-mode-switch {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+
+  .guide-mode-switch button {
+    min-height: var(--control-touch);
+  }
+
+  .guide-quick-start,
+  .guide-section-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .guide-flow-row {
+    grid-template-columns: 1fr;
+  }
+
+  .guide-flow-line {
+    width: 1px;
+    height: 24px;
+    justify-self: center;
+  }
+}

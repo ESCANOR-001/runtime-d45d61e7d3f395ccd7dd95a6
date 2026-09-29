@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.env
+.env.*
+.npmrc
+*.log
+*.tgz
+*.apk
+*.aab
+*.jks
+*.keystore
+*.pem
+*.p12
+signing.properties
+local.properties
+.tmp/
+.DS_Store

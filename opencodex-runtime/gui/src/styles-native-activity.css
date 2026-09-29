@@ -1,0 +1,13 @@
+.native-activity { display: grid; gap: var(--space-4); max-width: 1100px; padding-block: var(--space-4); }
+.native-activity-toolbar { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; color: var(--muted); }
+.native-tabs { display: flex; gap: var(--space-2); border-bottom: 1px solid var(--border); padding-bottom: var(--space-2); }
+.native-tabs [aria-selected="true"] { background: var(--raised); color: var(--text); }
+.native-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: var(--space-4); }
+.native-metrics > div { background: var(--raised); padding: var(--space-4); border-radius: var(--radius-card); }
+.native-metrics dt { color: var(--muted); }
+.native-metrics dd { margin: var(--space-2) 0 0; font-size: 1.5rem; font-variant-numeric: tabular-nums; }
+.native-table-wrap { overflow-x: auto; }
+.native-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.native-table th, .native-table td { text-align: left; padding: var(--space-3); border-bottom: 1px solid var(--border); white-space: nowrap; }
+.native-table th { color: var(--muted); font-weight: 500; }
+.native-range { display: flex; gap: var(--space-3); align-items: center; }

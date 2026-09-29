@@ -1,0 +1,267 @@
+import { describe, expect, test } from "bun:test";
+import {
+  advanceProjectedThreadStream,
+  createProjectedThreadStreamState,
+  projectedThreadBoundedSnapshot,
+  projectedThreadOlderPage,
+  replayProjectedThreadAfter,
+} from "../src/android-remote/thread-stream";
+
+type JsonRecord = Record<string, unknown>;
+
+function message(id: string, text: string, sequence: number, streaming = false): JsonRecord {
+  const createdAt = new Date(Date.parse("2026-08-11T00:00:00.000Z") + sequence * 1_000).toISOString();
+  return {
+    id,
+    role: sequence === 0 ? "user" : "assistant",
+    text,
+    attachments: [],
+    turnId: `turn-${Math.floor(sequence / 4)}`,
+    sequence,
+    streaming,
+    createdAt,
+    updatedAt: createdAt,
+  };
+}
+
+function activity(id: string, sequence: number, status: string): JsonRecord {
+  return {
+    id,
+    tone: "tool",
+    kind: "commandExecution",
+    summary: "Run tests",
+    payload: { status },
+    turnId: "turn-0",
+    sequence,
+    createdAt: "2026-08-11T00:00:00.000Z",
+  };
+}
+
+function statusActivity(): JsonRecord {
+  return {
+    id: "context-window.updated-thread-1",
+    tone: "info",
+    kind: "context-window.updated",
+    summary: "Context window updated",
+    payload: { usedTokens: 45_000, maxTokens: 258_000 },
+    turnId: null,
+    createdAt: "2026-08-11T00:00:00.000Z",
+  };
+}
+
+function providerUsageActivity(): JsonRecord {
+  return {
+    id: "provider-usage-thread-1",
+    tone: "info",
+    kind: "provider.usage.updated",
+    summary: "Provider usage updated",
+    payload: { providerLabel: "OpenAI", windows: [{ label: "Weekly", remainingPercent: 71 }] },
+    turnId: null,
+    createdAt: "2026-08-11T00:00:00.000Z",
+  };
+}
+
+function detail(input: {
+  messages?: JsonRecord[];
+  activities?: JsonRecord[];
+  sessionStatus?: string;
+  readSequence?: number;
+} = {}): JsonRecord {
+  const updatedAt = "2026-08-11T00:10:00.000Z";
+  return {
+    snapshotSequence: input.readSequence ?? 1,
+    thread: {
+      id: "thread-1",
+      projectId: "project-1",
+      title: "Task",
+      modelSelection: { instanceId: "openai", model: "gpt-5.6-sol" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: "C:/workspace",
+      latestTurn: null,
+      createdAt: "2026-08-11T00:00:00.000Z",
+      updatedAt,
+      archivedAt: null,
+      deletedAt: null,
+      messages: input.messages ?? [],
+      proposedPlans: [],
+      activities: input.activities ?? [],
+      checkpoints: [],
+      session: {
+        threadId: "thread-1",
+        status: input.sessionStatus ?? "idle",
+        providerName: "openai",
+        runtimeMode: "full-access",
+        activeTurnId: input.sessionStatus === "running" ? "turn-0" : null,
+        lastError: null,
+        updatedAt,
+      },
+    },
+  };
+}
+
+describe("Android Remote projected task stream", () => {
+  test("suppresses a read-counter-only refresh", () => {
+    const state = createProjectedThreadStreamState(detail({ readSequence: 4 }));
+    const advanced = advanceProjectedThreadStream(state, detail({ readSequence: 99 }));
+    expect(advanced.items).toEqual([]);
+    expect(advanced.state.sequence).toBe(1);
+  });
+
+  test("suppresses a task timestamp refresh when no visible field changed", () => {
+    const before = detail({ messages: [message("m-1", "Hello", 1)] });
+    const after = structuredClone(before);
+    (after.thread as JsonRecord).updatedAt = "2026-08-11T00:11:00.000Z";
+    const advanced = advanceProjectedThreadStream(createProjectedThreadStreamState(before), after);
+    expect(advanced.items).toEqual([]);
+    expect(advanced.usedSnapshot).toBe(false);
+    expect(advanced.state.sequence).toBe(1);
+  });
+
+  test("sends only the assistant suffix and replays it by sequence", () => {
+    const before = detail({ messages: [message("m-1", "Hello", 1, true)] });
+    const after = detail({ messages: [message("m-1", "Hello world", 1, true)] });
+    const advanced = advanceProjectedThreadStream(createProjectedThreadStreamState(before), after);
+    expect(advanced.usedSnapshot).toBe(false);
+    expect(advanced.items).toHaveLength(1);
+    expect(advanced.items[0]).toMatchObject({
+      kind: "event",
+      event: {
+        sequence: 2,
+        type: "thread.message-sent",
+        payload: { messageId: "m-1", text: " world", streaming: true, sequence: 1 },
+      },
+    });
+    expect(replayProjectedThreadAfter(advanced.state, 1)).toEqual(advanced.items);
+    expect(replayProjectedThreadAfter(advanced.state, 0)).toBeNull();
+  });
+
+  test("keeps the assistant phase on the small live message event", () => {
+    const commentary = { ...message("m-1", "Still working", 1), phase: "commentary" };
+    const advanced = advanceProjectedThreadStream(
+      createProjectedThreadStreamState(detail()),
+      detail({ messages: [commentary] }),
+    );
+    expect(advanced.usedSnapshot).toBe(false);
+    expect(advanced.items[0]).toMatchObject({
+      event: {
+        type: "thread.message-sent",
+        payload: { messageId: "m-1", phase: "commentary" },
+      },
+    });
+  });
+
+  test("updates one stable tool row instead of appending a duplicate", () => {
+    const before = detail({ activities: [activity("tool-1", 2, "inProgress")] });
+    const after = detail({ activities: [activity("tool-1", 2, "completed")] });
+    const advanced = advanceProjectedThreadStream(createProjectedThreadStreamState(before), after);
+    expect(advanced.items).toHaveLength(1);
+    expect(advanced.items[0]).toMatchObject({
+      event: {
+        type: "thread.activity-appended",
+        payload: { activity: { id: "tool-1", sequence: 2, payload: { status: "completed" } } },
+      },
+    });
+  });
+
+  test("streams a visible activity even when hidden status rows move behind it", () => {
+    const contextWindow = statusActivity();
+    const tool = activity("tool-1", 2, "inProgress");
+    const advanced = advanceProjectedThreadStream(
+      createProjectedThreadStreamState(detail({ activities: [contextWindow] })),
+      detail({ activities: [tool, contextWindow] }),
+    );
+
+    expect(advanced.usedSnapshot).toBe(false);
+    expect(advanced.items).toEqual([
+      expect.objectContaining({
+        kind: "event",
+        event: expect.objectContaining({
+          type: "thread.activity-appended",
+          payload: expect.objectContaining({ activity: expect.objectContaining({ id: "tool-1" }) }),
+        }),
+      }),
+    ]);
+  });
+
+  test("keeps provider usage behind newly appended visible activities", () => {
+    const providerUsage = providerUsageActivity();
+    const tool = activity("tool-provider-status", 2, "inProgress");
+    const advanced = advanceProjectedThreadStream(
+      createProjectedThreadStreamState(detail({ activities: [providerUsage] })),
+      detail({ activities: [tool, providerUsage] }),
+    );
+
+    expect(advanced.usedSnapshot).toBe(false);
+    expect(advanced.items).toHaveLength(1);
+    expect(advanced.items[0]).toMatchObject({
+      event: {
+        type: "thread.activity-appended",
+        payload: { activity: { id: "tool-provider-status" } },
+      },
+    });
+  });
+
+  test("falls back to a bounded snapshot for a rewrite or removal", () => {
+    const before = detail({
+      messages: [message("m-1", "One", 1), message("m-2", "Two", 2)],
+    });
+    const after = detail({ messages: [message("m-2", "Two", 2)] });
+    const advanced = advanceProjectedThreadStream(createProjectedThreadStreamState(before), after);
+    expect(advanced.usedSnapshot).toBe(true);
+    expect(advanced.items[0]).toMatchObject({
+      kind: "snapshot",
+      snapshot: { snapshotSequence: 2 },
+    });
+  });
+
+  test("keeps explicit queued-message order in bounded reconnect snapshots", () => {
+    const first = {
+      ...message("queued-1", "First", 1),
+      role: "user",
+      turnId: null,
+      phase: "queued",
+      queuePosition: 1,
+    };
+    const second = {
+      ...message("queued-2", "Second", 2),
+      role: "user",
+      turnId: null,
+      phase: "queued",
+      queuePosition: 0,
+    };
+    const snapshot = projectedThreadBoundedSnapshot(
+      createProjectedThreadStreamState(detail({ messages: [second, first] })),
+    ) as { snapshot: { thread: { messages: JsonRecord[] } } };
+
+    expect(snapshot.snapshot.thread.messages.map(row => row.id)).toEqual([
+      "queued-2",
+      "queued-1",
+    ]);
+  });
+
+  test("bounds the first page and walks backward with opaque cursors", () => {
+    const manyMessages = Array.from({ length: 300 }, (_, index) =>
+      message(`m-${index}`, `Message ${index}`, index),
+    );
+    const state = createProjectedThreadStreamState(detail({ messages: manyMessages }));
+    const snapshot = projectedThreadBoundedSnapshot(state) as {
+      snapshot: {
+        historyPage: { hasOlder: boolean; olderCursor: string | null };
+        thread: { messages: JsonRecord[] };
+      };
+    };
+    expect(snapshot.snapshot.historyPage.hasOlder).toBe(true);
+    expect(snapshot.snapshot.thread.messages.length).toBeLessThan(300);
+    const cursor = snapshot.snapshot.historyPage.olderCursor;
+    expect(cursor).not.toBeNull();
+    const older = projectedThreadOlderPage(state, cursor!);
+    expect(older.messages.length).toBeGreaterThan(0);
+    expect(older.messages.at(-1)?.id).not.toBe(snapshot.snapshot.thread.messages[0]?.id);
+    const recentIds = new Set(snapshot.snapshot.thread.messages.map(row => row.id));
+    expect(older.messages.some(row => recentIds.has(row.id))).toBe(false);
+    expect(older.pageInfo.olderCursor).not.toBe(cursor);
+    expect(() => projectedThreadOlderPage(state, "not-a-cursor")).toThrow("cursor is invalid");
+  });
+});
