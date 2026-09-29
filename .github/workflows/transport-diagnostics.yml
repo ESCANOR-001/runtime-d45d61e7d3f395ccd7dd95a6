@@ -31,6 +31,14 @@ jobs:
       - name: Compare native WebSocket clients
         run: bun tests/helpers/websocket-size-probe.ts
       - name: Check oversized response behavior
+        env:
+          REMODEX_TEST_TRANSPORT_DIAGNOSTICS: "1"
         run: bun scripts/test.ts tests/android-remote-runtime-compatibility.test.ts
+      - name: Compare transport without realm isolation
+        if: ${{ !cancelled() }}
+        env:
+          REMODEX_TEST_TRANSPORT_DIAGNOSTICS: "1"
+        run: bun test tests/android-remote-runtime-compatibility.test.ts
       - name: Check history worker lifecycle
-        run: bun scripts/test.ts tests/codex-history-job.test.ts
+        if: ${{ !cancelled() }}
+        run: bun test tests/codex-history-job.test.ts

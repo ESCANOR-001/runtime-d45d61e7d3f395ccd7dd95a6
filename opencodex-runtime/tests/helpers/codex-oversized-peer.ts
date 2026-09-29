@@ -18,7 +18,12 @@ const server = Bun.serve({
       if (message.id === undefined) return;
       if (message.method === oversizedMethod) {
         requests++;
-        if (socket.send(JSON.stringify({ id: message.id, result: "x".repeat(16 * 1024 * 1024) })) === 0) {
+        const payload = JSON.stringify({ id: message.id, result: "x".repeat(16 * 1024 * 1024) });
+        const sent = socket.send(payload);
+        if (process.env.REMODEX_TEST_TRANSPORT_DIAGNOSTICS === "1") {
+          console.error(JSON.stringify({ method: message.method, bytes: payload.length, sent, buffered: socket.getBufferedAmount() }));
+        }
+        if (sent === 0) {
           throw new Error("Oversized response was not sent");
         }
       } else {
