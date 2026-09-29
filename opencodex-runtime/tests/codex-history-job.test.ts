@@ -5,16 +5,34 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { Database } from "bun:sqlite";
-import { liveStorageWorkerCount } from "../src/storage/worker-lifecycle";
 
 import {
   describeHistoryJobFailure,
   deriveCodexHistoryOperation,
   runCodexHistoryJob,
+  type CodexHistoryJobRequest,
+  type CodexHistoryJobOutcome,
 } from "../src/codex/history-job";
 
 const sandboxes: string[] = [];
 let previousCodexHome: string | undefined;
+
+function runHistoryJobsInPeer(requests: CodexHistoryJobRequest[], options?: { timeoutMs: number }): {
+  outcome: CodexHistoryJobOutcome;
+  liveWorkers: number;
+  elapsedMs: number;
+}[] {
+  const child = spawnSync(process.execPath, [join(import.meta.dir, "helpers/history-job-peer.ts")], {
+    windowsHide: true,
+    input: JSON.stringify({ requests, options }),
+    encoding: "utf8",
+    timeout: 55_000,
+  });
+  if (child.error || child.status !== 0) {
+    throw new Error(`History peer failed: ${child.error?.message ?? child.stderr}`);
+  }
+  return JSON.parse(child.stdout);
+}
 
 afterEach(() => {
   if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
@@ -159,8 +177,9 @@ test("skip resolves without spawning a thread and writes nothing", async () => {
 test("a real Worker performs the transition and the parent joins it", async () => {
   const fixture = makeFixture("ocx-history-job-run-");
 
-  const outcome = await runCodexHistoryJob({ ...fixture, operation: "recover-legacy-openai" });
+  const [{ outcome, liveWorkers }] = runHistoryJobsInPeer([{ ...fixture, operation: "recover-legacy-openai" }]);
   expect(outcome.kind).toBe("converged");
+  expect(liveWorkers).toBe(0);
 
   // Already committed by the time the promise settles — that is what joining buys.
   const db = new Database(fixture.canonicalStateDbPath, { readonly: true });
@@ -172,11 +191,14 @@ test("a real Worker performs the transition and the parent joins it", async () =
 }, 30_000);
 
 test("repeated history jobs leave no worker closing behind the next request", async () => {
-  for (let index = 0; index < 5; index++) {
-    const fixture = makeFixture("ocx-history-job-repeat-");
-    const outcome = await runCodexHistoryJob({ ...fixture, operation: "recover-legacy-openai" });
+  const requests = Array.from({ length: 5 }, (): CodexHistoryJobRequest => ({
+    ...makeFixture("ocx-history-job-repeat-"), operation: "recover-legacy-openai",
+  }));
+  const results = runHistoryJobsInPeer(requests);
+  expect(results).toHaveLength(5);
+  for (const { outcome, liveWorkers } of results) {
     expect(outcome.kind).toBe("converged");
-    expect(liveStorageWorkerCount()).toBe(0);
+    expect(liveWorkers).toBe(0);
   }
 }, 60_000);
 
@@ -188,9 +210,8 @@ test("repeated history jobs leave no worker closing behind the next request", as
 test("an overrun Worker returns a typed timeout rather than hanging", async () => {
   const fixture = makeFixture("ocx-history-job-timeout-");
 
-  const started = Date.now();
-  const outcome = await runCodexHistoryJob(
-    { ...fixture, operation: "recover-legacy-openai" },
+  const [{ outcome, liveWorkers, elapsedMs }] = runHistoryJobsInPeer(
+    [{ ...fixture, operation: "recover-legacy-openai" }],
     { timeoutMs: 1 },
   );
 
@@ -198,7 +219,8 @@ test("an overrun Worker returns a typed timeout rather than hanging", async () =
   // and neither throws.
   expect(["converged", "failed"]).toContain(outcome.kind);
   if (outcome.kind === "failed") expect(outcome.reason).toBe("timeout");
-  expect(Date.now() - started).toBeLessThan(20_000);
+  expect(liveWorkers).toBe(0);
+  expect(elapsedMs).toBeLessThan(20_000);
 }, 30_000);
 
 /**
@@ -212,7 +234,8 @@ test("a hard history error reaches the caller with its real message", async () =
   rmSync(fixture.canonicalStateDbPath, { force: true });
   mkdirSync(fixture.canonicalStateDbPath);
 
-  const outcome = await runCodexHistoryJob({ ...fixture, operation: "recover-legacy-openai" });
+  const [{ outcome, liveWorkers }] = runHistoryJobsInPeer([{ ...fixture, operation: "recover-legacy-openai" }]);
+  expect(liveWorkers).toBe(0);
   expect(outcome.kind).toBe("failed");
   if (outcome.kind === "failed") {
     expect(outcome.message).toMatch(/unable to open|not a database|cannot open/i);

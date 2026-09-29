@@ -48,7 +48,11 @@ test.each(["thread/turns/list", "turn/start"])("oversized %s fails explicitly wi
   try {
     runtime = new AndroidCodexRuntime(await listening, () => ({ runtime: desktop, desktopVersion: desktop.version }));
     const client = await runtime.start();
-    await expect(client.request(method, { threadId: "oversized" }, 10_000)).rejects.toBeInstanceOf(AndroidCodexResponseTooLargeError);
+    const failure = await client.request(method, { threadId: "oversized" }, 10_000).then(
+      () => null,
+      error => error,
+    );
+    expect(failure).toBeInstanceOf(AndroidCodexResponseTooLargeError);
     expect(await client.request("thread/read", { threadId: "oversized", includeTurns: false })).toEqual({ ready: true, requests: 1 });
   } finally {
     globalThis.WebSocket = originalWebSocket;
