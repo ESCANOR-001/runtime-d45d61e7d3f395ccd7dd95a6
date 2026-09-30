@@ -190,6 +190,7 @@ export function normalizedCompletedItem(value: unknown, completed: boolean): Jso
       text: bounded(publicText ?? "", 2 * 1024 * 1024),
       phase: stringValue(raw.phase).trim() || null,
       memoryCitation: deepCamelValue(raw.memory_citation ?? raw.memoryCitation) ?? null,
+      ...(Array.isArray(raw.questions) ? { questions: deepCamelValue(raw.questions) } : {}),
     };
   }
   if (type === "reasoning") {

@@ -56,3 +56,19 @@ jobs:
       - name: Run Windows runtime tests
         if: runner.os == 'Windows'
         run: bun scripts/test-file-shard.ts --shard=${{ matrix.shard }}/4
+      - name: Run dashboard tests
+        if: ${{ !cancelled() && matrix.shard == 1 }}
+        working-directory: opencodex-runtime/gui
+        run: bun run test
+      - name: Lint dashboard
+        if: ${{ !cancelled() && matrix.shard == 1 }}
+        working-directory: opencodex-runtime/gui
+        run: bun run lint
+      - name: Install documentation dependencies
+        if: ${{ !cancelled() && matrix.shard == 2 }}
+        working-directory: opencodex-runtime/docs-site
+        run: bun install --frozen-lockfile
+      - name: Build documentation
+        if: ${{ !cancelled() && matrix.shard == 2 }}
+        working-directory: opencodex-runtime/docs-site
+        run: bun run build

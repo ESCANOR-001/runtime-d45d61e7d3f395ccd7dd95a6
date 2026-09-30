@@ -45,6 +45,18 @@ function thread(path: string): JsonRecord {
 }
 
 describe("Android Remote completed command recovery", () => {
+  test("a saved compacted record alone is a completed marker, never live compaction", async () => {
+    const { home, path } = await fixture([
+      { type: "session_meta", payload: { id: "thread-1" } },
+      { type: "turn_context", payload: { turn_id: "turn-1" } },
+      { type: "compacted", payload: { message: "private handoff" } },
+    ]);
+    const recovered = await new AndroidRemoteSessionCommandRecovery({ codexHome: home }).enrichThread(thread(path));
+    const items = ((recovered.turns as JsonRecord[])[0]!.items as JsonRecord[]);
+    expect(items.find(item => item.type === "contextCompaction")).toMatchObject({ status: "completed" });
+    expect(JSON.stringify(recovered)).not.toContain("private handoff");
+  });
+
   test("restores exact changed-file paths into completed task items", async () => {
     const directPatch = [
       "*** Begin Patch",

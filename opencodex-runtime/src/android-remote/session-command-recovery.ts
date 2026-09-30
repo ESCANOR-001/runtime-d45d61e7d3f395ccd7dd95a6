@@ -547,7 +547,7 @@ function consumeRecord(
       callId: itemId,
       itemId,
       order,
-      item: { type: "contextCompaction", id: itemId, status: "inProgress" },
+      item: { type: "contextCompaction", id: itemId, status: "completed" },
     });
     return;
   }

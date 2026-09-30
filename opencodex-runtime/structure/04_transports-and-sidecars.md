@@ -1,5 +1,22 @@
 # Transports And Sidecars SOT
 
+## Desktop questions and context compaction
+
+Android reads bounded recent Desktop state for selected and known-active tasks,
+coalescing reads and retaining only question/compaction metadata. Async questions
+come from `agentMessage.questions`, not the tool's immediate acceptance receipt.
+Their IDs match Desktop's `request_user_input_async` item/index encoding. Answers
+use Desktop's question-reply envelope through the existing owner-safe steer/start
+path; every answer is revalidated against fresh Desktop state before delivery.
+Accepted steering replies and ordinary user replies resolve the same questions.
+Android displays a question sheet with options and an optional custom answer,
+then compact question/answer bubbles instead of transport JSON.
+
+A current, explicitly unfinished `contextCompaction` item keeps the task running
+even if the secondary app-server says idle. Completed or historical compaction
+does not establish activity. A saved `compacted` record denotes completion, not
+the beginning of compaction. Private handoff text is never part of this metadata.
+
 ## Android sidebar updates
 
 An uncached shell subscription waits for a real lightweight first-page snapshot;

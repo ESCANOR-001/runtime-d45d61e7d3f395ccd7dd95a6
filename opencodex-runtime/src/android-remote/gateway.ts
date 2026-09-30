@@ -1,4 +1,5 @@
 import { isPrivateLanIpv4 } from "./local-network";
+import { desktopAnswerMessage, readDesktopInteractions, type DesktopInteractions } from "./desktop-interactions";
 import { DEFAULT_ANDROID_GATEWAY_PORT as DEFAULT_GATEWAY_PORT } from "./ports";
 import { createDesktopUpdateRoutes } from "./desktop-updates";
 import { createTaskActivityReader } from "../update/task-activity";
@@ -306,7 +307,7 @@ type DesktopActiveTurnProbe = {
   expiresAt: number;
 };
 
-type LiveCodexNotificationSource = "app-server" | "desktop-session";
+type LiveCodexNotificationSource = "app-server" | "desktop-session" | "desktop-state";
 
 type LiveNotificationActivityItem = {
   label: string;
@@ -433,6 +434,8 @@ function gatewayStartupError(error: unknown): string {
 function desktopConversationIsActive(value: unknown): boolean | null {
   const state = record(value);
   if (!state) return null;
+  const interactions = readDesktopInteractions(state, desktopConversationTurnRows(state));
+  if (interactions.compaction?.active || interactions.activeTurnId) return true;
   const runtimeStatus = record(state.threadRuntimeStatus);
   const runtimeType = stringValue(runtimeStatus?.type ?? state.threadRuntimeStatus, 64)
     .replace(/[^a-z0-9]/giu, "")
@@ -521,6 +524,10 @@ function desktopStateStatusIsTerminal(value: unknown): boolean {
 function activeTurnIdFromDesktopState(value: unknown): string {
   const state = record(value);
   if (!state) return "";
+  const interactions = readDesktopInteractions(state, desktopConversationTurnRows(state));
+  const compaction = interactions.compaction;
+  if (compaction?.active) return compaction.turnId;
+  if (interactions.activeTurnId) return interactions.activeTurnId;
   const session = record(state.session);
   const runtime = record(state.runtimeStatus) ?? record(state.runtime);
   const thread = record(state.thread) ?? record(state.conversation);
@@ -2169,6 +2176,12 @@ export class AndroidRemoteGatewayController {
     expiresAt: number;
   }>();
   private readonly desktopThreadActivityReads = new Map<string, Promise<boolean | null>>();
+  private readonly desktopInteractions = new Map<string, DesktopInteractions>();
+  private readonly desktopInteractionReads = new Map<string, Promise<void>>();
+  private readonly desktopInteractionReadAt = new Map<string, number>();
+  private readonly desktopInteractionObservedAt = new Map<string, number>();
+  private readonly answeredDesktopQuestions = new Set<string>();
+  private readonly completedDesktopTurns = new Map<string, string>();
   /**
    * One bounded Desktop probe supplies both the activity bit and the exact
    * turn id used by steer. This prevents `threadHasActiveTurn()` and
@@ -2724,6 +2737,11 @@ export class AndroidRemoteGatewayController {
     this.latestThreadTokenUsage.clear();
     this.desktopThreadActivityCache.clear();
     this.desktopThreadActivityReads.clear();
+    this.desktopInteractions.clear();
+    this.desktopInteractionReadAt.clear();
+    this.desktopInteractionObservedAt.clear();
+    this.answeredDesktopQuestions.clear();
+    this.completedDesktopTurns.clear();
     this.desktopActiveTurnProbes.clear();
     this.desktopActiveTurnProbeReads.clear();
     this.projectedActivityReconciledAt.clear();
@@ -3172,6 +3190,88 @@ export class AndroidRemoteGatewayController {
     this.pollTimer.unref?.();
   }
 
+  private async refreshDesktopInteractions(remoteThreadId: string): Promise<void> {
+    const read = this.desktopIpc.readFollowerThreadState;
+    const nativeThreadId = this.nativeThreadId(remoteThreadId);
+    if (!read || this.drafts.has(remoteThreadId)
+      || fallbackOwnershipState(this.desktopIpc, nativeThreadId).state === "local-owned") return;
+    const current = this.desktopInteractionReads.get(remoteThreadId);
+    if (current) return current;
+    if (this.now() - (this.desktopInteractionReadAt.get(remoteThreadId) ?? -Infinity) < 2000) return;
+    const pending = (async () => {
+      const state = await read.call(this.desktopIpc, nativeThreadId, { fresh: true });
+      if (!state) return;
+      const next = readDesktopInteractions(state, desktopConversationTurnRows(state));
+      const completedTurnId = this.completedDesktopTurns.get(remoteThreadId);
+      if (completedTurnId && next.activeTurnId === completedTurnId) next.activeTurnId = null;
+      if (completedTurnId && next.compaction?.turnId === completedTurnId) next.compaction.active = false;
+      const previous = this.desktopInteractions.get(remoteThreadId);
+      this.desktopInteractions.set(remoteThreadId, next);
+      this.desktopInteractionObservedAt.set(remoteThreadId, this.now());
+      while (this.desktopInteractions.size > 128) {
+        const oldest = this.desktopInteractions.keys().next().value!;
+        this.desktopInteractions.delete(oldest);
+        this.desktopInteractionReadAt.delete(oldest);
+        this.desktopInteractionObservedAt.delete(oldest);
+      }
+      for (const id of next.answeredIds) this.answeredDesktopQuestions.add(id);
+      while (this.answeredDesktopQuestions.size > 2048) {
+        this.answeredDesktopQuestions.delete(this.answeredDesktopQuestions.values().next().value!);
+      }
+      for (const group of next.questions) {
+        const questions = group.questions.filter(question => !this.answeredDesktopQuestions.has(question.id));
+        if (!questions.length) continue;
+        const pending = this.rememberDesktopPendingUserInput({
+          nativeThreadId, remoteThreadId, itemId: group.itemId, callId: group.itemId,
+          turnId: group.turnId, requestedAt: "", questions,
+        });
+        this.rememberSupplementalActivity(remoteThreadId, pending.activity);
+      }
+      for (const [requestId, question] of this.pendingDesktopUserInputs) {
+        if (question.remoteThreadId !== remoteThreadId || !this.isAsyncDesktopQuestion(question)) continue;
+        if (!question.questions.every(row => this.answeredDesktopQuestions.has(stringValue(row.id, 128)))) continue;
+        this.forgetDesktopPendingUserInput(requestId);
+        this.rememberSupplementalActivity(remoteThreadId, {
+          id: `resolved-${requestId}`, kind: "user-input.resolved", tone: "info",
+          summary: "User input submitted", payload: { requestId }, turnId: question.turnId,
+          sequence: ++this.sequence, createdAt: new Date(this.now()).toISOString(),
+        });
+      }
+      const compaction = next.compaction;
+      const changed = JSON.stringify(previous?.compaction) !== JSON.stringify(compaction);
+      const activeTurnId = compaction?.active ? compaction.turnId : next.activeTurnId;
+      if (activeTurnId && (changed || previous?.activeTurnId !== activeTurnId || !this.projectedThreadIsActive(remoteThreadId))) {
+        this.applyLiveCodexNotification({ method: "turn/started", params: {
+          threadId: nativeThreadId, turnId: activeTurnId,
+          turn: { id: activeTurnId, status: "inProgress" },
+        } }, true, "desktop-state");
+      }
+      const projectedCompaction = compaction ?? (previous?.compaction ? { ...previous.compaction, active: false } : null);
+      if (changed && projectedCompaction) {
+        this.applyLiveCodexNotification({
+          method: projectedCompaction.active ? "item/started" : "item/completed",
+          params: { threadId: nativeThreadId, turnId: projectedCompaction.turnId,
+            item: { type: "contextCompaction", id: projectedCompaction.id,
+              status: projectedCompaction.active ? "inProgress" : "completed" } },
+        }, true, "desktop-state");
+      }
+      if (JSON.stringify(previous?.questions) !== JSON.stringify(next.questions)
+        || JSON.stringify(previous?.answeredIds) !== JSON.stringify(next.answeredIds)) {
+        this.authoritativeThreadRefreshes.add(remoteThreadId);
+      }
+    })().catch(() => undefined).finally(() => {
+      this.desktopInteractionReadAt.set(remoteThreadId, this.now());
+      this.desktopInteractionReads.delete(remoteThreadId);
+    });
+    this.desktopInteractionReads.set(remoteThreadId, pending);
+    return pending;
+  }
+
+  private isAsyncDesktopQuestion(input: PendingDesktopUserInput): boolean {
+    return input.questions.length > 0 && input.questions.every(question =>
+      stringValue(question.id, 128).startsWith('["request_user_input_async",'));
+  }
+
   private scheduleRefresh(): void {
     if (this.sockets.size === 0) return;
     this.scheduleShellRefresh();
@@ -3292,6 +3392,13 @@ export class AndroidRemoteGatewayController {
     }
     this.shellRefreshRunning = true;
     try {
+      const liveThreads = [...new Set([
+        ...[...this.sockets].flatMap(ws => ws.data.threadId ? [ws.data.threadId] : []),
+        ...[...this.knownActiveTurnIds.keys()].map(id => this.remoteThreadId(id)),
+      ])].slice(0, 16);
+      for (let offset = 0; offset < liveThreads.length; offset += 4) {
+        await Promise.all(liveThreads.slice(offset, offset + 4).map(id => this.refreshDesktopInteractions(id)));
+      }
       const rows = [...this.sockets].filter(ws => ws.data.subscription === "shell");
       const groups = new Map<string, ServerWebSocket<GatewayWsData>[]>();
       for (const ws of rows) {
@@ -3352,6 +3459,7 @@ export class AndroidRemoteGatewayController {
     }
     if (ws.data.subscription === "thread") {
       const threadId = ws.data.threadId ?? "";
+      await this.refreshDesktopInteractions(threadId);
       if (initial) {
         const state = await this.ensureThreadStream(threadId);
         if ((this.queuedTurns.get(threadId)?.length ?? 0) > 0) {
@@ -4094,7 +4202,7 @@ export class AndroidRemoteGatewayController {
       // erase short tools before the notification refresh runs and can make
       // the notification move ahead of the in-app thread.
       if (next.activeItems.size === 0) {
-        next.fallbackLabel = completedLabel === "Requires your input"
+        next.fallbackLabel = completedLabel === "Requires your input" || completedLabel === "Compacting context"
           ? "Reasoning"
           : completedLabel ?? next.fallbackLabel;
       }
@@ -4627,6 +4735,28 @@ export class AndroidRemoteGatewayController {
     const detail = projectCodexThreadDetail(thread, ++this.sequence, { compactCompletedWork: true });
     const projected = record(detail.thread);
     if (!projected) return detail;
+    const desktopInteraction = this.now() - (this.desktopInteractionObservedAt.get(remoteThreadId) ?? -Infinity) < 20_000
+      ? this.desktopInteractions.get(remoteThreadId) : undefined;
+    const desktopCompaction = desktopInteraction?.compaction;
+    const desktopActiveTurnId = desktopCompaction?.active ? desktopCompaction.turnId
+      : desktopInteraction?.activeTurnId;
+    if (desktopActiveTurnId) {
+      Object.assign(projected, this.projectLiveTurnLifecycle(projected, remoteThreadId, "turn/started", {
+        turnId: desktopActiveTurnId, turn: { id: desktopActiveTurnId, status: "inProgress" },
+      }));
+    }
+    if (desktopCompaction) {
+      const existingCompaction = projectedRow(projected.activities, desktopCompaction.id)
+        ?? this.supplementalActivities.get(remoteThreadId)?.find(row => row.id === desktopCompaction.id);
+      const activity = projectCodexLiveTurnItem({
+        threadId: remoteThreadId, turnId: desktopCompaction.turnId,
+        item: { type: "contextCompaction", id: desktopCompaction.id, status: desktopCompaction.active ? "inProgress" : "completed" },
+        completed: !desktopCompaction.active,
+        sequence: finiteNumber(existingCompaction?.sequence) ?? this.nextProjectedTurnSequence(projected, desktopCompaction.turnId),
+        createdAtMs: desktopCompaction.startedAt ?? this.now(),
+      }).activity;
+      if (activity) this.rememberSupplementalActivity(remoteThreadId, activity);
+    }
     const liveProjectedThread = record(this.threadStreams.get(remoteThreadId)?.detail.thread);
     const liveProjectedSession = record(liveProjectedThread?.session);
     const liveProjectedLatestTurn = record(liveProjectedThread?.latestTurn);
@@ -4732,6 +4862,9 @@ export class AndroidRemoteGatewayController {
     const pending = [...this.pendingRequests.values()]
       .filter(row => row.remoteThreadId === remoteThreadId)
       .map(row => row.activity);
+    pending.push(...[...this.pendingDesktopUserInputs.values()]
+      .filter(row => row.remoteThreadId === remoteThreadId && this.isAsyncDesktopQuestion(row))
+      .map(row => row.activity));
     const recoveredDesktopInput = this.rememberDesktopPendingUserInputFromThread(thread, remoteThreadId);
     if (
       recoveredDesktopInput
@@ -5878,7 +6011,7 @@ export class AndroidRemoteGatewayController {
     } else if (type === "thread.approval.respond") {
       await this.respondToApproval(command);
     } else if (type === "thread.user-input.respond") {
-      await this.respondToUserInput(command);
+      await this.respondToUserInput(clientId, command);
     } else if (type === "thread.mcp-elicitation.respond") {
       await this.respondToMcpElicitation(command);
     } else if (type === "thread.user-input.draft.update") {
@@ -8374,7 +8507,7 @@ export class AndroidRemoteGatewayController {
     this.resolvePendingRequest(pending, "approval.resolved", "Approval response submitted", { decision });
   }
 
-  private async respondToUserInput(command: JsonRecord): Promise<void> {
+  private async respondToUserInput(clientId: string, command: JsonRecord): Promise<void> {
     const requestId = stringValue(command.requestId, 128);
     const remoteThreadId = stringValue(command.threadId, 128);
     let pending = this.pendingRequests.get(requestId);
@@ -8408,6 +8541,32 @@ export class AndroidRemoteGatewayController {
       const requestFollowerAction = this.desktopIpc.requestFollowerAction;
       if (!desktopPending || !readFollowerThreadState || !requestFollowerAction) {
         throw new Error("This question is no longer waiting for an answer");
+      }
+      if (desktopPending.remoteThreadId !== remoteThreadId) throw new Error("Question does not belong to this task");
+      if (this.isAsyncDesktopQuestion(desktopPending)) {
+        const state = await readFollowerThreadState.call(this.desktopIpc, desktopPending.nativeThreadId, { fresh: true });
+        if (!state) throw new Error("Reconnect to Codex Desktop before answering this question");
+        const group = readDesktopInteractions(state, desktopConversationTurnRows(state)).questions
+          .find(row => row.itemId === desktopPending.itemId);
+        if (!group || group.questions.some(row => this.answeredDesktopQuestions.has(row.id))) {
+          throw new Error("This question is no longer waiting for an answer");
+        }
+        const text = desktopAnswerMessage(group.questions, answers);
+        const replyCommand = {
+          ...command, type: "thread.turn.start",
+          message: { messageId: randomUUID(), text, attachments: [] },
+        };
+        if (desktopConversationIsActive(state)) await this.steerTurn(clientId, replyCommand);
+        else await this.startTurnUsingOwner(clientId, replyCommand);
+        for (const question of group.questions) this.answeredDesktopQuestions.add(question.id);
+        this.forgetDesktopPendingUserInput(desktopPending.publicRequestId);
+        this.rememberSupplementalActivity(remoteThreadId, {
+          id: `resolved-${desktopPending.publicRequestId}`, kind: "user-input.resolved", tone: "info",
+          summary: "User input submitted", payload: { requestId: desktopPending.publicRequestId, answers: rawAnswers },
+          turnId: desktopPending.turnId, sequence: ++this.sequence, createdAt: new Date(this.now()).toISOString(),
+        });
+        this.scheduleRefresh();
+        return;
       }
       for (const question of desktopPending.questions) {
         const questionId = stringValue(question.id, 128);
@@ -8717,7 +8876,8 @@ export class AndroidRemoteGatewayController {
       },
     };
     for (const [requestId, candidate] of this.pendingDesktopUserInputs) {
-      if (candidate.remoteThreadId === input.remoteThreadId && requestId !== publicRequestId) {
+      if (candidate.remoteThreadId === input.remoteThreadId && requestId !== publicRequestId
+        && !this.isAsyncDesktopQuestion(candidate)) {
         this.pendingDesktopUserInputs.delete(requestId);
       }
     }
@@ -9195,11 +9355,26 @@ export class AndroidRemoteGatewayController {
   ): boolean {
     if (source === "desktop-session") this.observeAuthoritativeSteerDelivery(message);
     const method = stringValue(message.method, 128);
-    const params = record(message.params) ?? {};
+    let params = record(message.params) ?? {};
     const nativeThreadId = stringValue(params.threadId, 128);
     if (!nativeThreadId) return false;
     if (method === "turn/started") this.missingNativeThreadIds.delete(nativeThreadId);
     const remoteThreadId = this.remoteThreadId(nativeThreadId);
+    const liveCompaction = this.desktopInteractions.get(remoteThreadId)?.compaction;
+    const completedItem = record(params.item);
+    if (source === "desktop-session" && method === "item/completed" && completedItem?.type === "contextCompaction"
+      && liveCompaction?.turnId === stringValue(params.turnId, 128)) {
+      if (liveCompaction.startedAt !== null
+        && stringValue(completedItem.id, 128).startsWith(`context-compaction-${liveCompaction.turnId}-`)
+        && (finiteNumber(params.completedAtMs) ?? -Infinity) >= liveCompaction.startedAt) {
+        params = { ...params, item: { ...completedItem, id: liveCompaction.id } };
+        message = { ...message, params };
+      }
+      if (record(params.item)?.id === liveCompaction.id) liveCompaction.active = false;
+    }
+    if (method === "turn/completed" && source === "app-server" && liveCompaction?.active
+      && this.now() - (this.desktopInteractionObservedAt.get(remoteThreadId) ?? -Infinity) < 20_000
+      && liveCompaction.turnId === (stringValue(params.turnId, 128) || stringValue(record(params.turn)?.id, 128))) return true;
     if (method === "turn/completed" && !this.threadStreams.has(remoteThreadId)) {
       const previous = this.shellLifecycles.get(remoteThreadId)
         ?? record(this.threadStreams.get(remoteThreadId)?.detail.thread);
@@ -9233,8 +9408,20 @@ export class AndroidRemoteGatewayController {
     const turnId = stringValue(params.turnId, 128) || stringValue(turn?.id, 128);
     if (method === "turn/started") {
       this.rememberKnownActiveTurn(nativeThreadId, turnId);
+      if (source === "desktop-session") this.completedDesktopTurns.delete(remoteThreadId);
     } else if (method === "turn/completed") {
       this.forgetKnownActiveTurn(nativeThreadId, turnId);
+      if (source === "desktop-session") {
+        this.completedDesktopTurns.set(remoteThreadId, turnId);
+        while (this.completedDesktopTurns.size > 128) {
+          this.completedDesktopTurns.delete(this.completedDesktopTurns.keys().next().value!);
+        }
+      }
+      const interactions = this.desktopInteractions.get(remoteThreadId);
+      if (interactions?.activeTurnId === turnId) interactions.activeTurnId = null;
+      if (interactions?.compaction?.turnId === turnId) {
+        interactions.compaction = { ...interactions.compaction, active: false };
+      }
     }
     const replayedSettings = method === "thread/settings/updated"
       ? this.rememberDesktopThreadSettings(remoteThreadId, params)

@@ -1374,6 +1374,7 @@ function activityFromItem(
       ? {
           itemId: id,
           title: summary,
+          ...(status ? { status } : {}),
           ...turnTiming,
         }
     : userInputRequest

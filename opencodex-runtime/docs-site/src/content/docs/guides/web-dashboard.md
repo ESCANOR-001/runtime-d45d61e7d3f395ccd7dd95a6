@@ -610,6 +610,19 @@ is gated correctly without manual classification.
 :::
 
 
+### Android questions and task progress
+
+With the matching Android app and server update, Codex questions open an answer
+sheet with selectable options and a custom-response field. You can dismiss the
+sheet and reopen it with **Answer question**. Submitted replies show the question
+and answer, not internal JSON. Answers submitted in Desktop also dismiss the
+pending question on the phone after synchronization.
+
+While Codex compacts context, Android shows the compaction activity and keeps the
+task running. Compaction finishing is not the same as the task finishing; the task
+remains active until its turn actually ends. These updates require a reachable
+Desktop connection and may take a few seconds to synchronize.
+
 ### Android file-content previews
 
 Generated-image tools remain visible while running and after completion. The Android **View Images**

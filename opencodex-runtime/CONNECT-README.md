@@ -1,5 +1,13 @@
 # Remodex Connect — desktop/server npm package
 
+## Version 1.2.21
+
+Carries the Windows/macOS CI fixes verified in all eight server compatibility shards: complete remote-asset test fixtures, bounded startup/shutdown checks, native-promise oversized-response assertions, and isolated real history-worker regression checks. The manual focused runtime workflow is available for transport and worker checks without a full dashboard build.
+
+Legacy Antigravity OAuth client credentials are no longer embedded in the distributed source. That legacy integration requires explicit `GOOGLE_ANTIGRAVITY_CLIENT_ID` and `GOOGLE_ANTIGRAVITY_CLIENT_SECRET` environment settings; missing settings fail before network access. The simplified ChatGPT/Codex connection flow is unchanged.
+
+## Simplified desktop/server flow
+
 Version 1.2.19 introduces the simplified desktop/server flow in the existing `@remodex/rmx` npm package. The Android app is not copied or changed. It includes three-stage onboarding and QR progress. Development and release preparation do not install over the original local service.
 
 The product is the existing npm package (`@remodex/rmx`, command `rmx`) and its browser dashboard. No separate desktop application, native installer, or new npm package is being built or shipped. The retained legacy `desktop/` tooling is outside this product's build and npm payload.

@@ -3234,6 +3234,87 @@ describe("Android Remote Codex projection", () => {
     expect(JSON.stringify(live)).not.toContain("private text");
   });
 
+  test.each(["legacy", "canonical"])("mirrors live Desktop compaction and async questions despite an idle private snapshot: %s", async shape => {
+    let now = Date.now();
+    const codex = new FakeCodexClient();
+    codex.threads.push({ id: "desktop-interaction", cwd: process.cwd(), modelProvider: "openai", status: { type: "idle" }, turns: [] });
+    const desktopIpc = new FakeDesktopIpcSync();
+    desktopIpc.markDesktopOwned("desktop-interaction");
+    const questionId = '["request_user_input_async","call-question",0]';
+    const items: Record<string, unknown>[] = [
+      { type: "agentMessage", id: "call-question", questions: [{ title: "Which platform?", options: ["Android", "All"] }] },
+      { type: "contextCompaction", id: "live-compaction", completed: false, startedAtMs: now },
+    ];
+    desktopIpc.followerStateAction = async () => ({
+      id: "desktop-interaction", threadRuntimeStatus: { type: "idle" },
+      ...(shape === "legacy"
+        ? { turns: [{ turnId: "live-turn", status: "in_progress", items }] }
+        : { turnHistory: { kind: "canonical", history: {
+          entitiesByKey: { "turn:live-turn": { turnId: "live-turn", status: "in_progress", items } },
+          islands: [{ entries: ["turn:live-turn"] }],
+        } } }),
+    });
+    const controller = new AndroidRemoteGatewayController(memoryStore(), {
+      port: 0, hostname: "127.0.0.1", now: () => now, desktopIpcSync: desktopIpc,
+      runtime: { start: async () => codex, stop: async () => {} },
+    });
+    const internal = controller as unknown as {
+      refreshDesktopInteractions(id: string): Promise<void>;
+      ensureThreadStream(id: string): Promise<{ detail: { thread: Record<string, any> } }>;
+      readFullThreadDetail(id: string): Promise<{ thread: Record<string, any> }>;
+      respondToUserInput(clientId: string, command: Record<string, unknown>): Promise<void>;
+      steerTurn(clientId: string, command: Record<string, any>): Promise<void>;
+      applyLiveCodexNotification(message: CodexJsonRpcMessage, publish: boolean, source: string): boolean;
+      liveNotificationActivities: Map<string, { activeItems: Map<string, unknown>; fallbackLabel: string }>;
+    };
+    try {
+      await controller.start();
+      await internal.refreshDesktopInteractions("desktop-interaction");
+      const initial = await internal.ensureThreadStream("desktop-interaction");
+      expect(initial.detail.thread.session.status).toBe("running");
+      expect(initial.detail.thread.activities).toContainEqual(expect.objectContaining({ kind: "context-compaction", payload: expect.objectContaining({ status: "inProgress" }) }));
+      const question = initial.detail.thread.activities.find((row: any) => row.kind === "user-input.requested");
+      expect(question.payload.questions[0].id).toBe(questionId);
+      internal.applyLiveCodexNotification({ method: "item/completed", params: {
+        threadId: "desktop-interaction", turnId: "live-turn", completedAtMs: now + 100,
+        item: { type: "contextCompaction", id: `context-compaction-live-turn-${now + 100}`, status: "completed" },
+      } }, true, "desktop-session");
+      const afterCompaction = await internal.readFullThreadDetail("desktop-interaction");
+      expect(afterCompaction.thread.activities.filter((row: any) => row.kind === "context-compaction")).toHaveLength(1);
+      expect(internal.liveNotificationActivities.get("desktop-interaction")?.activeItems.size).toBe(0);
+      expect(internal.liveNotificationActivities.get("desktop-interaction")?.fallbackLabel).toBe("Reasoning");
+      const deliver = spyOn(internal, "steerTurn").mockResolvedValue(undefined);
+      await expect(internal.respondToUserInput("phone", {
+        threadId: "another-task", requestId: question.payload.requestId, answers: { [questionId]: "Android" },
+      })).rejects.toThrow("does not belong");
+      await internal.respondToUserInput("phone", {
+        threadId: "desktop-interaction", requestId: question.payload.requestId, answers: { [questionId]: "My custom answer" },
+      });
+      expect(deliver).toHaveBeenCalledTimes(1);
+      const message = deliver.mock.calls[0]![1].message.text;
+      expect(message).toContain("send_user_message_question_reply");
+      expect(message).toContain("My custom answer");
+      items.push({ type: "userMessage", id: "answer", content: [{ type: "text", text: message }] });
+      items[1] = { ...items[1], completed: true };
+      now += 3000;
+      await internal.refreshDesktopInteractions("desktop-interaction");
+      const resolved = await internal.readFullThreadDetail("desktop-interaction");
+      expect(resolved.thread.session.status).toBe("running");
+      expect(resolved.thread.hasPendingUserInput).toBe(false);
+      expect(resolved.thread.activities).toContainEqual(expect.objectContaining({ kind: "user-input.resolved" }));
+      expect(resolved.thread.activities).toContainEqual(expect.objectContaining({ kind: "context-compaction", payload: expect.objectContaining({ status: "completed" }) }));
+      internal.applyLiveCodexNotification({ method: "turn/completed", params: {
+        threadId: "desktop-interaction", turn: { id: "live-turn", status: "completed" },
+      } }, true, "desktop-session");
+      now += 3000;
+      await internal.refreshDesktopInteractions("desktop-interaction");
+      expect((await internal.readFullThreadDetail("desktop-interaction")).thread.session.status).not.toBe("running");
+      deliver.mockRestore();
+    } finally {
+      await controller.stop();
+    }
+  });
+
   test("projects Codex context compaction as a safe ordered marker", () => {
     const snapshot = projectCodexThreadDetail({
       id: "native-1",
