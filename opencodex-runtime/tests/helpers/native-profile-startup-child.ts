@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
 
 import { NativeProfileManager } from "../../src/codex/native-profile-manager";
 import { isCodexAccountUsable } from "../../src/codex/account-usability";
@@ -67,7 +67,10 @@ const server = startServer(0, {
   managementApi: { nativeProfileApi: { manager } },
 });
 
-writeFileSync(portPath, String(server.port));
+if (!Number.isInteger(server.port) || server.port < 1 || server.port > 65535) {
+  throw new Error("Startup fixture did not bind a valid TCP port");
+}
+atomicWriteFile(portPath, String(server.port));
 // #1061: the parent parses this file as soon as it exists, so a partial write
 // surfaces as `Unexpected EOF`. atomicWriteFile publishes through a rename, so a
 // reader sees either nothing or the whole document.

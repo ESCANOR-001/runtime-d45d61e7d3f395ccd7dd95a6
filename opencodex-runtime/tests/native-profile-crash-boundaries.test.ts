@@ -139,6 +139,7 @@ async function stopStartup(
 
 function spawnSwitch(f: Awaited<ReturnType<typeof fixture>>, options: { boundary?: NativeProfileSwitchBoundary; marker?: string; release?: string; contention?: string; result: string }) {
   return Bun.spawn([process.execPath, join(import.meta.dir, "helpers", "native-profile-switch-child.ts")], {
+    windowsHide: true,
     cwd: join(import.meta.dir, ".."),
     env: {
       ...process.env,
@@ -169,6 +170,7 @@ function spawnStartup(
   extraEnv: Record<string, string> = {},
 ) {
   return Bun.spawn([process.execPath, join(import.meta.dir, "helpers", "native-profile-startup-child.ts")], {
+    windowsHide: true,
     cwd: join(import.meta.dir, ".."),
     env: {
       ...process.env, HOME: f.home, USERPROFILE: f.home, CODEX_HOME: f.codexHome, OPENCODEX_HOME: f.configDir,
@@ -232,7 +234,10 @@ describe("native profile Remodex process-exit phases", () => {
       const restart = spawnStartup(f, p);
       try {
         await waitFor(p.port);
-        const port = Number(readFileSync(p.port, "utf8"));
+        const publishedPort = readFileSync(p.port, "utf8");
+        expect(publishedPort).toMatch(/^[1-9]\d{0,4}$/);
+        const port = Number(publishedPort);
+        expect(port).toBeLessThanOrEqual(65535);
         if (scenario.phase) {
           expect((await mainRequest(port)).status).toBeGreaterThanOrEqual(400);
           expect(existsSync(p.upstream)).toBe(false);
