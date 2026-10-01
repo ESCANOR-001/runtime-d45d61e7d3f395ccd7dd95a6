@@ -14,6 +14,7 @@ function runCli(args: string[], env: NodeJS.ProcessEnv = {}) {
     cwd: repoRoot,
     env: { ...process.env, ...env },
     encoding: "utf8",
+    windowsHide: true,
   });
 }
 
@@ -31,6 +32,7 @@ describe("CLI subcommand help", () => {
       cwd: repoRoot,
       env: process.env,
       encoding: "utf8",
+      windowsHide: true,
     });
     expect(binResult.status).toBe(0);
     expect(binResult.stdout.trim()).toMatch(/^Remodex \d+\.\d+\.\d+/);
@@ -46,7 +48,7 @@ describe("CLI subcommand help", () => {
     expect(result.stdout).toContain("Start the proxy; Codex sync requires configuration permission.");
   });
 
-  test("top-level help forms exit before Codex shim auto-restore can mutate launchers", () => {
+  test.each(["", "help", "--help", "-h"])("top-level help '%s' exits before Codex shim auto-restore can mutate launchers", help => {
     const opencodexHome = mkdtempSync(join(tmpdir(), "ocx-help-shim-home-"));
     const binDir = mkdtempSync(join(tmpdir(), "ocx-help-shim-bin-"));
     try {
@@ -67,17 +69,15 @@ describe("CLI subcommand help", () => {
       const backupBefore = readFileSync(backup);
       Bun.sleepSync(120);
 
-      for (const args of [[], ["help"], ["--help"], ["-h"]]) {
-        const result = runCli(args, { OPENCODEX_HOME: opencodexHome, PATH: binDir });
-        expect(result.status).toBe(0);
-        expect(result.stdout).toContain("Remodex (rmx)");
-        expect(result.stdout).toContain("Compatibility aliases: remodex, opencodex, ocx");
-        expect(result.stdout).toContain("These aliases accept the same commands as rmx.");
-        expect(result.stdout).not.toContain("\n  ocx ");
-        expect(readFileSync(wrapper, "utf8")).toBe(replacement);
-        expect(readFileSync(backup)).toEqual(backupBefore);
-        expect(readFileSync(statePath)).toEqual(stateBefore);
-      }
+      const result = runCli(help ? [help] : [], { OPENCODEX_HOME: opencodexHome, PATH: binDir });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("Remodex (rmx)");
+      expect(result.stdout).toContain("Compatibility aliases: remodex, opencodex, ocx");
+      expect(result.stdout).toContain("These aliases accept the same commands as rmx.");
+      expect(result.stdout).not.toContain("\n  ocx ");
+      expect(readFileSync(wrapper, "utf8")).toBe(replacement);
+      expect(readFileSync(backup)).toEqual(backupBefore);
+      expect(readFileSync(statePath)).toEqual(stateBefore);
     } finally {
       rmSync(opencodexHome, { recursive: true, force: true });
       rmSync(binDir, { recursive: true, force: true });
@@ -140,6 +140,7 @@ describe("CLI subcommand help", () => {
         cwd: repoRoot,
         env: { ...process.env, OPENCODEX_HOME: opencodexHome },
         encoding: "utf8",
+        windowsHide: true,
       });
 
       expect(result.status).toBe(0);
@@ -178,6 +179,7 @@ describe("CLI subcommand help", () => {
         cwd: repoRoot,
         env: { ...process.env, CODEX_HOME: codexHome },
         encoding: "utf8",
+        windowsHide: true,
       });
 
       expect(result.status).toBe(0);
@@ -189,7 +191,12 @@ describe("CLI subcommand help", () => {
     }
   });
 
-  test("mutating command help exits before local state changes", () => {
+  test.each([
+    { args: ["stop", "--help"], expected: "Usage: rmx stop" },
+    { args: ["uninstall", "--help"], expected: "Usage: rmx uninstall" },
+    { args: ["service", "uninstall", "--help"], expected: "Usage: rmx service" },
+    { args: ["codex-shim", "uninstall", "--help"], expected: "Usage: rmx codex-shim" },
+  ])("mutating command help exits before local state changes: %j", testCase => {
     const opencodexHome = mkdtempSync(join(tmpdir(), "ocx-help-state-"));
     const codexHome = mkdtempSync(join(tmpdir(), "ocx-help-codex-"));
     try {
@@ -199,23 +206,14 @@ describe("CLI subcommand help", () => {
       writeFileSync(configPath, before, "utf8");
       writeFileSync(markerPath, '{"installed":true}', "utf8");
 
-      const cases = [
-        { args: ["stop", "--help"], expected: "Usage: rmx stop" },
-        { args: ["uninstall", "--help"], expected: "Usage: rmx uninstall" },
-        { args: ["service", "uninstall", "--help"], expected: "Usage: rmx service" },
-        { args: ["codex-shim", "uninstall", "--help"], expected: "Usage: rmx codex-shim" },
-      ];
-
-      for (const testCase of cases) {
-        const result = runCli(testCase.args, {
-          CODEX_HOME: codexHome,
-          OPENCODEX_HOME: opencodexHome,
-        });
-        expect(result.status).toBe(0);
-        expect(result.stdout).toContain(testCase.expected);
-        expect(readFileSync(configPath, "utf8")).toBe(before);
-        expect(readFileSync(markerPath, "utf8")).toBe('{"installed":true}');
-      }
+      const result = runCli(testCase.args, {
+        CODEX_HOME: codexHome,
+        OPENCODEX_HOME: opencodexHome,
+      });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain(testCase.expected);
+      expect(readFileSync(configPath, "utf8")).toBe(before);
+      expect(readFileSync(markerPath, "utf8")).toBe('{"installed":true}');
     } finally {
       rmSync(opencodexHome, { recursive: true, force: true });
       rmSync(codexHome, { recursive: true, force: true });
@@ -231,6 +229,7 @@ describe("CLI subcommand help", () => {
         cwd: repoRoot,
         env: { ...process.env, CODEX_HOME: codexHome },
         encoding: "utf8",
+        windowsHide: true,
       });
 
       expect(result.status).toBe(0);
@@ -244,19 +243,15 @@ describe("CLI subcommand help", () => {
     }
   });
 
-  test("start rejects unknown and partially numeric port arguments", () => {
-    const cases = [
-      { args: ["start", "--port", "123abc"], expected: "Invalid port number" },
-      { args: ["start", "--bad"], expected: "Usage: rmx start [--port <port>]" },
-      { args: ["start", "--port", "1234", "--extra"], expected: "Usage: rmx start [--port <port>]" },
-    ];
-
-    for (const testCase of cases) {
-      const result = runCli(testCase.args);
-      expect(result.status).toBe(1);
-      expect(result.stderr).toContain(testCase.expected);
-      expect(result.stdout).not.toContain("Plain `codex`");
-    }
+  test.each([
+    { args: ["start", "--port", "123abc"], expected: "Invalid port number" },
+    { args: ["start", "--bad"], expected: "Usage: rmx start [--port <port>]" },
+    { args: ["start", "--port", "1234", "--extra"], expected: "Usage: rmx start [--port <port>]" },
+  ])("start rejects invalid port arguments: %j", testCase => {
+    const result = runCli(testCase.args);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(testCase.expected);
+    expect(result.stdout).not.toContain("Plain `codex`");
   });
 
   test("start help wins before port validation", () => {
