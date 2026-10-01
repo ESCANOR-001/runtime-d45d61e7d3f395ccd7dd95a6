@@ -4,8 +4,8 @@ import { runPosixPackageSmoke } from "./posix-package-smoke.mjs";
 
 export { globalPackagePaths } from "./posix-package-smoke.mjs";
 
-export async function runMacosPackageSmoke() {
-  return runPosixPackageSmoke("darwin");
+export async function runLinuxPackageSmoke() {
+  return runPosixPackageSmoke("linux");
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) await runMacosPackageSmoke();
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) await runLinuxPackageSmoke();
