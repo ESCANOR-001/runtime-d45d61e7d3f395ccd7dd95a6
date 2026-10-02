@@ -120,7 +120,11 @@ test("storage worker reservation 17 rejects before enqueue while the first 16 sp
 test("reset drains a worker that is still blocked mid-run", async () => {
   // A worker held inside its run is exactly the state that outlived the file
   // boundary in CI, so tear it down while it is still busy.
-  setStorageCleanupPolicyJobTestHooks({ blockMs: 1_500 });
+  let policyLoaded = false;
+  setStorageCleanupPolicyJobTestHooks({
+    blockMs: 1_500,
+    onPolicyLoaded: () => { policyLoaded = true; },
+  });
   seedArchived(isolatedCodexHome!.path);
   const started = requestStorageCleanupPolicyRun({
     reason: "manual",
@@ -129,6 +133,11 @@ test("reset drains a worker that is still blocked mid-run", async () => {
   expect(started.accepted).toBe(true);
 
   await waitForLiveWorker();
+  const loadDeadline = Date.now() + 10_000;
+  while (!policyLoaded && Date.now() < loadDeadline) await Bun.sleep(5);
+  expect(policyLoaded).toBe(true);
+  expect(getStorageCleanupPolicyJobState().status).toBe("running");
+  expect(liveStorageWorkerCount()).toBe(1);
   await resetStorageCleanupPolicyJobForTestsAsync();
   expect(liveStorageWorkerCount()).toBe(0);
 }, { timeout: 30_000 });
