@@ -20,6 +20,14 @@ The connection settings open on **Local**, alongside **Free temporary link** and
 The sections below are the manual path for adding another model provider or running Remodex in the
 foreground.
 
+### Pairing troubleshooting (next release)
+
+Updated Android builds distinguish missing pairing tokens, unsupported QR versions, malformed QR codes, and invalid server addresses before attempting a connection. Scan the QR from **Android Remote**, not a plain dashboard URL.
+
+With both the updated app and server, retrying the same QR in the running app can recover a lost pairing response for up to two minutes without creating another authorization. After an app/server restart or an expired retry window, generate a fresh QR. Older versions remain compatible but do not support this recovery.
+
+A connection error does not prove that a Cloudflare address changed. Check that the PC is awake and Remodex is running; try the same trusted Wi-Fi or a fresh QR. Quick Tunnel addresses can change, while a custom domain is intended to remain stable. Diagnostics record only fixed failure categories, route types, and HTTP status codes—not QR content, credentials, or addresses.
+
 ## Add a provider (optional)
 
 ```bash

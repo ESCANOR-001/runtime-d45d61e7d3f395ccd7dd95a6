@@ -2901,6 +2901,7 @@ export class AndroidRemoteGatewayController {
       }
       const exchanged = this.auth.exchangePairingToken({
         pairingToken: body.get("subject_token") ?? "",
+        retryProof: body.get("client_pairing_proof") ?? undefined,
         metadata: {
           label: body.get("client_label") ?? undefined,
           deviceType: body.get("client_device_type") ?? undefined,

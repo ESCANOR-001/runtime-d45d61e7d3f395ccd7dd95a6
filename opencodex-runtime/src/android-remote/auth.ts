@@ -11,6 +11,14 @@ const PAIRING_TTL_MS = 5 * 60 * 1000;
 const ACCESS_TOKEN_TTL_MS = 180 * 24 * 60 * 60 * 1000;
 const WEBSOCKET_TICKET_TTL_MS = 30 * 1000;
 const CLIENT_TOUCH_INTERVAL_MS = 60 * 1000;
+const PAIRING_RECOVERY_TTL_MS = 2 * 60 * 1000;
+
+type PairingExchangeResult = {
+  accessToken: string;
+  expiresAt: string;
+  client: AndroidRemoteStoredClient;
+  replacedClientIds: string[];
+};
 
 export const ANDROID_REMOTE_SCOPES = [
   "orchestration:read",
@@ -105,6 +113,11 @@ export class AndroidRemoteAuth {
   private readonly invitations = new Map<string, StoredInvitation>();
   private readonly websocketTickets = new Map<string, StoredTicket>();
   private readonly lastTouchedAt = new Map<string, number>();
+  private readonly pairingRecovery = new Map<string, {
+    proofDigest: string;
+    expiresAtMs: number;
+    result: PairingExchangeResult;
+  }>();
 
   constructor(
     private readonly store: AndroidRemoteStore,
@@ -149,11 +162,23 @@ export class AndroidRemoteAuth {
 
   exchangePairingToken(input: {
     pairingToken: string;
+    retryProof?: string;
     metadata: AndroidRemoteClientMetadata;
     address?: string;
-  }): { accessToken: string; expiresAt: string; client: AndroidRemoteStoredClient; replacedClientIds: string[] } | null {
+  }): PairingExchangeResult | null {
     this.pruneExpired();
+    if (input.retryProof !== undefined && !/^[a-f0-9]{64}$/.test(input.retryProof)) return null;
     const presentedDigest = digestAndroidRemoteCredential(input.pairingToken);
+    const recovery = this.pairingRecovery.get(presentedDigest);
+    if (recovery) {
+      if (!input.retryProof || !equalDigest(recovery.proofDigest, digestAndroidRemoteCredential(input.retryProof))) return null;
+      const authenticated = this.authenticateAccessToken(recovery.result.accessToken);
+      if (!authenticated) {
+        this.pairingRecovery.delete(presentedDigest);
+        return null;
+      }
+      return { ...recovery.result, client: authenticated.client, replacedClientIds: [] };
+    }
     const invitation = [...this.invitations.values()].find(row =>
       row.expiresAtMs > this.now() && equalDigest(row.tokenDigest, presentedDigest));
     if (!invitation) return null;
@@ -182,7 +207,16 @@ export class AndroidRemoteAuth {
     // A failed disk write must not consume the only way to pair this phone.
     this.invitations.delete(invitation.id);
     for (const clientId of replacedClientIds) this.revokeClient(clientId);
-    return { accessToken, expiresAt, client, replacedClientIds };
+    const result = { accessToken, expiresAt, client, replacedClientIds };
+    if (input.retryProof) {
+      if (this.pairingRecovery.size >= 128) this.pairingRecovery.delete(this.pairingRecovery.keys().next().value!);
+      this.pairingRecovery.set(presentedDigest, {
+        proofDigest: digestAndroidRemoteCredential(input.retryProof),
+        expiresAtMs: this.now() + PAIRING_RECOVERY_TTL_MS,
+        result,
+      });
+    }
+    return result;
   }
 
   authenticateAccessToken(rawToken: string, address?: string): AuthenticatedAndroidClient | null {
@@ -238,6 +272,9 @@ export class AndroidRemoteAuth {
   }
 
   revokeClient(clientId: string): void {
+    for (const [digest, recovery] of this.pairingRecovery) {
+      if (recovery.result.client.id === clientId) this.pairingRecovery.delete(digest);
+    }
     for (const [id, invitation] of this.invitations) {
       if (invitation.replaceClientId === clientId) this.invitations.delete(id);
     }
@@ -254,6 +291,9 @@ export class AndroidRemoteAuth {
 
   private pruneExpired(): void {
     const now = this.now();
+    for (const [digest, recovery] of this.pairingRecovery) {
+      if (recovery.expiresAtMs <= now) this.pairingRecovery.delete(digest);
+    }
     for (const [id, invitation] of this.invitations) {
       if (invitation.expiresAtMs <= now) this.invitations.delete(id);
     }

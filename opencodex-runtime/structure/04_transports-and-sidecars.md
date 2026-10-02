@@ -66,6 +66,12 @@ the release, and automatic installation still requires two idle observations.
 
 Pairing invitations are consumed only after the phone credential is saved successfully. A failed
 disk write leaves the invitation available for retry; successful exchanges remain single-use.
+Updated phones send a per-attempt random secret proof. For two minutes after acceptance,
+the same invitation and proof can recover the same credential if the response was lost.
+The recovery cache is memory-only, capped at 128 entries, and invalidated on revocation,
+replacement, expiry, or process restart. Older clients retain strict single-use behavior.
+An installation ID alone never authorizes recovery. Neither raw proofs nor credentials
+are written to diagnostics or the client authorization file.
 
 Pairing stores a digest of the app installation ID, never the raw ID. A successful repeat
 exchange atomically replaces all authorizations for that installation; names and addresses

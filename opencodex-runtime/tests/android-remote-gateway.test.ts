@@ -1001,6 +1001,41 @@ describe("Android Remote pairing addresses", () => {
 });
 
 describe("Android Remote credentials", () => {
+  test("HTTP token exchange recovers a dropped response without granting another phone access", async () => {
+    const store = memoryStore();
+    store.updateSettings({ controlEnabled: true, localNetworkEnabled: true });
+    const controller = new AndroidRemoteGatewayController(store, {
+      port: 0,
+      runtime: { start: async () => new FakeCodexClient(), stop: async () => {} },
+      desktopIpcSync: new FakeDesktopIpcSync(),
+      cloudflareTunnel: new ReadyCloudflareTunnel(null, "quick", "starting"),
+    });
+    try {
+      await controller.applySettings(store.read().settings);
+      const invitation = controller.createPairingInvitation("Test PC");
+      const body = new URLSearchParams({
+        grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
+        subject_token_type: "urn:t3:params:oauth:token-type:environment-bootstrap",
+        requested_token_type: "urn:ietf:params:oauth:token-type:access_token",
+        subject_token: invitation.payload.pairingToken,
+        client_pairing_proof: "a".repeat(64),
+      });
+      const exchange = () => fetch(`http://127.0.0.1:${controller.status().port}/oauth/token`, { method: "POST", body });
+      const first = await exchange();
+      expect(first.status).toBe(200);
+      const firstToken = await first.json() as { access_token: string };
+      const retry = await exchange();
+      expect(retry.status).toBe(200);
+      expect((await retry.json() as { access_token: string }).access_token).toBe(firstToken.access_token);
+      body.set("client_pairing_proof", "b".repeat(64));
+      expect((await exchange()).status).toBe(401);
+      body.delete("client_pairing_proof");
+      expect((await exchange()).status).toBe(401);
+      expect(store.read().clients).toHaveLength(1);
+    } finally {
+      await controller.stop();
+    }
+  });
   test("a repeated installation scan closes the old socket after rotating its authorization", async () => {
     const root = mkdtempSync(join(tmpdir(), "android-repair-gateway-"));
     const store = createAndroidRemoteStore(root);

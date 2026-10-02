@@ -25,6 +25,58 @@ function pair(auth: AndroidRemoteAuth, installationId?: string, replaceClientId?
     metadata: { label: "Same phone model", os: "android", installationId }, address: "192.168.1.9" })!;
 }
 
+test("a lost exchange response can be recovered only with the original secret proof", () => {
+  const { store, auth, root } = fixture();
+  const qr = invitation(auth);
+  const input = { pairingToken: qr.payload.pairingToken, retryProof: "a".repeat(64), metadata: { installationId: "same-installation" } };
+  const writes = spyOn(store, "upsertClient");
+  const first = auth.exchangePairingToken(input)!;
+  expect(auth.hasInvitation(qr.id)).toBe(false);
+  expect(auth.exchangePairingToken({ ...input, retryProof: undefined })).toBeNull();
+  expect(auth.exchangePairingToken({ ...input, retryProof: "b".repeat(64) })).toBeNull();
+  expect(auth.exchangePairingToken(input)?.accessToken).toBe(first.accessToken);
+  expect(auth.exchangePairingToken(input)?.replacedClientIds).toEqual([]);
+  expect(writes).toHaveBeenCalledTimes(1);
+  expect(store.read().clients).toHaveLength(1);
+  const persisted = readFileSync(join(root, "android-remote.json"), "utf8");
+  expect(persisted).not.toContain(input.retryProof);
+  expect(persisted).not.toContain(first.accessToken);
+  expect(new AndroidRemoteAuth(store).exchangePairingToken(input)).toBeNull();
+  writes.mockRestore();
+});
+
+test("pairing recovery expires without extending on retries", () => {
+  const { store } = fixture();
+  let now = Date.now();
+  const auth = new AndroidRemoteAuth(store, () => now);
+  const input = { pairingToken: invitation(auth).payload.pairingToken, retryProof: "c".repeat(64), metadata: {} };
+  expect(auth.exchangePairingToken(input)).not.toBeNull();
+  now += 119_999;
+  expect(auth.exchangePairingToken(input)).not.toBeNull();
+  now += 1;
+  expect(auth.exchangePairingToken(input)).toBeNull();
+});
+
+test.each(["revoke", "replace", "remove-store"])("%s invalidates pairing recovery", action => {
+  const { store, auth } = fixture();
+  const input = { pairingToken: invitation(auth).payload.pairingToken, retryProof: "d".repeat(64), metadata: { installationId: "phone" } };
+  const first = auth.exchangePairingToken(input)!;
+  if (action === "revoke") auth.revokeClient(first.client.id);
+  else if (action === "replace") pair(auth, "phone");
+  else store.revokeClient(first.client.id);
+  expect(auth.exchangePairingToken(input)).toBeNull();
+});
+
+test("invalid recovery proofs do not consume invitations or create clients", () => {
+  const { store, auth } = fixture();
+  const qr = invitation(auth);
+  for (const retryProof of ["", "installation-id", "z".repeat(64), "a".repeat(65)]) {
+    expect(auth.exchangePairingToken({ pairingToken: qr.payload.pairingToken, retryProof, metadata: {} })).toBeNull();
+  }
+  expect(auth.hasInvitation(qr.id)).toBe(true);
+  expect(store.read().clients).toHaveLength(0);
+});
+
 test("repeat scans rotate one installation's authorization and invalidate old tokens and tickets", () => {
   const { store, auth } = fixture();
   const first = pair(auth, "installation-one");
