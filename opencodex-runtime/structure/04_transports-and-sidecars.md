@@ -20,7 +20,9 @@ the beginning of compaction. Private handoff text is never part of this metadata
 ## Android sidebar updates
 
 An uncached shell subscription waits for a real lightweight first-page snapshot;
-an invented empty bootstrap must not mark a newly paired phone ready. Remaining
+an invented empty bootstrap must not mark a newly paired phone ready. Explicit
+fresh subscriptions also use this ten-row first page, with a ten-second native
+request deadline; they never join an in-flight full-history read. Remaining
 rows refresh independently of selected transcript and server-configuration reads.
 Shell reads are coalesced, failures retry with capped backoff, and the five-second
 safety poll also uses that independent shell path. First-page reads skip optional
@@ -28,6 +30,14 @@ session-index backfill. A bounded lifecycle cache retains only status metadata
 for unselected tasks, so start/completion events immediately update sidebar rows
 without loading transcripts. Later stale catalogue reads cannot revive the same
 completed turn, and old completion events cannot stop a newer active turn.
+
+Windows runtime selection follows the app-server child of the current user's
+verified running Desktop application. Cached installation folders and orphaned
+Remodex listeners do not override that version. Explicit environment pins still
+require a matching version. A version mismatch on the default private port uses
+an alternate loopback port without stopping the unowned listener. Gateway status
+reports a disconnected native runtime as an error even if its phone listener is
+still open.
 
 ## Update activity verification
 
@@ -64,7 +74,7 @@ A dashboard-created repair invitation can also name one existing client to repla
 revoking it before the scan. Removed clients' tickets, repair invitations, and sockets are
 invalidated after persistence succeeds. Revoked or already-replaced repair targets fail closed.
 
-`rmx onboard` explicitly enables `localNetworkEnabled` and starts the Android gateway on IPv4 LAN interfaces. Existing settings without this opt-in keep the loopback-only bind. Main dashboard port 10100 and private Codex port 10106 remain unchanged. Only RFC1918 private IPv4 addresses are advertised; loopback, public, link-local, and host-only adapters are excluded from phone-facing readiness. Direct public peers are rejected; cloudflared still connects through loopback. LAN HTTP requires a trusted network and existing phone authentication.
+`rmx onboard` explicitly enables `localNetworkEnabled` and starts the Android gateway on IPv4 LAN interfaces. Existing settings without this opt-in keep the loopback-only bind. Main dashboard port 10100 and default private Codex port 10106 remain unchanged; an incompatible existing private listener can cause selection of another loopback port. Only RFC1918 private IPv4 addresses are advertised; loopback, public, link-local, and host-only adapters are excluded from phone-facing readiness. Direct public peers are rejected; cloudflared still connects through loopback. LAN HTTP requires a trusted network and existing phone authentication.
 
 The local QR becomes available independently of remote-link verification, including when a saved named domain is unavailable. The six-step onboarding flow installs/verifies the Windows tray and checks Codex before offering LAN pairing in step six; only public tunnel verification remains independent. Remote setup continues in the persistent service. A lightweight 15-second interface check announces changed local addresses; it reads no conversation history and spawns no commands.
 
@@ -286,7 +296,12 @@ history recovery. Migration-mutated `updatedAt` is not conversation recency.
 On Windows, even successful bounded native history pages are checked against verified rollout
 discovery. Multiple verified sources or a newest source different from native metadata select
 session recovery with local paging, retaining native items in the merge and dropping native cursors.
-Single-source Windows tasks and other platforms retain native paging. Discovery uses the same
+Nonempty single-source Windows tasks and other platforms retain native paging. An empty Windows
+native page instead recovers saved messages. A verified single-source file without a history parent
+uses a 2 MiB recent tail before a coalesced background full read; older-page requests join that read.
+The initial local cursor anchors the first recovered block. Unexpected empty refreshes preserve
+already projected messages; explicit history edits can still clear them. Metadata header reads use
+explicit positional bounds because Bun sliced reads can overrun on Windows. Discovery uses the same
 Codex home as the recovery reader when a custom reader provides source resolution.
 
 Across platforms, private developer/system response records (including image resize notices) do
@@ -294,6 +309,9 @@ not break the pairing of a public user response with its following client-id eve
 and turn boundaries still flush that pending pair. Persisted `local_image`/`local_audio` content
 types normalize to the public `localImage`/`localAudio` types during history recovery. Attachment
 echo reconciliation keeps the durable client id and never merges two different explicit client ids.
+The shared public-text boundary also hides Windows `external_codex_apps_open_page` context
+records before recovery or live projection can treat them as user prompts. Response annotation
+directives are removed outside code examples so native phone rendering receives readable text.
 
 Live session replay and saved history use `desktop-thread-item.ts` for the same structured item
 conversion. `item_started`/`item_completed` events publish public tools immediately, including

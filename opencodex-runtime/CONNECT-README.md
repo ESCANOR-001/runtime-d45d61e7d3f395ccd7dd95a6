@@ -1,5 +1,15 @@
 # Remodex Connect — desktop/server npm package
 
+## 1.2.23 — Windows chat loading
+
+- Select the Codex runtime belonging to the running Windows Desktop after updates.
+- Load recent chats first instead of waiting for the complete chat catalogue.
+- Recover recent saved messages when Windows returns an empty history page, then load older history.
+- Keep loaded messages during unexpected empty refreshes and hide internal page-context and annotation text.
+
+If a conversation was already open before updating, return to the chat list and
+open it again to replace its previously retained history rows with clean messages.
+
 ## Version 1.2.21
 
 Carries the Windows/macOS CI fixes verified in all eight server compatibility shards: complete remote-asset test fixtures, bounded startup/shutdown checks, native-promise oversized-response assertions, and isolated real history-worker regression checks. The manual focused runtime workflow is available for transport and worker checks without a full dashboard build.

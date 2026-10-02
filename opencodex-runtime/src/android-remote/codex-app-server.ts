@@ -3,7 +3,7 @@ import { DEFAULT_CODEX_APP_SERVER_PORT } from "./ports";
 import { codexExecInvocation } from "../codex/exec-invocation";
 import { CODEX_PROFILE_PATH } from "../codex/paths";
 import { readDesktopDirectModelProvider } from "./desktop-model-route";
-import { verifyAndroidRuntimePeer, type AndroidRuntimeSelection } from "./runtime-compatibility";
+import { AndroidRuntimeVersionMismatchError, verifyAndroidRuntimePeer, type AndroidRuntimeSelection } from "./runtime-compatibility";
 import { resolveAndroidRuntimeInBackground } from "./runtime-probe-client";
 import { spawnWindowsProcessWithoutInheritedHandlesAsync } from "../lib/windows-no-inherit-process";
 
@@ -11,6 +11,13 @@ const START_TIMEOUT_MS = 12_000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const OWNED_PROCESS_TERM_GRACE_MS = 1_000;
 const OWNED_PROCESS_KILL_GRACE_MS = 1_000;
+
+async function unusedLoopbackPort(): Promise<number> {
+  const reservation = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response(null, { status: 503 }) });
+  const port = reservation.port!;
+  await reservation.stop(true);
+  return port;
+}
 
 const APP_SERVER_PROFILE_KEYS = new Set([
   "model_provider",
@@ -464,8 +471,9 @@ export class AndroidCodexRuntime {
   private stopFlight: Promise<void> | null = null;
 
   constructor(
-    private readonly port = DEFAULT_CODEX_APP_SERVER_PORT,
+    private port = DEFAULT_CODEX_APP_SERVER_PORT,
     private readonly selectRuntime: () => AndroidRuntimeSelection | Promise<AndroidRuntimeSelection> = resolveAndroidRuntimeInBackground,
+    private readonly alternatePort: (() => Promise<number>) | undefined = port === DEFAULT_CODEX_APP_SERVER_PORT ? unusedLoopbackPort : undefined,
   ) {}
 
   status(): AndroidCodexRuntimeStatus {
@@ -570,38 +578,52 @@ export class AndroidCodexRuntime {
     try {
       const selection = await this.selectRuntime();
       if (revision !== this.lifecycleRevision) throw new Error("Codex task runtime stopped during startup");
-      if (!(await taskServerReady(this.port))) {
-        await this.stopOwnedProcess();
-        const runtime = selection.runtime;
-        const invocation = codexExecInvocation(
-          runtime.command || "codex",
-          remodexCodexAppServerArgs(this.port),
-        );
-        // Bun can copy the proxy's 10100 LISTEN handle into a Windows child.
-        // Launch through Start-Process there so a stopped proxy never leaves a
-        // dead-PID listener behind in the long-lived Codex app-server tree.
-        const child: KillableSubprocess = process.platform === "win32"
-          ? await spawnWindowsProcessWithoutInheritedHandlesAsync(invocation.file, invocation.args, {
-              windowsVerbatimArguments: invocation.options.windowsVerbatimArguments,
-            })
-          : Bun.spawn([invocation.file, ...invocation.args], {
-              stdin: "ignore",
-              stdout: "ignore",
-              stderr: "ignore",
-              windowsHide: true,
-            });
-        this.child = child;
-        this.ownedProcess = true;
-        void child.exited.then(() => {
-          if (this.child !== child) return;
-          this.child = null;
-          this.ownedProcess = false;
-        });
-        await waitUntilReady(this.port, child);
+      let socket: CodexAppServerSocket | undefined;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        if (revision !== this.lifecycleRevision) throw new Error("Codex task runtime stopped during startup");
+        if (!(await taskServerReady(this.port))) {
+          await this.stopOwnedProcess();
+          const runtime = selection.runtime;
+          const invocation = codexExecInvocation(
+            runtime.command || "codex",
+            remodexCodexAppServerArgs(this.port),
+          );
+          // Bun can copy the proxy's 10100 LISTEN handle into a Windows child.
+          // Launch through Start-Process there so a stopped proxy never leaves a
+          // dead-PID listener behind in the long-lived Codex app-server tree.
+          const child: KillableSubprocess = process.platform === "win32"
+            ? await spawnWindowsProcessWithoutInheritedHandlesAsync(invocation.file, invocation.args, {
+                windowsVerbatimArguments: invocation.options.windowsVerbatimArguments,
+              })
+            : Bun.spawn([invocation.file, ...invocation.args], {
+                stdin: "ignore",
+                stdout: "ignore",
+                stderr: "ignore",
+                windowsHide: true,
+              });
+          this.child = child;
+          this.ownedProcess = true;
+          void child.exited.then(() => {
+            if (this.child !== child) return;
+            this.child = null;
+            this.ownedProcess = false;
+          });
+          await waitUntilReady(this.port, child);
+        }
+        try {
+          socket = await CodexAppServerSocket.connect(
+            `ws://127.0.0.1:${this.port}`, selection.desktopVersion ?? selection.runtime.version,
+          );
+          break;
+        } catch (error) {
+          if (!(error instanceof AndroidRuntimeVersionMismatchError) || !this.alternatePort || attempt !== 0) throw error;
+          // A prior Remodex process can leave its listener behind after a
+          // Desktop update. Never kill or reuse an unowned, incompatible peer.
+          await this.stopOwnedProcess();
+          this.port = await this.alternatePort();
+        }
       }
-      const socket = await CodexAppServerSocket.connect(
-        `ws://127.0.0.1:${this.port}`, selection.desktopVersion ?? selection.runtime.version,
-      );
+      if (!socket) throw new Error("Could not connect to the matching Codex task server");
       if (revision !== this.lifecycleRevision) {
         socket.close();
         throw new Error("Codex task runtime stopped during startup");

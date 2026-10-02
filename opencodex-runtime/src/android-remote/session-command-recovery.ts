@@ -21,6 +21,7 @@ const READ_CHUNK_BYTES = 64 * 1024;
 const MAX_COMMAND_BYTES = 64 * 1024;
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const MAX_CACHE_ENTRIES = 6;
+const RECENT_HISTORY_BYTES = 2 * 1024 * 1024;
 
 type RecoveredCommand = {
   callId: string;
@@ -110,6 +111,7 @@ type SessionCache = {
 
 export interface AndroidRemoteCommandRecovery {
   resolveSourcePaths?(threadId: string, explicit: readonly string[]): Promise<string[]>;
+  enrichRecentThread?(thread: JsonRecord, sourcePaths: readonly string[]): Promise<{ thread: JsonRecord; hasOlder: boolean } | null>;
   enrichThread(thread: JsonRecord, sourcePaths?: readonly string[]): Promise<JsonRecord>;
   clear(): void;
 }
@@ -1150,6 +1152,42 @@ export class AndroidRemoteSessionCommandRecovery implements AndroidRemoteCommand
     this.lineageReplay = null;
   }
 
+  /** A Windows native reader can return an empty page for a populated task. */
+  async enrichRecentThread(thread: JsonRecord, sourcePaths: readonly string[]): Promise<{ thread: JsonRecord; hasOlder: boolean } | null> {
+    // Continuations and rollbacks still use the proven full-lineage reader.
+    // Never guess which sibling or parent contains the authoritative history.
+    if (sourcePaths.length !== 1) return null;
+    try {
+      const header = await this.updateCache(sourcePaths[0]!, true);
+      if (!header || header.threadId !== thread.id || header.historyBaseThreadId) return null;
+      let start = Math.max(0, header.size - RECENT_HISTORY_BYTES);
+      if (start > 0) {
+        const file = await open(header.canonicalPath, "r");
+        try {
+          const bytes = new Uint8Array(READ_CHUNK_BYTES);
+          // Discard the first partial record without reading outside the tail.
+          let found = false;
+          while (start < header.size) {
+            const { bytesRead } = await file.read(bytes, 0, Math.min(bytes.length, header.size - start), start);
+            if (!bytesRead) break;
+            const newline = bytes.subarray(0, bytesRead).indexOf(0x0a);
+            start += newline >= 0 ? newline + 1 : bytesRead;
+            if (newline >= 0) { found = true; break; }
+          }
+          if (!found) return null;
+        } finally { await file.close(); }
+      }
+      const recent: SessionCache = {
+        ...header, currentTurnId: null, nextTurnPlanMode: false,
+        turnsInOrder: [], recoveredTurns: new Map(), turns: new Map(), pendingUserMessage: null,
+      };
+      await scanSession(recent, start, header.canonicalPath, header.size);
+      const result = mergeRecoveredCommands(mergeRecoveredTurns({ ...thread, turns: [] }, recent), recent);
+      if (!(result.turns as JsonRecord[]).some(turn => Array.isArray(turn.items) && turn.items.length)) return null;
+      return { thread: result, hasOlder: start > 0 };
+    } catch { return null; }
+  }
+
   async enrichThread(thread: JsonRecord, sourcePaths: readonly string[] = []): Promise<JsonRecord> {
     const threadId = stringValue(thread.id).trim();
     if (!threadId) return thread;
@@ -1342,7 +1380,23 @@ export class AndroidRemoteSessionCommandRecovery implements AndroidRemoteCommand
       entries.set(canonicalPath, cache);
     }
     if (metadataOnly && cache.threadId === null) {
-      const prefix = await Bun.file(canonicalPath).slice(0, MAX_RECORD_BYTES).text();
+      // Explicit positional reads respect the bound on Windows too. Bun's
+      // sliced file reader can read past its end into the entire transcript.
+      const file = await open(canonicalPath, "r");
+      const chunks: Buffer[] = [];
+      try {
+        let offset = 0;
+        while (offset < Math.min(size, MAX_RECORD_BYTES)) {
+          const chunk = Buffer.alloc(Math.min(READ_CHUNK_BYTES, size - offset, MAX_RECORD_BYTES - offset));
+          const { bytesRead } = await file.read(chunk, 0, chunk.length, offset);
+          if (!bytesRead) break;
+          const newline = chunk.subarray(0, bytesRead).indexOf(0x0a);
+          chunks.push(chunk.subarray(0, newline >= 0 ? newline + 1 : bytesRead));
+          offset += bytesRead;
+          if (newline >= 0) break;
+        }
+      } finally { await file.close(); }
+      const prefix = Buffer.concat(chunks).toString("utf8");
       const newline = prefix.indexOf("\n");
       if (newline < 0) return null;
       const parsed = record(JSON.parse(prefix.slice(0, newline)));

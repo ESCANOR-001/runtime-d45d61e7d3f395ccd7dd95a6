@@ -61,6 +61,7 @@ import {
   projectedThreadBoundedSnapshot,
   projectedThreadOlderPage,
   projectedThreadRecentPage,
+  projectedThreadStartCursor,
   replayProjectedThreadAfter,
   type ProjectedThreadStreamState,
 } from "./thread-stream";
@@ -140,7 +141,7 @@ const ANDROID_ATTACHMENT_ONLY_BOOTSTRAP_PROMPT =
   "[User attached one or more files without additional text. Respond using the conversation context and the attached file(s).]";
 const THREAD_LIST_PAGE_SIZE = 100;
 const THREAD_LIST_MAX_PAGES = 10;
-const THREAD_LIST_QUICK_PAGE_SIZE = 25;
+const THREAD_LIST_QUICK_PAGE_SIZE = 10;
 // Codex notifications drive the normal live path. This slower poll is only a
 // safety net for changes made by another Codex process (for example Desktop).
 // Reading and projecting an entire long task every second made the phone
@@ -332,6 +333,7 @@ export type AndroidRemoteGatewayStatus = {
 interface CodexRuntimeLike {
   start(): Promise<AndroidCodexClient>;
   stop(): Promise<void>;
+  status?(): { connected: boolean; error?: string };
 }
 
 export type AndroidRemoteGatewayOptions = {
@@ -2122,6 +2124,8 @@ export class AndroidRemoteGatewayController {
    * token or safety poll.
    */
   private readonly authoritativeThreadRefreshes = new Set<string>();
+  private readonly windowsHistoryBackfills = new Set<string>();
+  private readonly windowsHistoryBackfillFlights = new Map<string, Promise<void>>();
   private readonly threadSourcePaths = new Map<string, string[]>();
   private readonly nativeThreadMetadata = new Map<string, JsonRecord>();
   private readonly missingNativeThreadIds = new Set<string>();
@@ -2197,6 +2201,7 @@ export class AndroidRemoteGatewayController {
   private shellCache: JsonRecord | null = null;
   private shellUpdatedAt = 0;
   private shellReadPending: Promise<JsonRecord> | null = null;
+  private quickShellReadPending: Promise<JsonRecord> | null = null;
   private shellRefreshFailures = 0;
   // Sidebar lifecycle survives transcript eviction and never retains messages.
   private shellLifecycles = new Map<string, JsonRecord>();
@@ -2420,11 +2425,15 @@ export class AndroidRemoteGatewayController {
   }
 
   status(): AndroidRemoteGatewayStatus {
+    const runtime = this.runtime.status?.();
+    const disconnected = this.gatewayStatus === "ready" && runtime?.connected === false;
     return {
-      status: this.gatewayStatus,
+      status: disconnected ? "error" : this.gatewayStatus,
       port: this.boundPort,
       backgroundServer: "current-process",
-      ...(this.statusError ? { error: this.statusError } : {}),
+      ...(disconnected
+        ? { error: gatewayStartupError(runtime.error ?? "Codex disconnected. Reconnect Android to retry.") }
+        : this.statusError ? { error: this.statusError } : {}),
     };
   }
 
@@ -2716,6 +2725,8 @@ export class AndroidRemoteGatewayController {
     this.desktopThreadSettings.clear();
     this.nativeThreadModelProviders.clear();
     this.authoritativeThreadRefreshes.clear();
+    this.windowsHistoryBackfills.clear();
+    this.windowsHistoryBackfillFlights.clear();
     this.threadSourcePaths.clear();
     this.nativeThreadMetadata.clear();
     this.missingNativeThreadIds.clear();
@@ -2784,7 +2795,7 @@ export class AndroidRemoteGatewayController {
       });
     }
     if (url.pathname === "/healthz" && req.method === "GET") {
-      return jsonResponse({ status: this.gatewayStatus, service: "opencodex-android-remote" });
+      return jsonResponse({ status: this.status().status, service: "opencodex-android-remote" });
     }
     if (url.pathname === "/.well-known/t3/environment" && req.method === "GET") {
       return jsonResponse(this.environmentDescriptor());
@@ -3078,10 +3089,6 @@ export class AndroidRemoteGatewayController {
       if (method === "orchestration.subscribeShell") {
         ws.data.subscription = "shell";
         ws.data.requestId = id;
-        if (params.refresh === true) {
-          await this.refreshSocket(ws, true);
-          return;
-        }
         // A fabricated empty cache must not complete first-pairing readiness.
         // Read the small first page, then fill the remaining rows independently
         // of any slow selected-transcript/configuration refresh.
@@ -3090,11 +3097,12 @@ export class AndroidRemoteGatewayController {
           const hasRows = cached && (
             (Array.isArray(cached.threads) && cached.threads.length > 0)
             || (Array.isArray(cached.projects) && cached.projects.length > 0));
-          const snapshot = hasRows ? cached : await this.shellSnapshot(true);
+          const snapshot = hasRows && params.refresh !== true ? cached : await this.shellSnapshot(true);
           this.publishSubscriptionEvent(ws, { kind: "snapshot", snapshot }, true);
-        } catch {
-          // Keep this subscription alive: the shell-only retry sends its first
-          // real snapshot without requiring an application restart.
+        } catch (error) {
+          // Report the actual failure before the phone's generic readiness
+          // deadline. Keep the subscription registered for background retries.
+          socketError(ws, id, error instanceof Error ? error.message : "Could not load chats from Codex.");
         }
         this.scheduleShellRefresh();
         return;
@@ -3130,6 +3138,7 @@ export class AndroidRemoteGatewayController {
           // History reads do not advance or replace the selected live stream.
           socketResult(ws, id, projectedThreadRecentPage(detail, Number.MAX_SAFE_INTEGER));
         } else {
+          await this.finishWindowsHistoryBackfill(threadId);
           const state = await this.ensureThreadStream(threadId);
           socketResult(ws, id, projectedThreadOlderPage(state, cursor));
         }
@@ -3438,6 +3447,10 @@ export class AndroidRemoteGatewayController {
   private async refreshSocket(ws: ServerWebSocket<GatewayWsData>, force: boolean): Promise<void> {
     const events = await this.subscriptionEvents(ws, force);
     for (const event of events) this.publishSubscriptionEvent(ws, event, force);
+    if (ws.data.subscription === "thread" && ws.data.threadId) {
+      // Publish the recent messages before beginning any full saved-file scan.
+      void this.finishWindowsHistoryBackfill(ws.data.threadId).catch(() => this.scheduleRefresh());
+    }
   }
 
   private subscriptionKey(ws: ServerWebSocket<GatewayWsData>): string | null {
@@ -3459,6 +3472,10 @@ export class AndroidRemoteGatewayController {
     }
     if (ws.data.subscription === "thread") {
       const threadId = ws.data.threadId ?? "";
+      if (!initial && this.windowsHistoryBackfills.has(threadId)) {
+        await this.finishWindowsHistoryBackfill(threadId);
+        return [];
+      }
       await this.refreshDesktopInteractions(threadId);
       if (initial) {
         const state = await this.ensureThreadStream(threadId);
@@ -3767,7 +3784,7 @@ export class AndroidRemoteGatewayController {
           // active provider. An explicit empty list means every provider,
           // including Desktop tasks created before Remodex was selected.
           modelProviders: [],
-        }));
+        }, options.quick ? 10_000 : undefined));
         const rows = Array.isArray(result?.data) ? result.data : [];
         for (const value of rows) {
           const thread = record(value);
@@ -4435,11 +4452,13 @@ export class AndroidRemoteGatewayController {
   }
 
   private async shellSnapshot(quick = false): Promise<JsonRecord> {
-    if (this.shellReadPending) return this.shellReadPending;
+    // A first-page request must not join a slow full-history read already in flight.
+    const key = quick ? "quickShellReadPending" : "shellReadPending";
+    if (this[key]) return this[key];
     const pending = this.buildShellSnapshot(quick);
-    this.shellReadPending = pending;
+    this[key] = pending;
     try { return await pending; }
-    finally { if (this.shellReadPending === pending) this.shellReadPending = null; }
+    finally { if (this[key] === pending) this[key] = null; }
   }
 
   private async buildShellSnapshot(quick: boolean): Promise<JsonRecord> {
@@ -4547,6 +4566,16 @@ export class AndroidRemoteGatewayController {
     }
     this.applyLiveThreadLifecycleToShell(snapshot);
     this.applyLiveNotificationActivitiesToShell(snapshot);
+    if (quick && this.shellCache) {
+      // Reconnecting must not temporarily remove older rows from a populated
+      // sidebar. The following full refresh remains authoritative for removals.
+      for (const key of ["threads", "projects"] as const) {
+        const fresh = Array.isArray(snapshot[key]) ? snapshot[key] as JsonRecord[] : [];
+        const seen = new Set(fresh.map(row => row.id));
+        const cached = Array.isArray(this.shellCache[key]) ? this.shellCache[key] as JsonRecord[] : [];
+        snapshot[key] = [...fresh, ...cached.filter(row => !seen.has(row.id))];
+      }
+    }
     this.shellCache = snapshot;
     this.shellUpdatedAt = this.now();
     return snapshot;
@@ -4554,7 +4583,7 @@ export class AndroidRemoteGatewayController {
 
   private async readFullThreadDetail(
     remoteThreadId: string,
-    options: { readonly boundedInitial?: boolean } = {},
+    options: { readonly boundedInitial?: boolean; readonly savedHistory?: boolean; readonly allowEmptyHistory?: boolean } = {},
   ): Promise<JsonRecord> {
     this.refreshProviderQuotaReports();
     let boundedInitial = options.boundedInitial === true;
@@ -4569,7 +4598,8 @@ export class AndroidRemoteGatewayController {
       let readCompleted = false;
       let readFound = false;
       let readFailure: unknown = null;
-      let recoverSavedHistory = this.oversizedHistoryThreads.has(nativeId);
+      let windowsEmptyPage = false;
+      let recoverSavedHistory = options.savedHistory === true || this.oversizedHistoryThreads.has(nativeId);
       if (recoverSavedHistory) boundedInitial = false;
       try {
         const result = record(await this.requireCodex().request("thread/read", {
@@ -4590,6 +4620,13 @@ export class AndroidRemoteGatewayController {
             turns: page.turns,
             historyPage: { olderCursor: nativeHistoryCursor(remoteThreadId, page.nextCursor) },
           };
+          if (process.platform === "win32" && page.turns.length === 0) {
+            // Windows may report no turns while the Desktop rollout is populated.
+            // Do not publish that empty native page as a complete conversation.
+            boundedInitial = false;
+            windowsEmptyPage = true;
+            native.historyPage = undefined;
+          }
         } catch (error) {
           if (error instanceof AndroidCodexResponseTooLargeError || windowsNativeHistoryNeedsSessionRecovery(error)) {
             // Do not retry Codex's broken lineage with a larger thread/read.
@@ -4674,8 +4711,20 @@ export class AndroidRemoteGatewayController {
             recoverySeed.path = sourcePaths.at(-1);
           }
         }
-        native = await this.sessionCommandRecovery.enrichThread(recoverySeed, sourcePaths);
+        const recent = process.platform === "win32" && options.boundedInitial === true
+          && !this.threadStreams.has(remoteThreadId)
+          ? await this.sessionCommandRecovery.enrichRecentThread?.(recoverySeed, sourcePaths)
+          : null;
+        native = recent?.thread ?? await this.sessionCommandRecovery.enrichThread(recoverySeed, sourcePaths);
+        if (recent?.hasOlder) this.windowsHistoryBackfills.add(remoteThreadId);
         const recoveredTurns = Array.isArray(native.turns) ? native.turns : [];
+        const previousThread = record(this.threadStreams.get(remoteThreadId)?.detail.thread);
+        if (windowsEmptyPage && !options.allowEmptyHistory && recoveredTurns.length === 0
+          && projectedRows(previousThread?.messages).length > 0) {
+          // A failed empty Windows refresh must not erase already visible work.
+          // Explicit rollback refreshes can still intentionally clear history.
+          throw new Error("Windows returned an empty history update. Keeping the messages already loaded while retrying.");
+        }
         if (recoverSavedHistory && !recoveredTurns.some(turn => {
           const items = record(turn)?.items;
           return Array.isArray(items) && items.length > 0;
@@ -4904,7 +4953,32 @@ export class AndroidRemoteGatewayController {
     projected.messages = this.messagesWithQueuedTurns(projected.messages, remoteThreadId);
     projected.hasPendingApprovals = pending.some(row => row.kind === "approval.requested");
     projected.hasPendingUserInput = pending.some(row => row.kind === "user-input.requested");
+    if (options.boundedInitial && this.windowsHistoryBackfills.has(remoteThreadId)) {
+      projected.historyPage = { olderCursor: projectedThreadStartCursor(detail) };
+    }
     return detail;
+  }
+
+  private async finishWindowsHistoryBackfill(threadId: string): Promise<void> {
+    const existing = this.windowsHistoryBackfillFlights.get(threadId);
+    if (existing) return existing;
+    if (!this.windowsHistoryBackfills.has(threadId) || !this.threadStreams.has(threadId)) return;
+    const flight = (async () => {
+      const detail = await this.readFullThreadDetail(threadId, { savedHistory: true });
+      const current = this.threadStreams.get(threadId);
+      if (!current || !this.windowsHistoryBackfills.has(threadId)) return;
+      const advanced = advanceProjectedThreadStream(current, detail, this.now());
+      this.threadStreams.set(threadId, advanced.state);
+      this.windowsHistoryBackfills.delete(threadId);
+      for (const ws of this.sockets) {
+        if (ws.data.subscription !== "thread" || ws.data.threadId !== threadId) continue;
+        // Keep the delivered page small; older work remains available by cursor.
+        this.publishSubscriptionEvent(ws, projectedThreadBoundedSnapshot(advanced.state), true);
+      }
+    })();
+    this.windowsHistoryBackfillFlights.set(threadId, flight);
+    try { await flight; }
+    finally { this.windowsHistoryBackfillFlights.delete(threadId); }
   }
 
   private async ensureThreadStream(remoteThreadId: string): Promise<ProjectedThreadStreamState> {
@@ -8048,7 +8122,7 @@ export class AndroidRemoteGatewayController {
     this.authoritativeThreadRefreshes.add(remoteThreadId);
     try {
       const current = await this.ensureThreadStream(remoteThreadId);
-      const detail = await this.readFullThreadDetail(remoteThreadId, { boundedInitial: true });
+      const detail = await this.readFullThreadDetail(remoteThreadId, { boundedInitial: true, allowEmptyHistory: true });
       const latest = this.threadStreams.get(remoteThreadId) ?? current;
       const advanced = advanceProjectedThreadStream(latest, detail, this.now());
       this.threadStreams.set(remoteThreadId, advanced.state);
@@ -8068,6 +8142,7 @@ export class AndroidRemoteGatewayController {
   }
 
   private clearRolledBackProjection(remoteThreadId: string): void {
+    this.windowsHistoryBackfills.delete(remoteThreadId);
     this.supplementalActivities.delete(remoteThreadId);
     this.supplementalPlans.delete(remoteThreadId);
     this.completedLiveMessageIds.delete(remoteThreadId);

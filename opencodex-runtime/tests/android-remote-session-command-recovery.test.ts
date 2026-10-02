@@ -45,6 +45,62 @@ function thread(path: string): JsonRecord {
 }
 
 describe("Android Remote completed command recovery", () => {
+  test("Windows page context never becomes a prompt ahead of the real saved user message", async () => {
+    const { home, path } = await fixture([
+      { type: "session_meta", payload: { id: "thread-1" } },
+      { type: "turn_context", payload: { turn_id: "turn-1" } },
+      { type: "response_item", payload: { type: "message", role: "user", id: "internal-page",
+        content: [{ type: "input_text", text: '<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>' }] } },
+      { type: "response_item", payload: { type: "message", role: "developer", id: "context", content: [{ type: "input_text", text: "Private context" }] } },
+      { type: "response_item", payload: { type: "message", role: "user", id: "raw-prompt", content: [{ type: "input_text", text: "Fetch the project branches." }] } },
+      { type: "event_msg", payload: { type: "item_completed", turn_id: "turn-1", item: { type: "UserMessage", id: "public-prompt", client_id: "phone-prompt",
+        content: [{ type: "text", text: "Fetch the project branches." }] } } },
+    ]);
+    const recovery = new AndroidRemoteSessionCommandRecovery({ codexHome: home });
+    const seed = { id: "thread-1", path, turns: [] };
+    for (const recovered of [await recovery.enrichThread(seed), (await recovery.enrichRecentThread(seed, [path]))!.thread]) {
+      const users = (recovered.turns as JsonRecord[]).flatMap(turn => turn.items as JsonRecord[]).filter(item => item.type === "userMessage");
+      expect(users).toHaveLength(1);
+      expect(users[0]).toMatchObject({ id: "public-prompt", clientId: "phone-prompt", content: [{ type: "text", text: "Fetch the project branches." }] });
+      expect(JSON.stringify(recovered)).not.toContain("external_codex_apps_open_page");
+      expect(JSON.stringify(recovered)).not.toContain("Private context");
+    }
+  });
+
+  test("reads a bounded recent tail first and leaves older messages available to full recovery", async () => {
+    const item = (id: string, text: string) => ({ type: "event_msg", payload: {
+      type: "item_completed", turn_id: id, item: { id, type: "agentMessage", text },
+    } });
+    const { home, path } = await fixture([
+      { type: "session_meta", payload: { id: "thread-1" } },
+      item("old", "Older saved answer"),
+      { type: "response_item", payload: { type: "message", role: "developer", content: [{ type: "input_text", text: "private-context".repeat(180000) }] } },
+      { type: "turn_context", payload: { turn_id: "new" } },
+      item("new", "Newest saved answer"),
+    ]);
+    const recovery = new AndroidRemoteSessionCommandRecovery({ codexHome: home });
+    const seed = { id: "thread-1", path, turns: [] };
+    const recent = await recovery.enrichRecentThread(seed, [path]);
+    expect(recent?.hasOlder).toBe(true);
+    expect(JSON.stringify(recent)).toContain("Newest saved answer");
+    expect(JSON.stringify(recent)).not.toContain("Older saved answer");
+    expect(JSON.stringify(recent)).not.toContain("private-context");
+    const full = await recovery.enrichThread(seed, [path]);
+    expect(JSON.stringify(full)).toContain("Older saved answer");
+    expect(JSON.stringify(full)).toContain("Newest saved answer");
+    expect(JSON.stringify(full)).not.toContain("private-context");
+    expect(await recovery.enrichRecentThread({ ...seed, id: "another-task" }, [path])).toBeNull();
+    expect(await recovery.enrichRecentThread(seed, [path, path])).toBeNull();
+  });
+
+  test("recent recovery defers continuation parents to the verified lineage reader", async () => {
+    const { home, path } = await fixture([
+      { type: "session_meta", payload: { id: "thread-1", history_base: { thread_id: "parent", end_byte_offset: 100 } } },
+    ]);
+    expect(await new AndroidRemoteSessionCommandRecovery({ codexHome: home })
+      .enrichRecentThread({ id: "thread-1", path }, [path])).toBeNull();
+  });
+
   test("a saved compacted record alone is a completed marker, never live compaction", async () => {
     const { home, path } = await fixture([
       { type: "session_meta", payload: { id: "thread-1" } },

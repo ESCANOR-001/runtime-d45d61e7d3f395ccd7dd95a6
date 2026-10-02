@@ -213,6 +213,12 @@ export function projectedThreadOlderPage(
   return pageFromRange(thread, blocks, start, end);
 }
 
+/** Bookmark the beginning of a recent saved-file tail before older work arrives. */
+export function projectedThreadStartCursor(detail: JsonRecord): string | null {
+  const first = timelineBlocks(threadOf(detail))[0];
+  return first ? cursorFor(first) : null;
+}
+
 export function projectedThreadBoundedSnapshot(state: ProjectedThreadStreamState): JsonRecord {
   const page = projectedThreadRecentPage(state.detail);
   const thread = threadOf(state.detail);

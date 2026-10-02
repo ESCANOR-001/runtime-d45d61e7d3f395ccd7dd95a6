@@ -10748,7 +10748,7 @@ describe("Android Remote Codex connection", () => {
 
       await Bun.sleep(20);
       expect(codex.requests.find(request => request.method === "thread/list")?.params).toMatchObject({
-        limit: 25,
+        limit: 10,
         cursor: null,
         archived: false,
         modelProviders: [],
@@ -10757,6 +10757,79 @@ describe("Android Remote Codex connection", () => {
       socket?.close();
       await controller.stop();
     }
+  });
+
+  test("fresh phone subscriptions load before slow full history, including during reconnect", async () => {
+    const codex = new FakeCodexClient();
+    const recent = { id: "recent", name: "Recent", cwd: process.cwd(), modelProvider: "openai", createdAt: 1_786_531_000, updatedAt: 1_786_531_100, status: { type: "idle" }, turns: [] };
+    const older = { ...recent, id: "older", name: "Older" };
+    let release!: () => void;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    let started!: () => void;
+    const fullStarted = new Promise<void>(resolve => { started = resolve; });
+    const original = codex.request.bind(codex);
+    const requests: Array<{ limit?: number; archived?: boolean; timeoutMs?: number }> = [];
+    codex.request = async <T>(method: string, params?: unknown, timeoutMs?: number): Promise<T> => {
+      if (method !== "thread/list") return original<T>(method, params);
+      const options = params as { limit?: number; archived?: boolean };
+      requests.push({ ...options, timeoutMs });
+      if (options.limit === 10) return { data: [recent], nextCursor: "older-page" } as T;
+      started();
+      await blocked;
+      return { data: options.archived ? [] : [recent, older], nextCursor: null } as T;
+    };
+    const controller = new AndroidRemoteGatewayController(memoryStore(), {
+      port: 0, hostname: "127.0.0.1",
+      runtime: { start: async () => codex, stop: async () => {} },
+      desktopIpcSync: new FakeDesktopIpcSync(),
+    });
+    let socket: WebSocket | null = null;
+    try {
+      await controller.start();
+      const invitation = controller.createPairingInvitation("Test PC");
+      const paired = controller.auth.exchangePairingToken({ pairingToken: invitation.payload.pairingToken, metadata: { label: "Phone", os: "android" } })!;
+      const ticket = controller.auth.issueWebSocketTicket(paired.client.id);
+      socket = new WebSocket(`ws://127.0.0.1:${controller.status().port}/ws?wsTicket=${encodeURIComponent(ticket.ticket)}`, "opencodex-json-v1");
+      await socketOpen(socket);
+      const first = socketMessage(socket, 3_000, "first page before full history");
+      socket.send(JSON.stringify({ id: "first", method: "orchestration.subscribeShell", params: { refresh: true } }));
+      expect(await first).toMatchObject({ id: "first", event: { snapshot: { threads: [expect.objectContaining({ id: "recent" })] } } });
+      expect(requests[0]).toMatchObject({ limit: 10, archived: false, timeoutMs: 10_000 });
+      await fullStarted;
+      const reconnect = socketMessage(socket, 3_000, "reconnect while full history is blocked");
+      socket.send(JSON.stringify({ id: "reconnect", method: "orchestration.subscribeShell", params: { refresh: true } }));
+      expect(await reconnect).toMatchObject({ id: "reconnect", event: { kind: "snapshot" } });
+      const complete = socketMessageMatching(socket, message => JSON.stringify(message).includes('"id":"older"'), 3_000, "remaining history");
+      release();
+      await complete;
+      const retained = socketMessage(socket, 3_000, "reconnect retains older cached rows");
+      socket.send(JSON.stringify({ id: "retained", method: "orchestration.subscribeShell", params: { refresh: true } }));
+      expect(await retained).toMatchObject({ id: "retained", event: { snapshot: {
+        threads: expect.arrayContaining([expect.objectContaining({ id: "recent" }), expect.objectContaining({ id: "older" })]),
+      } } });
+    } finally { release(); socket?.close(); await controller.stop(); }
+  });
+
+  test("a disconnected Codex runtime is not advertised as a ready gateway", async () => {
+    let connected = true;
+    const controller = new AndroidRemoteGatewayController(memoryStore(), {
+      port: 0, hostname: "127.0.0.1",
+      runtime: {
+        start: async () => new FakeCodexClient(), stop: async () => {},
+        status: () => ({ connected, ...(!connected ? { error: "Codex runtime version could not be checked" } : {}) }),
+      },
+      desktopIpcSync: new FakeDesktopIpcSync(),
+    });
+    try {
+      await controller.start();
+      expect(controller.status().status).toBe("ready");
+      connected = false;
+      expect(controller.status()).toMatchObject({ status: "error", error: expect.stringContaining("version could not be checked") });
+      const health = await fetch(`http://127.0.0.1:${controller.status().port}/healthz`);
+      expect(await health.json()).toMatchObject({ status: "error" });
+      connected = true;
+      expect(controller.status().status).toBe("ready");
+    } finally { await controller.stop(); }
   });
 
   test("manual shell refresh bypasses the cached empty sidebar", async () => {
@@ -10880,7 +10953,10 @@ describe("Android Remote Codex connection", () => {
       );
       await socketOpen(socket);
 
-      const shellMessage = socketMessage(socket, 3_000, "canonical shell snapshot");
+      const shellMessage = socketMessageMatching(socket, () =>
+        codex.requests.some(request => request.method === "thread/list"
+          && (request.params as { archived?: boolean }).archived === true),
+      3_000, "canonical shell snapshot including archived history");
       socket.send(JSON.stringify({
         id: "canonical-shell",
         method: "orchestration.subscribeShell",
@@ -11349,11 +11425,13 @@ describe("Android Remote Codex connection", () => {
         3_000,
         "first real sidebar after a temporary failure",
       );
+      const failure = socketMessage(socket, 3_000, "underlying chat-list failure");
       socket.send(JSON.stringify({
         id: "retry-shell",
         method: "orchestration.subscribeShell",
         params: {},
       }));
+      expect(await failure).toMatchObject({ id: "retry-shell", error: { message: "temporary thread-list failure" } });
       expect(await converged).toMatchObject({
         id: "retry-shell",
         event: { kind: "snapshot" },
@@ -11557,6 +11635,64 @@ describe("Android Remote Codex connection", () => {
 });
 
 describe("Android bounded first-open history", () => {
+  test.skipIf(process.platform !== "win32")("Windows empty native page publishes newest messages before older saved history finishes", async () => {
+    const codex = new FakeCodexClient();
+    codex.threads.push({ id: "empty-native", name: "Saved conversation", cwd: process.cwd(), turns: [] });
+    const original = codex.request.bind(codex);
+    codex.request = async <T>(method: string, params: unknown = {}): Promise<T> => {
+      if (method === "thread/turns/list") return { data: [], nextCursor: null } as T;
+      return original<T>(method, params);
+    };
+    const turn = (id: string, text: string, startedAt: number) => ({ id, status: "completed", startedAt,
+      items: [{ id: `${id}-answer`, type: "agentMessage", text }] });
+    const recentTurn = turn("new", "Newest saved answer", 1700000002);
+    const oldTurn = turn("old", "Older saved answer", 1700000001);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let fullReads = 0;
+    let missingSavedHistory = false;
+    const controller = new AndroidRemoteGatewayController(memoryStore(), {
+      port: 0, hostname: "127.0.0.1", runtime: { start: async () => codex, stop: async () => {} },
+      desktopIpcSync: new FakeDesktopIpcSync(),
+      sessionCommandRecovery: {
+        async enrichRecentThread(seed) { return missingSavedHistory ? null : { thread: { ...seed, turns: [recentTurn] }, hasOlder: true }; },
+        async enrichThread(seed) { fullReads++; await gate; return { ...seed, turns: missingSavedHistory ? [] : [oldTurn, recentTurn] }; },
+        clear() {},
+      },
+    });
+    let socket: WebSocket | null = null;
+    try {
+      await controller.start();
+      const invitation = controller.createPairingInvitation("Recent history PC");
+      const paired = controller.auth.exchangePairingToken({ pairingToken: invitation.payload.pairingToken, metadata: { label: "History phone", os: "android" } })!;
+      const ticket = controller.auth.issueWebSocketTicket(paired.client.id);
+      socket = new WebSocket(`ws://127.0.0.1:${controller.status().port}/ws?wsTicket=${encodeURIComponent(ticket.ticket)}`, "opencodex-json-v1");
+      await socketOpen(socket);
+      const firstPending = socketMessageMatching(socket, message => message.id === "recent" && Boolean(message.event));
+      socket.send(JSON.stringify({ id: "recent", method: "orchestration.subscribeThread", params: { threadId: "empty-native" } }));
+      const first = await firstPending as any;
+      expect(first.event.snapshot.thread.messages.map((row: any) => row.text)).toEqual(["Newest saved answer"]);
+      expect(first.event.snapshot.historyPage.hasOlder).toBe(true);
+      const cursor = first.event.snapshot.historyPage.olderCursor;
+      const olderPending = socketMessageMatching(socket, message => message.id === "older");
+      socket.send(JSON.stringify({ id: "older", method: "orchestration.getThreadPage", params: { threadId: "empty-native", cursor } }));
+      release();
+      const older = await olderPending as any;
+      expect(older.result.messages.map((row: any) => row.text)).toEqual(["Older saved answer"]);
+      expect(fullReads).toBe(1);
+      missingSavedHistory = true;
+      await expect((controller as any).readFullThreadDetail("empty-native", { boundedInitial: true }))
+        .rejects.toThrow("Keeping the messages already loaded");
+      expect((controller as any).threadStreams.get("empty-native").detail.thread.messages.length).toBe(2);
+      const intentionallyEmpty = await (controller as any).readFullThreadDetail("empty-native", { boundedInitial: true, allowEmptyHistory: true });
+      expect(intentionallyEmpty.thread.messages).toHaveLength(0);
+    } finally {
+      release();
+      socket?.close();
+      await controller.stop();
+    }
+  });
+
   test.each(["lineage-error", "silent-original", "silent-newest", "oversized"])("history recovery returns verified saved work and pages it without another native read: %s", async scenario => {
     const root = mkdtempSync(join(tmpdir(), "rmx-windows-history-"));
     const sessions = join(root, "sessions");

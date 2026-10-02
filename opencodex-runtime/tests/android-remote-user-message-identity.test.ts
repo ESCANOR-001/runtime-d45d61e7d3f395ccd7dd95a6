@@ -6,6 +6,26 @@ import {
 } from "../src/android-remote/user-message-identity";
 
 describe("Android Remote user-message normalization", () => {
+  test("hides Windows open-page context without removing the actual prompt", () => {
+    const context = '<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>';
+    expect(sanitizePublicTranscriptText(context)).toBeNull();
+    expect(sanitizePublicTranscriptText('<external_codex_apps_open_page>{"page_id":')).toBeNull();
+    expect(sanitizePublicTranscriptText(`${context}\nFetch the project branches.`)).toBe("Fetch the project branches.");
+    const example = `Explain this record: ${context}`;
+    expect(sanitizePublicTranscriptText(example)).toBe(example);
+    const code = `\`\`\`xml\n${context}\n\`\`\``;
+    expect(sanitizePublicTranscriptText(code)).toBe(code);
+  });
+
+  test("removes displayed annotation markers but preserves code examples", () => {
+    const marker = ':codex-annotation{index="1"}';
+    expect(sanitizePublicTranscriptText(`Switched the branch. ${marker}`)).toBe("Switched the branch.");
+    expect(sanitizePublicTranscriptText(`${marker} Done.`)).toBe("Done.");
+    for (const example of [`Use \`${marker}\` in this example.`, `Use \`\`${marker}\`\` here.`, `\`\`\`text\n${marker}\n\`\`\``, `~~~text\n${marker}\n~~~`]) {
+      expect(sanitizePublicTranscriptText(example)).toBe(example);
+    }
+  });
+
   test("hides headed repository instructions on Windows and POSIX paths", () => {
     for (const path of ["C:\\Users\\Example\\My Project", "/home/example/my-project", "\\\\server\\share\\project"]) {
       const instructions = `# AGENTS.md instructions for ${path}\r\n\r\n<INSTRUCTIONS>\r\nProject rules.\r\n</INSTRUCTIONS>`;

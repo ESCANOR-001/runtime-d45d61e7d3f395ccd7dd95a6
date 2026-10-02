@@ -19,6 +19,7 @@ const PRIVATE_BOOTSTRAP_BLOCK_NAMES = [
   "environment_context",
   "app-context",
   "in-app-browser-context",
+  "external_codex_apps_open_page",
   "response-annotations",
   "skills_instructions",
   "permissions instructions",
@@ -170,7 +171,14 @@ export function sanitizePublicTranscriptText(value: unknown): string | null {
     : stripped.text;
 
   if (stripped.stripped && !candidate.trim()) return null;
-  return unwrapCodexAttachmentEnvelope(candidate);
+  const publicText = unwrapCodexAttachmentEnvelope(candidate);
+  // Desktop renders response annotations as UI metadata. Native Android also
+  // needs clean text from the server; retain literal examples inside code.
+  const cleaned = publicText.replace(
+    /(`{3,}|~{3,})[\s\S]*?(?:\1|$)|(`+)[^\n]*?\2|(:codex-annotation\s*\{\s*index="\d+"\s*\})/gu,
+    (match, _fence: string | undefined, _inline: string | undefined, directive: string | undefined) => directive ? "" : match,
+  );
+  return cleaned === publicText ? publicText : cleaned.replace(/[ \t]+\n/gu, "\n").trim();
 }
 
 /** Roles that are model context rather than public conversation participants. */

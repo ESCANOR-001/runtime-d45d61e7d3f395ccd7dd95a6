@@ -4,9 +4,29 @@ import { join } from "node:path";
 import { AndroidCodexRuntime, AndroidCodexResponseTooLargeError } from "../src/android-remote/codex-app-server";
 import { selectAndroidRuntime, verifyAndroidRuntimePeer } from "../src/android-remote/runtime-compatibility";
 import type { ResolvedCodexRuntime } from "../src/codex/runtime";
+import { activeWindowsDesktopRuntimePaths, type WindowsDesktopRuntimeProcess } from "../src/android-remote/windows-desktop-runtime";
 
 const desktop: ResolvedCodexRuntime = { command: "desktop/codex.exe", version: "0.153.4", source: "path" };
 const stale: ResolvedCodexRuntime = { command: "npm/codex.exe", version: "0.147.0", source: "path" };
+
+test("Windows uses Desktop's child runtime rather than an orphaned older listener", () => {
+  const desktopPath = "C:\\Program Files\\WindowsApps\\OpenAI.Codex_1.0_x64\\app\\ChatGPT.exe";
+  const runtimePath = "C:\\Users\\test\\AppData\\Local\\OpenAI\\Codex\\bin\\new\\codex.exe";
+  const processes: WindowsDesktopRuntimeProcess[] = [
+    { pid: 10, parentPid: 1, executablePath: desktopPath, commandLine: `"${desktopPath}"` },
+    { pid: 11, parentPid: 10, executablePath: runtimePath, commandLine: `"${runtimePath}" app-server --analytics-default-enabled` },
+    { pid: 12, parentPid: 10, executablePath: runtimePath, commandLine: `"${runtimePath}" exec-server` },
+    { pid: 13, parentPid: 99, executablePath: "C:\\old\\codex.exe", commandLine: 'C:\\old\\codex.exe app-server --listen ws://127.0.0.1:10106' },
+  ];
+  expect(activeWindowsDesktopRuntimePaths(processes)).toEqual([runtimePath]);
+  expect(activeWindowsDesktopRuntimePaths(processes.slice(1))).toEqual([]);
+  expect(activeWindowsDesktopRuntimePaths([
+    { ...processes[0]!, commandLine: `"${desktopPath}" --type=renderer` }, ...processes.slice(1),
+  ])).toEqual([]);
+  expect(activeWindowsDesktopRuntimePaths([
+    processes[0]!, { ...processes[1]!, commandLine: `"${runtimePath}" app-server --listen=ws://127.0.0.1:10106` },
+  ])).toEqual([]);
+});
 test.each(["thread/turns/list", "turn/start"])("oversized %s fails explicitly without replay and allows a fresh connection", async method => {
   const peer = spawn(process.execPath, [join(import.meta.dir, "helpers/codex-oversized-peer.ts"), method], {
     windowsHide: true,
@@ -138,4 +158,32 @@ test("checks the connected server's version, including an already listening serv
     await runtime.stop();
     await server.stop(true);
   }
+});
+
+test("an incompatible leftover listener is left alone while a matching peer is selected", async () => {
+  const methods: string[][] = [[], []];
+  const peers = ["0.147.0", "0.153.4"].map((version, index) => Bun.serve({
+    hostname: "127.0.0.1", port: 0,
+    fetch(request, server) { if (server.upgrade(request)) return; return new Response("ready"); },
+    websocket: { message(socket, bytes) {
+      const message = JSON.parse(String(bytes));
+      methods[index]!.push(message.method);
+      if (message.id !== undefined) socket.send(JSON.stringify({ id: message.id, result: message.method === "initialize" ? { userAgent: `codex/${version}` } : { data: [] } }));
+    } },
+  }));
+  let alternatives = 0;
+  const runtime = new AndroidCodexRuntime(peers[0]!.port!, () => ({ runtime: desktop, desktopVersion: desktop.version }), async () => {
+    alternatives++;
+    return peers[1]!.port!;
+  });
+  try {
+    const client = await runtime.start();
+    expect(await client.request("thread/list", {})).toEqual({ data: [] });
+    expect(alternatives).toBe(1);
+    expect(methods[0]).toEqual(["initialize"]);
+    expect(methods[1]).toContain("thread/list");
+    expect(runtime.status()).toMatchObject({ connected: true, port: peers[1]!.port, ownedProcess: false });
+    await runtime.stop();
+    expect((await fetch(`http://127.0.0.1:${peers[0]!.port}/readyz`)).ok).toBe(true);
+  } finally { await runtime.stop(); await Promise.all(peers.map(peer => peer.stop(true))); }
 });
