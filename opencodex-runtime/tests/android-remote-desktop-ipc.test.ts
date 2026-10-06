@@ -130,6 +130,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void>
 describe("Android Remote Codex Desktop IPC", () => {
   test("uses the installed Desktop v2/v4 envelopes and preserves the target id", async () => {
     expect(DESKTOP_IPC_METHOD_VERSIONS.get("thread-follower-start-turn")).toBe(2);
+    expect(DESKTOP_IPC_METHOD_VERSIONS.get("thread-follower-update-thread-settings")).toBe(2);
     expect(DESKTOP_IPC_METHOD_VERSIONS.get("thread-follower-interrupt-turn")).toBe(4);
     expect(desktopIpcRequestVersion("thread-follower-interrupt-turn", {
       conversationId: "envelope-thread",
@@ -188,10 +189,18 @@ describe("Android Remote Codex Desktop IPC", () => {
       mode: "user-stop",
       expectedTurnId: "turn-1",
     }, { targetClientId: "desktop-owner-reconnected" });
+    await transport.request("thread-follower-update-thread-settings", {
+      conversationId: "envelope-thread",
+      threadSettings: { model: "gpt-5.6-sol" },
+    }, { targetClientId: "desktop-owner-reconnected" });
 
     const envelopes = socket.writes.map(frame =>
       JSON.parse(frame.subarray(4).toString("utf8")) as DesktopIpcEnvelope,
     );
+    expect(envelopes.find(row => row.method === "thread-follower-update-thread-settings")).toMatchObject({
+      version: 2,
+      targetClientId: "desktop-owner-reconnected",
+    });
     expect(envelopes.find(row => row.method === "thread-follower-start-turn")).toMatchObject({
       version: 2,
       targetClientId: "desktop-owner-reconnected",
@@ -592,13 +601,15 @@ describe("Android Remote Codex Desktop IPC", () => {
     sync.stop();
   });
 
-  test("falls back to bounded thread/turns/list reads when an older Desktop lacks page methods", async () => {
-    const transport = new TargetedLiveTransport();
+  test.each(["unknown method: thread-follower-load-history-page", "no-client-found"])("falls back to bounded history when an older Desktop rejects page methods: %s", async rejection => {
+    const transport = Object.assign(new TargetedLiveTransport(), {
+      discover: async () => ({ canHandle: true, handledByClientId: "legacy-desktop-owner" }),
+    });
     const threadId = "legacy-page-method-thread";
     const owner = "legacy-desktop-owner";
     let pageReads = 0;
     transport.requestOverride = async method => {
-      if (method === "thread-follower-load-history-page") throw new Error("unknown method: thread-follower-load-history-page");
+      if (method === "thread-follower-load-history-page") throw new Error(rejection);
       throw new Error(`unexpected Desktop method ${method}`);
     };
     const sync = new AndroidDesktopIpcLiveSync({
@@ -633,13 +644,34 @@ describe("Android Remote Codex Desktop IPC", () => {
 
     const state = await sync.readFollowerThreadState(threadId, { fresh: true });
     expect(state?.turns).toHaveLength(10);
+    expect(state?.androidRemoteHistoryOnly).toBe(true);
     expect(pageReads).toBe(1);
     // Capability is cached for this connection; a second read must not send
     // another unsupported private IPC request.
     expect(await sync.readFollowerThreadState(threadId)).toMatchObject({ id: threadId });
-    expect(transport.requests.filter(row => row.method === "thread-follower-load-history-page")).toHaveLength(1);
+    const attempts = transport.requests.length;
     expect(await sync.readFollowerHistoryPage?.(threadId, { direction: "recent" })).toMatchObject({ id: threadId });
+    expect(transport.requests).toHaveLength(attempts);
+    expect(sync.threadOwnership(threadId).state).toBe("desktop-owned");
+    expect(transport.broadcasts.some(row => row.method === "thread-stream-following-changed")).toBe(false);
     sync.stop();
+  });
+
+  test("does not treat a page timeout as unsupported or switch to a private writer", async () => {
+    const transport = new TargetedLiveTransport();
+    transport.requestOverride = async () => { throw new Error("request timed out"); };
+    let pageReads = 0;
+    const sync = new AndroidDesktopIpcLiveSync({
+      transport,
+      readThread: async () => { throw new Error("full reads forbidden"); },
+      readThreadPage: async () => { pageReads += 1; return null; },
+      sendCodexRequest: async () => { throw new Error("private writer forbidden"); },
+      respondToCodexRequest: () => undefined,
+    });
+    try {
+      await expect(sync.readFollowerThreadState("timeout-thread", { fresh: true })).rejects.toThrow("request timed out");
+      expect(pageReads).toBe(0);
+    } finally { sync.stop(); }
   });
 
   test("bounds a legacy inbound Desktop snapshot before retaining it", async () => {
@@ -677,6 +709,51 @@ describe("Android Remote Codex Desktop IPC", () => {
     expect(Buffer.byteLength(JSON.stringify(state), "utf8")).toBeLessThan(3 * 1024 * 1024);
     expect(JSON.stringify(state)).not.toContain(huge);
     sync.stop();
+  });
+
+  test("keeps empty assistant text renderable in local-owner snapshots and live items", async () => {
+    const transport = new FakeLiveTransport();
+    const threadId = "empty-assistant-text";
+    const sync = new AndroidDesktopIpcLiveSync({
+      transport,
+      snapshotDebounceMs: 0,
+      readThread: async () => ({
+        id: threadId,
+        turns: [{ id: "turn-1", status: "inProgress", items: [
+          { id: "empty", type: "agentMessage", text: "" },
+          { id: "missing", type: "agentMessage" },
+          { id: "content-only", type: "agentMessage", content: [{ type: "text", text: "Visible answer" }] },
+          { id: "private", type: "agentMessage", text: "<turn_aborted>Private control message</turn_aborted>" },
+        ] }],
+      }),
+      sendCodexRequest: async () => ({}),
+      respondToCodexRequest: () => undefined,
+      openUrl: async () => undefined,
+    });
+    try {
+      sync.claimThread({ threadId, turnStartParams: { input: [] } });
+      await waitFor(() => transport.broadcasts.some(row =>
+        (row.params.change as { type?: string })?.type === "snapshot",
+      ));
+      const snapshot = transport.broadcasts.find(row =>
+        (row.params.change as { type?: string })?.type === "snapshot",
+      )!;
+      const state = (snapshot.params.change as { conversationState: { turns: Array<{ items: Array<Record<string, unknown>> }> } }).conversationState;
+      const items = state.turns.flatMap(turn => turn.items);
+      expect(items.find(item => item.id === "empty")?.text).toBe("");
+      expect(items.find(item => item.id === "missing")?.text).toBe("");
+      expect(items.find(item => item.id === "content-only")?.text).toBe("Visible answer");
+      expect(items.some(item => item.id === "private")).toBe(false);
+      for (const item of items.filter(item => item.type === "agentMessage")) {
+        expect(() => (item.text as string).trim()).not.toThrow();
+      }
+      sync.observeCodexMessage({ method: "item/started", params: {
+        threadId, turnId: "turn-1", item: { id: "streaming", type: "agentMessage", text: "" },
+      } });
+      const live = await sync.readFollowerThreadState(threadId);
+      const turns = live!.turns as Array<{ items: Array<Record<string, unknown>> }>;
+      expect(turns.flatMap(turn => turn.items).find(item => item.id === "streaming")?.text).toBe("");
+    } finally { sync.stop(); }
   });
 
   test("sanitizes Windows owner snapshots and patches without shifting item indexes", async () => {

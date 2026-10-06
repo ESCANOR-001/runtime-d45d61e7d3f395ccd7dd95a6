@@ -714,6 +714,7 @@ function latestTurn(thread: JsonRecord): JsonRecord | null {
       turnId: thread.androidRemoteLatestTurnId,
       occurredAt: thread.androidRemoteLatestTurnAt,
       lastProgressAt: thread.androidRemoteActivityUnverified === true ? undefined : thread.androidRemoteLatestProgressAt,
+      unverified: thread.androidRemoteActivityUnverified === true,
     })
   ) {
     // Keep the internal running marker for ownership safety, but avoid telling
@@ -771,6 +772,7 @@ function sessionOf(thread: JsonRecord, updatedAt: string): JsonRecord {
     turnId: projectedTurnId,
     occurredAt: thread.androidRemoteLatestTurnAt,
     lastProgressAt: thread.androidRemoteActivityUnverified === true ? undefined : thread.androidRemoteLatestProgressAt,
+    unverified: thread.androidRemoteActivityUnverified === true,
   });
   const projectedRunning = projectedLifecycleWins && projectedState === "running";
   const projectedError = projectedLifecycleWins && projectedState === "error";
@@ -1077,14 +1079,12 @@ function messagesAndActivity(
       if (!item) continue;
       const itemSequence = sequence++;
       const id = text(item.id, stableId("item", `${text(thread.id)}:${itemSequence}`));
-      // Command rows are transient progress feedback. Completed snapshots keep
-      // the lasting reasoning/file/tool structure but omit terminal history,
-      // matching the compact completed-task presentation on Android.
       if (
         item.type === "commandExecution" &&
         !streaming &&
         commandPresentation(item).itemType === "command_execution" &&
-        options.includeCompletedCommandActivities !== true
+        options.includeCompletedCommandActivities !== true &&
+        options.compactCompletedWork !== true
       ) {
         continue;
       }
@@ -1228,15 +1228,6 @@ function messagesAndActivity(
       }
       const activity = activityFromItem(item, turn, id, turnId, createdAt, itemSequence);
       if (activity) {
-        const payload = record(activity.payload);
-        // Match Android's completed Work disclosure before crossing the wire.
-        // Running turns retain every public activity; only completed history
-        // drops transient tools that Android would immediately discard.
-        if (options.compactCompletedWork && !streaming
-          && activity.kind !== "task.progress"
-          && payload?.itemType !== "file_change"
-          && payload?.itemType !== "image-generation"
-          && payload?.requestKind !== "file-change") continue;
         appendActivity(activity);
       }
     }

@@ -4,6 +4,7 @@ import { basename, join, posix, win32 } from "node:path";
 import { getCodexHome } from "../codex/paths";
 import { resolveThreadSourcePaths } from "./thread-source-paths";
 import { boundedTurnErrorMessage } from "./turn-activity";
+import { desktopAsyncQuestionItem, desktopQuestionReplyIds, readDesktopInteractions } from "./desktop-interactions";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -44,6 +45,7 @@ type DesktopTaskActivity = {
   errorMessage: string | null;
   waitingOnUserInput: boolean;
   pendingUserInput: DesktopPendingUserInput | null;
+  pendingAsyncUserInputs?: DesktopPendingUserInput[];
 };
 
 type DesktopPendingUserInput = {
@@ -297,6 +299,8 @@ async function scanLatestDesktopTaskActivity(
   let waitingOnUserInput = false;
   let pendingUserInput: DesktopPendingUserInput | null = null;
   const resolvedCallIds = new Set<string>();
+  const answeredAsyncQuestions = new Set<string>();
+  const pendingAsyncInputs = new Map<string, DesktopPendingUserInput>();
   let lastProgressAt: string | undefined;
   let pendingImageGeneration: DesktopTaskActivity["pendingImageGeneration"];
   while (end > lowerBound) {
@@ -314,6 +318,20 @@ async function scanLatestDesktopTaskActivity(
       const row = parsedLine(line);
       if (!row) continue;
       const payload = record(row.payload);
+      const inputItem = row.type === "event_msg" && ["item_started", "item_completed"].includes(text(payload?.type))
+        ? record(payload?.item)
+        : row.type === "response_item" || row.type === "response_item_event" ? payload : null;
+      for (const id of desktopQuestionReplyIds(inputItem)) answeredAsyncQuestions.add(id);
+      const asyncItem = desktopAsyncQuestionItem(inputItem);
+      if (asyncItem) {
+        const group = readDesktopInteractions({ turns: [{ items: [asyncItem] }] }).questions[0];
+        if (group && !pendingAsyncInputs.has(group.itemId)) {
+          const questions = group.questions.filter(question => !answeredAsyncQuestions.has(question.id));
+          if (questions.length) pendingAsyncInputs.set(group.itemId, {
+            itemId: group.itemId, callId: group.itemId, questions, requestedAt: text(row.timestamp),
+          });
+        }
+      }
       const progress = row.type === "event_msg"
         ? payload?.type === "agent_message" || payload?.type === "agent_reasoning"
           || payload?.type === "item_started" || payload?.type === "item_completed"
@@ -347,8 +365,12 @@ async function scanLatestDesktopTaskActivity(
           || [...text(payload?.input).matchAll(/\btools\.([A-Za-z0-9_]+)\s*\(/gu)].some(match => isImageGenerationTool(match[1])))) {
         pendingImageGeneration ??= { callId: call.callId, startedAt: text(row.timestamp) };
       }
-      const activity = activityFromRow(row, waitingOnUserInput, pendingUserInput);
-      if (activity) return { ...activity, ...(activity.state === "running" ? { lastProgressAt, pendingImageGeneration } : {}) };
+      const asyncInputs = [...pendingAsyncInputs.values()];
+      const activity = activityFromRow(row, waitingOnUserInput || asyncInputs.length > 0, pendingUserInput ?? asyncInputs[0] ?? null);
+      if (activity) return { ...activity, ...(activity.state === "running" ? {
+        lastProgressAt, pendingImageGeneration,
+        ...(asyncInputs.length ? { pendingAsyncUserInputs: asyncInputs } : {}),
+      } : {}) };
     }
     suffix = lines[0]?.slice(0, SESSION_ACTIVITY_SCAN_CHUNK_BYTES) ?? "";
     end = start;
@@ -381,6 +403,8 @@ async function readLatestDesktopTaskActivity(path: string): Promise<DesktopTaskA
       // current turn only for that rare transition so a submitted answer also
       // clears the sidebar badge before the turn completes.
       const questionStateChanged = appendedText.includes('request_user_input')
+        || appendedText.includes('"questions"')
+        || appendedText.includes('send_user_message_question_reply')
         || (cached.activity?.waitingOnUserInput === true
           && appendedText.includes('"type":"function_call_output"'));
       const appendedActivity = await scanLatestDesktopTaskActivity(
@@ -498,10 +522,14 @@ export async function annotateDesktopTaskActivity(
         ...(activity.pendingUserInput
           ? { androidRemotePendingUserInput: activity.pendingUserInput }
           : {}),
+        ...(activity.pendingAsyncUserInputs
+          ? { androidRemotePendingAsyncUserInputs: activity.pendingAsyncUserInputs }
+          : {}),
       };
       delete annotated.androidRemoteActivityUnverified;
       if (!activity.errorMessage) delete annotated.androidRemoteLatestTurnError;
       if (!activity.pendingUserInput) delete annotated.androidRemotePendingUserInput;
+      if (!activity.pendingAsyncUserInputs) delete annotated.androidRemotePendingAsyncUserInputs;
       return annotated;
     } catch {
       return thread;

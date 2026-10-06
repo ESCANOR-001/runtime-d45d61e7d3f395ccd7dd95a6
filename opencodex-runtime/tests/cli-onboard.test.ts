@@ -284,6 +284,8 @@ describe("rmx onboard", () => {
         expect(result.tunnel).toBeNull();
         expect(opened).toEqual(["http://localhost:10100/#android-remote/pair"]);
         expect(capture.stdout.join("\n")).toContain("You can connect over Wi-Fi now");
+        expect(capture.stdout.join("\n")).toContain("For different networks, wait for the verified remote QR");
+        expect(capture.stdout.join("\n")).toContain("Use same-Wi-Fi QR now");
         expect(capture.stderr).toEqual([]);
       });
     }

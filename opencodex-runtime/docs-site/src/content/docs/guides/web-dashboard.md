@@ -62,6 +62,32 @@ Android conversations hide automatically supplied project instructions, includin
 still guide Codex; they simply do not appear as messages you sent. Normal questions
 about AGENTS.md and file-edit activities remain visible.
 
+### Android conversation reliability (next release)
+
+Saved conversation continuations are checked on Linux, macOS, and Windows so
+opening an older task does not silently omit messages between history files.
+Only verified files for the conversation and its recorded parent history are
+combined; uncertain history is reported rather than guessed.
+
+Older Desktop versions may lack the bounded history IPC method. Remodex uses a
+read-only compatibility path without taking ownership away from Desktop. Async
+question replies are checked against saved history when the recent Desktop
+summary does not contain the question. If verification fails, the answer is not
+sent and can be retried.
+
+If an older saved file contains a zero-filled damaged record, readable messages
+remain available through **Load earlier messages**, with an incomplete-history
+warning. Missing content is not reconstructed and saved files are not modified.
+Questions after the damaged section can still be answered when their subsequent
+history is verified; uncertain older questions remain protected from accidental
+replies. New activity appending to a verified file does not discard the older
+messages already recovered.
+
+Live **Compacting context** activity still requires a start event from the owning
+runtime. Desktop versions without a safe live-state subscription may expose only
+the saved completion marker. Remodex does not invent compaction from inactivity
+or load an unbounded Desktop transcript to obtain that event.
+
 ### Model catalog
 
 The generated model catalog uses Codex's current downloaded model definitions when available.
@@ -612,16 +638,59 @@ is gated correctly without manual classification.
 
 ### Android questions and task progress
 
+Completed work retains public tool summaries inside the expandable Work section;
+finishing a turn no longer removes its command/search rows from Android history.
+If a live refresh advances past an older-page cursor, the server retries that
+page against verified saved history without replacing the running transcript.
+An invalid cursor or a boundary removed by a real history rewrite still reports
+an error rather than returning an empty successful page.
+Saved-record recovery accepts records up to 64 MiB, including image-heavy
+compaction records; the compaction's embedded image data is not copied into
+the recovered transcript. Metadata reads remain capped at 16 MiB. Unverifiable
+recovery reports a retryable error instead of publishing a truncated replacement.
+
+The next app/server update also recognizes asynchronous questions carried by live tool calls
+and saved task history, including questions with a free-text answer and no preset options.
+Questions already answered in Desktop are not offered again after synchronization.
+
+If Desktop is temporarily reconnecting its task handler, Remodex makes bounded owner-discovery
+retries. When a send or question answer targets a remembered Desktop task that is no longer
+mounted after a restart, Remodex reopens that same task once and waits for its renderer before
+delivering the action. This may bring the task into view on your computer. History reads never
+trigger this activation, and a timeout after delivery never triggers an automatic resend.
+A task still owned by Desktop is never silently moved to another writer. If Desktop cannot
+restore its handler, the action remains unsent; reopen Desktop and retry once its connection recovers.
+
+The matching Android update keeps transcript deltas based on committed screen updates. If a
+native transcript update fails, it retries a full display snapshot once; a further failure offers
+**Retry** without deleting or reloading the conversation's saved history.
+
 With the matching Android app and server update, Codex questions open an answer
 sheet with selectable options and a custom-response field. You can dismiss the
-sheet and reopen it with **Answer question**. Submitted replies show the question
+sheet and reopen it with **Answer the question**. Submitted replies show the question
 and answer, not internal JSON. Answers submitted in Desktop also dismiss the
 pending question on the phone after synchronization.
 
-While Codex compacts context, Android shows the compaction activity and keeps the
-task running. Compaction finishing is not the same as the task finishing; the task
-remains active until its turn actually ends. These updates require a reachable
-Desktop connection and may take a few seconds to synchronize.
+Recovered questions keep their original turn and timeline position; reconnecting
+does not make old questions new activity beneath the latest reply. Questions in
+completed work stay inside that collapsed section until you expand it. Answered
+questions are history, not new requests to answer. An unanswered asynchronous
+question may remain available after its turn ends, without replacing the composer
+or automatically reopening the answer sheet.
+
+Server restarts close phone connections before stopping the network listeners and
+tunnel. A temporary shutdown must not overwrite the phone's saved routes with an
+empty list. Existing pairing remains valid; intentional route removal and access
+revocation still apply. Phones whose saved routes were emptied by an older server
+need their connection restored once through normal pairing.
+
+When Codex provides a live compaction-start event, Android shows the compaction
+activity and keeps the task running, including while compaction is quiet for
+several minutes. Compaction finishing is not the same as the task finishing.
+These updates require a reachable runtime connection. Some Desktop versions only
+provide a saved compaction-completion marker through the bounded history
+integration; live compaction cannot be identified from that marker alone.
+Unverified activity must not be interpreted as a confirmed pause or completion.
 
 ### Android file-content previews
 

@@ -1,6 +1,6 @@
 {
   "name": "@remodex/rmx",
-  "version": "1.2.23",
+  "version": "1.2.24",
   "description": "Remodex Connect — native ChatGPT/Codex remote access and local activity",
   "displayName": "Remodex",
   "type": "module",

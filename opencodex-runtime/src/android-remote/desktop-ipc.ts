@@ -56,6 +56,23 @@ const MAX_STREAM_TEXT_BYTES = 1024 * 1024;
  * so every follower mutation has identical delivery semantics.
  */
 const FOLLOWER_OWNER_RETRY_DELAYS_MS = [0, 125, 350] as const;
+const OWNER_REACTIVATION_DELAYS_MS = [0, 100, 250, 500, 1_000, 1_500] as const;
+const OWNER_REACTIVATION_METHODS = new Set([
+  "thread-follower-start-turn",
+  "thread-follower-update-thread-settings",
+  "thread-follower-steer-turn",
+  "thread-follower-interrupt-turn",
+  "thread-follower-edit-last-user-turn",
+  "thread-follower-compact-thread",
+  "thread-follower-rollback-thread",
+  "thread-follower-set-model-and-reasoning",
+  "thread-follower-set-collaboration-mode",
+  "thread-follower-command-approval-decision",
+  "thread-follower-file-approval-decision",
+  "thread-follower-permissions-request-approval-response",
+  "thread-follower-submit-user-input",
+  "thread-follower-submit-mcp-server-elicitation-response",
+]);
 const THREAD_STREAM_STATE_CHANGED = "thread-stream-state-changed";
 const THREAD_STREAM_FOLLOWING_CHANGED = "thread-stream-following-changed";
 const CLIENT_STATUS_CHANGED = "client-status-changed";
@@ -94,7 +111,7 @@ export const DESKTOP_IPC_METHOD_VERSIONS = new Map<string, number>([
   ["thread-queued-followups-changed", 1],
   ["thread-follower-start-turn", 2],
   ["thread-follower-load-complete-history", 1],
-  ["thread-follower-update-thread-settings", 1],
+  ["thread-follower-update-thread-settings", 2],
   ["thread-follower-compact-thread", 1],
   ["thread-follower-steer-turn", 1],
   ["thread-follower-interrupt-turn", 4],
@@ -467,6 +484,14 @@ function desktopFollowerMethodUnsupported(error: unknown): boolean {
   return /(?:method|request).*(?:not found|unknown|unsupported|unavailable)|unknown method|unsupported method|-32601/iu.test(
     message,
   );
+}
+
+function desktopHistoryPageUnavailable(error: unknown): boolean {
+  return desktopFollowerMethodUnsupported(error)
+    || (error instanceof DesktopIpcOwnershipError
+      && error.method === THREAD_FOLLOWER_LOAD_HISTORY_PAGE
+      && error.reason === "no-client-found")
+    || (error instanceof Error && /^(?:no-client-found|no codex ipc client can handle this request)$/iu.test(error.message.trim()));
 }
 
 export class DesktopIpcOwnershipError extends Error {
@@ -1451,6 +1476,8 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
    * This map is intentionally separate from the local mirror ownership map.
    */
   private readonly desktopOwnerClientIds = new Map<string, string>();
+  private readonly ownerReactivations = new Map<string, Promise<string | null>>();
+  private ownerRecoveryGeneration = 0;
   /** Waiters used only while reacquiring a renderer id after reconnect. */
   private readonly desktopOwnerWaiters = new Map<string, Set<{
     resolve: (clientId: string | null) => void;
@@ -1564,6 +1591,8 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
   }
 
   stop(): void {
+    this.ownerRecoveryGeneration += 1;
+    this.ownerReactivations.clear();
     if (this.snapshotTimer) clearTimeout(this.snapshotTimer);
     this.snapshotTimer = null;
     for (const timer of this.followTimers.values()) clearTimeout(timer);
@@ -1775,53 +1804,38 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
   }
 
   async requestFollowerAction(method: string, params: JsonRecord): Promise<unknown> {
+    try {
+      return await this.dispatchFollowerAction(method, params);
+    } catch (error) {
+      if (!(error instanceof DesktopIpcOwnershipError)
+        || error.reason !== "owner-unavailable"
+        || !OWNER_REACTIVATION_METHODS.has(method)
+        || !await this.reactivateDesktopOwner(error.threadId)) throw error;
+      return await this.dispatchFollowerAction(method, params);
+    }
+  }
+
+  private async dispatchFollowerAction(method: string, params: JsonRecord): Promise<unknown> {
     const threadId = threadIdFromParams(params);
-    const knownDesktopOwner = Boolean(
+    let knownDesktopOwner = Boolean(
       threadId && this.desktopOwnedThreadIds.has(threadId),
     );
-    let initialOwner = threadId ? this.desktopOwnerClientIds.get(threadId) ?? "" : "";
-    // A remembered Desktop-owned task may have lost its renderer id when the
-    // socket disconnected.  Reacquire that id through the read-only stream
-    // probe before sending *any* follower mutation.  An untargeted mutation
-    // during this window could be picked up by a different renderer (or by a
-    // stale local mirror), so fail closed when reacquisition is inconclusive.
-    if (knownDesktopOwner && threadId && !initialOwner) {
-      const reacquired = await this.reacquireDesktopOwner(threadId);
-      if (!reacquired) {
-        throw new DesktopIpcOwnershipError(
-          `Codex Desktop still owns task ${threadId}; its current renderer owner could not be reacquired`,
-          threadId,
-          method,
-          0,
-          "owner-unavailable",
-        );
-      }
-      initialOwner = reacquired;
-    }
+    let requestAttempts = 0;
+    let ownerUnavailable = false;
     let lastError: unknown = null;
     for (let attempt = 0; attempt < FOLLOWER_OWNER_RETRY_DELAYS_MS.length; attempt += 1) {
       const delayMs = FOLLOWER_OWNER_RETRY_DELAYS_MS[attempt] ?? 0;
       if (delayMs > 0) await waitMs(delayMs);
-      // Keep a known owner target stable across the handler-registration race.
-      // A newer authoritative snapshot may replace it between attempts; use
-      // that new id, but never broaden a known-owner request to local Codex.
-      let targetClientId = threadId
-        ? this.desktopOwnerClientIds.get(threadId) || initialOwner
-        : "";
+      knownDesktopOwner ||= Boolean(threadId && this.desktopOwnedThreadIds.has(threadId));
+      let targetClientId = threadId ? this.desktopOwnerClientIds.get(threadId) ?? "" : "";
       if (knownDesktopOwner && threadId && !targetClientId) {
-        const reacquired = await this.reacquireDesktopOwner(threadId);
-        if (!reacquired) {
-          throw new DesktopIpcOwnershipError(
-            `Codex Desktop still owns task ${threadId}; its current renderer owner could not be reacquired`,
-            threadId,
-            method,
-            attempt,
-            "owner-unavailable",
-          );
-        }
-        targetClientId = reacquired;
+        targetClientId = await this.reacquireDesktopOwner(threadId) ?? "";
+        ownerUnavailable = !targetClientId;
+        if (ownerUnavailable) continue;
       }
+      ownerUnavailable = false;
       try {
+        requestAttempts += 1;
         const result = await this.transport.request(method, params, {
           ...(targetClientId ? { targetClientId } : {}),
         });
@@ -1829,7 +1843,10 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
         return result;
       } catch (error) {
         lastError = error;
-        if (!desktopFollowerNoClientFound(error)) throw error;
+        const message = error instanceof Error ? error.message : String(error);
+        if (!/^(?:no-client-found|no codex ipc client can handle this request)$/iu.test(message.trim())) {
+          throw error;
+        }
         // A targeted no-client-found is safe to retry, but never broaden it
         // into an untargeted request.  If the renderer was replaced, the next
         // attempt must first obtain the replacement sourceClientId.
@@ -1839,31 +1856,18 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
           // monotonic Desktop-owned fact, then let the read-only discovery
           // path identify the replacement renderer before another mutation.
           this.removeDesktopOwnerClient(targetClientId);
-          if (initialOwner === targetClientId) initialOwner = "";
         }
-        if (knownDesktopOwner && threadId && !this.desktopOwnerClientIds.get(threadId)) {
-          const reacquired = await this.reacquireDesktopOwner(threadId);
-          if (!reacquired && attempt < FOLLOWER_OWNER_RETRY_DELAYS_MS.length - 1) {
-            throw new DesktopIpcOwnershipError(
-              `Codex Desktop still owns task ${threadId}; its current renderer owner could not be reacquired`,
-              threadId,
-              method,
-              attempt + 1,
-              "owner-unavailable",
-            );
-          }
-          if (reacquired) initialOwner = reacquired;
-        }
-        if (attempt === FOLLOWER_OWNER_RETRY_DELAYS_MS.length - 1) break;
       }
     }
     if (knownDesktopOwner && threadId) {
       throw new DesktopIpcOwnershipError(
-        `Codex Desktop still owns task ${threadId}; its follower IPC handler could not be reached`,
+        ownerUnavailable
+          ? `Codex Desktop still owns task ${threadId}; its current renderer owner could not be reacquired`
+          : `Codex Desktop still owns task ${threadId}; its follower IPC handler could not be reached`,
         threadId,
         method,
-        FOLLOWER_OWNER_RETRY_DELAYS_MS.length,
-        "no-client-found",
+        requestAttempts,
+        ownerUnavailable ? "owner-unavailable" : "no-client-found",
       );
     }
     throw lastError instanceof Error
@@ -1884,6 +1888,39 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
     await this.openUrl(
       `codex://threads/${encodeURIComponent(threadId)}?opencodex-reactivate=${token}`,
     );
+  }
+
+  private reactivateDesktopOwner(threadId: string): Promise<string | null> {
+    const existing = this.ownerReactivations.get(threadId);
+    if (existing) return existing;
+    const generation = this.ownerRecoveryGeneration;
+    const eligible = (): boolean => generation === this.ownerRecoveryGeneration
+      && this.transport.connected
+      && this.threadOwnership(threadId).state === "desktop-owned";
+    const recover = async (): Promise<string | null> => {
+      if (!eligible()) return null;
+      const discovery = await this.discoverDesktopOwner(threadId);
+      if (!eligible()) return null;
+      if (discovery.handledByClientId) return discovery.handledByClientId;
+      if (discovery.timedOut) return null;
+      await this.activateFollowerThread(threadId);
+      for (const delayMs of OWNER_REACTIVATION_DELAYS_MS) {
+        if (delayMs > 0) await waitMs(delayMs);
+        if (!eligible()) return null;
+        const owner = this.desktopOwnerClientIds.get(threadId);
+        if (owner) return owner;
+        const refreshed = await this.discoverDesktopOwner(threadId);
+        if (!eligible()) return null;
+        if (refreshed.handledByClientId) return refreshed.handledByClientId;
+        if (refreshed.timedOut) return null;
+      }
+      return null;
+    };
+    const flight = recover().catch(() => null).finally(() => {
+      if (this.ownerReactivations.get(threadId) === flight) this.ownerReactivations.delete(threadId);
+    });
+    this.ownerReactivations.set(threadId, flight);
+    return flight;
   }
 
   async readFollowerHistoryPage(
@@ -1916,7 +1953,7 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
       }
       return response ? clone(response) : null;
     } catch (error) {
-      if (!desktopFollowerMethodUnsupported(error)) throw error;
+      if (!desktopHistoryPageUnavailable(error)) throw error;
       this.markBoundedHistoryUnsupported();
       return this.readFollowerHistoryPageFallback(threadId, direction, options.pageToken ?? null);
     }
@@ -2025,7 +2062,7 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
       // cannot become an unhandled promise, while still allowing the race to
       // observe it when it is the first result.
       void directState.catch(error => {
-        if (desktopFollowerMethodUnsupported(error)) this.markBoundedHistoryUnsupported();
+        if (desktopHistoryPageUnavailable(error)) this.markBoundedHistoryUnsupported();
       });
       // Race the bounded page request against the state publication timeout.
       // A slow or lost Desktop response must not keep the gateway request
@@ -2041,7 +2078,7 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
         clearTimeout(stateWaiter.timer);
         if (waiters.size === 0) this.followerStateWaiters.delete(threadId);
       }
-      if (desktopFollowerMethodUnsupported(error)) {
+      if (desktopHistoryPageUnavailable(error)) {
         this.markBoundedHistoryUnsupported();
         return this.readFollowerThreadStateFallback(threadId);
       }
@@ -2072,7 +2109,7 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
     const result = await this.readThreadPage(threadId);
     const state = record(result?.thread) ?? record(result);
     if (!state) return null;
-    const redacted = sanitizeDesktopConversationState(state, true);
+    const redacted = sanitizeDesktopConversationState({ ...state, androidRemoteHistoryOnly: true }, true);
     const bounded = this.historyPages.recentPage(threadId, redacted).state;
     this.followerStates.set(threadId, clone(bounded));
     this.followerRevisions.set(threadId, this.followerRevisions.get(threadId) ?? 0);
@@ -3609,6 +3646,9 @@ function sanitizeDesktopItem(
       else safe.content = [{ type: "text", text: publicTranscriptText }, ...attachments];
     }
     if (rawTranscriptText && !transcriptText(safe)) return null;
+    if (normalizedType === "agentmessage" && typeof safe.text !== "string") {
+      safe.text = transcriptText(safe);
+    }
   }
   if (type === "reasoning") safe.content = [];
   return safe;

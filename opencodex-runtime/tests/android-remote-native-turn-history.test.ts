@@ -1,10 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import type { AndroidCodexClient } from "../src/android-remote/codex-app-server";
-import { decodeNativeHistoryCursor, nativeHistoryCursor, nativeHistoryIsUnsupported, readNativeTurnsPage, windowsNativeHistoryNeedsSessionRecovery } from "../src/android-remote/native-turn-history";
+import { decodeNativeHistoryCursor, nativeHistoryCursor, nativeHistoryIsUnsupported, nativeHistoryNeedsSessionRecovery, readNativeTurnsPage, windowsNativeHistoryNeedsSessionRecovery } from "../src/android-remote/native-turn-history";
 import { projectCodexThreadDetail } from "../src/android-remote/projection";
 import { createProjectedThreadStreamState, projectedThreadBoundedSnapshot, projectedThreadOlderPage, projectedThreadRecentPage } from "../src/android-remote/thread-stream";
 
 describe("complete bounded Android history", () => {
+  test("recognizes the exact lineage failure for recovery on every operating system", () => {
+    expect(nativeHistoryNeedsSessionRecovery(new Error("invalid paginated history lineage for task: source rollout belongs to another thread"))).toBe(true);
+    expect(nativeHistoryNeedsSessionRecovery({ message: "invalid paginated history lineage: source rollout belongs to another thread" })).toBe(true);
+    for (const unrelated of [null, {}, new Error("request timed out"), new Error("invalid paginated history lineage: missing file")]) {
+      expect(nativeHistoryNeedsSessionRecovery(unrelated)).toBe(false);
+    }
+  });
   test("recovers only the specific Windows lineage failure without changing other platforms", () => {
     const error = new Error("invalid paginated history lineage for task: source rollout belongs to another thread");
     expect(windowsNativeHistoryNeedsSessionRecovery(error, "win32")).toBe(true);
@@ -44,7 +51,7 @@ describe("complete bounded Android history", () => {
     }, 1, { compactCompletedWork: true });
     const snapshot = projectedThreadBoundedSnapshot(createProjectedThreadStreamState(detail)) as any;
     expect(calls).toEqual([{ threadId: "task", limit: 1, sortDirection: "desc", itemsView: "full" }]);
-    expect(snapshot.snapshot.thread.activities.map((item: any) => item.id)).toEqual(["reasoning", "patch"]);
+    expect(snapshot.snapshot.thread.activities.map((item: any) => item.id)).toEqual(["reasoning", "command", "search", "patch"]);
     expect(snapshot.snapshot.thread.messages.map((item: any) => item.id)).toEqual(["user", "answer"]);
     expect(JSON.stringify(snapshot)).not.toContain("private");
     expect(JSON.stringify(snapshot).length).toBeLessThan(10_000);

@@ -10,6 +10,30 @@ const state = (items: unknown[], status = "in_progress") => ({
 });
 
 describe("Desktop live interaction projection", () => {
+  test("does not invent a current timestamp for missing or invalid historical dates", () => {
+    for (const startedAt of [undefined, "invalid", Infinity, 1e20]) {
+      const result = readDesktopInteractions({ turns: [{
+        id: "old-turn", startedAt, status: "completed", items: [questionItem],
+      }] });
+      expect(result.questions[0]?.requestedAt).toBe("");
+    }
+  });
+
+  test("preserves old question turn, timestamp and provider position across later turns", () => {
+    const turns = Array.from({ length: 70 }, (_, index) => ({
+      id: `turn-${index}`, startedAt: 1_700_000_000 + index, status: "completed",
+      items: [{ type: "agentMessage", id: `answer-${index}`, text: "Done" },
+        ...(index === 60 ? [questionItem] : []),
+      ],
+    }));
+    expect(readDesktopInteractions({ turns }).questions[0]).toMatchObject({
+      turnId: "turn-60", requestedAt: new Date(1_700_000_060_000).toISOString(), sequence: 61,
+    });
+    expect(readDesktopInteractions({ turns: [...turns, {
+      id: "latest", startedAt: 1_800_000_000, status: "completed", items: [],
+    }] }).questions[0]).toEqual(readDesktopInteractions({ turns }).questions[0]);
+  });
+
   test("maps async questions with exact Desktop IDs and supports free text", () => {
     const groups = readDesktopInteractions(state([questionItem])).questions;
     expect(groups[0]?.questions).toEqual([

@@ -11,7 +11,7 @@ export type DesktopQuestion = {
 export type DesktopInteractions = {
   activeTurnId: string | null;
   compaction: { id: string; turnId: string; active: boolean; startedAt: number | null } | null;
-  questions: { itemId: string; turnId: string; questions: DesktopQuestion[] }[];
+  questions: { itemId: string; turnId: string; requestedAt: string; sequence: number; questions: DesktopQuestion[] }[];
   answeredIds: string[];
 };
 
@@ -30,6 +30,29 @@ function rows(value: unknown): JsonRecord[] {
 function inputText(value: unknown): string {
   return rows(value).filter(part => part.type === "text" || part.type === "input_text")
     .map(part => text(part.text)).join("");
+}
+
+export function desktopAsyncQuestionItem(value: unknown): JsonRecord | null {
+  const item = record(value);
+  if (!item) return null;
+  const type = text(item.type).replace(/_/gu, "").toLowerCase();
+  if (type === "agentmessage" && Array.isArray(item.questions)) return { ...item, type: "agentMessage" };
+  if (!["functioncall", "dynamictoolcall"].includes(type) || (item.name ?? item.tool) !== "request_user_input_async") return null;
+  const id = text(item.call_id ?? item.callId) || text(item.id);
+  let args = record(item.arguments);
+  if (!args && typeof item.arguments === "string") {
+    try { args = record(JSON.parse(item.arguments)); } catch { return null; }
+  }
+  return id && Array.isArray(args?.questions)
+    ? { type: "agentMessage", id, questions: args.questions, text: "", delivery: "async" } : null;
+}
+
+export function desktopQuestionReplyIds(value: unknown): string[] {
+  const item = record(value);
+  const type = text(item?.type).replace(/_/gu, "").toLowerCase();
+  if (!item || !(type === "usermessage" || (type === "message" && item.role === "user")
+    || (type === "steeringusermessage" && item.status === "accepted"))) return [];
+  return desktopQuestionReplies(inputText(item.content ?? item.input) || text(item.text)).map(reply => reply.questionItemId);
 }
 
 export function desktopQuestionReplies(source: string): { questionItemId: string; question: string; answer: string }[] {
@@ -51,13 +74,21 @@ export function desktopQuestionReplies(source: string): { questionItemId: string
 
 export function readDesktopInteractions(value: unknown, orderedTurns?: readonly JsonRecord[]): DesktopInteractions {
   const state = record(value);
-  const turns = (orderedTurns ?? rows(state?.turns)).slice(-64);
+  const allTurns = orderedTurns ?? rows(state?.turns);
+  const turns = allTurns.slice(-64);
+  let sequence = allTurns.slice(0, -64).reduce((count, turn) => count + rows(turn.items).length, 0);
   const answered = new Set<string>();
   const questions: DesktopInteractions["questions"] = [];
   for (const turn of turns) {
     const turnId = text(turn.turnId ?? turn.id);
     const inputs = [inputText(record(turn.params)?.input)];
-    for (const item of rows(turn.items)) {
+    for (const rawItem of rows(turn.items)) {
+      const itemSequence = sequence++;
+      const item = desktopAsyncQuestionItem(rawItem) ?? rawItem;
+      for (const id of desktopQuestionReplyIds(item)) answered.add(id);
+      for (const id of Array.isArray(item.androidRemoteAnsweredQuestionIds) ? item.androidRemoteAnsweredQuestionIds : []) {
+        if (typeof id === "string") answered.add(id);
+      }
       if (item.type === "userMessage" || (item.type === "steeringUserMessage" && item.status === "accepted")) {
         inputs.push(inputText(item.content ?? item.input) || text(item.text));
       }
@@ -76,7 +107,16 @@ export function readDesktopInteractions(value: unknown, orderedTurns?: readonly 
           multiSelect: false,
         }];
       });
-      if (normalized.length) questions.push({ itemId: text(item.id), turnId, questions: normalized });
+      if (normalized.length) {
+        const startedAt = turn.startedAt ?? turn.createdAt ?? state?.createdAt;
+        const time = typeof startedAt === "number"
+          ? startedAt > 10_000_000_000 ? startedAt : startedAt * 1000
+          : Date.parse(text(startedAt));
+        const date = new Date(time);
+        questions.push({ itemId: text(item.id), turnId, questions: normalized,
+          sequence: itemSequence, requestedAt: Number.isFinite(date.getTime()) ? date.toISOString() : "",
+        });
+      }
     }
     for (const input of inputs) {
       for (const reply of desktopQuestionReplies(input)) answered.add(reply.questionItemId);
@@ -95,7 +135,8 @@ export function readDesktopInteractions(value: unknown, orderedTurns?: readonly 
       active: !turnTerminal && (compactionItem.completed === false || compactionItem.status === "inProgress"),
       startedAt: typeof startedAt === "number" && Number.isFinite(startedAt) ? startedAt : null,
     } : null,
-    questions: questions.map(group => ({ ...group, questions: group.questions.filter(question => !answered.has(question.id)) }))
+    questions: [...new Map(questions.map(group => [JSON.stringify([group.turnId, group.itemId]), group])).values()]
+      .map(group => ({ ...group, questions: group.questions.filter(question => !answered.has(question.id)) }))
       .filter(group => group.questions.length > 0),
     answeredIds: [...answered],
   };

@@ -587,7 +587,8 @@ export async function runOnboard(
       output.log(JSON.stringify(result));
     } else {
       output.log("Ready to connect your phone.\n");
-      if (localReady) output.log("1. Put your phone and computer on the same trusted Wi-Fi.");
+      if (verifiedForPairing) output.log("The QR includes verified remote access and any available Wi-Fi addresses. Your phone switches routes automatically.");
+      else if (localReady) output.log("For different networks, wait for the verified remote QR. For the same trusted Wi-Fi, choose 'Use same-Wi-Fi QR now' on the QR page.");
       output.log("Open Remodex on your phone, tap Scan QR code, and scan the code on your computer.");
       output.log("Keep the QR page open until it confirms your phone is connected.\n");
       output.log(`Your QR code: ${dashboardUrl}`);

@@ -4,10 +4,37 @@ import {
   createProjectedThreadStreamState,
   projectedThreadBoundedSnapshot,
   projectedThreadOlderPage,
+  readProjectedOlderPage,
   replayProjectedThreadAfter,
 } from "../src/android-remote/thread-stream";
 
 type JsonRecord = Record<string, unknown>;
+
+describe("history cursor recovery", () => {
+  test("loads an older boundary after the live stream advances to a different bounded window", async () => {
+    const messages = Array.from({ length: 240 }, (_, index) => message(`m-${index}`, `Message ${index}`, index));
+    const full = detail({ messages });
+    const original = createProjectedThreadStreamState(full);
+    const snapshot = projectedThreadBoundedSnapshot(original) as any;
+    const cursor = snapshot.snapshot.historyPage.olderCursor;
+    const expected = projectedThreadOlderPage(original, cursor);
+    const recent = createProjectedThreadStreamState(detail({ messages: messages.slice(-8) }));
+    let reads = 0;
+    const page = await readProjectedOlderPage(recent, cursor, async () => { reads += 1; return full; });
+    expect(page).toEqual(expected);
+    expect(reads).toBe(1);
+    expect((recent.detail.thread as JsonRecord).messages).toEqual(messages.slice(-8));
+    await expect(readProjectedOlderPage(recent, "invalid", async () => { reads += 1; return full; })).rejects.toThrow("invalid");
+    expect(reads).toBe(1);
+  });
+
+  test("does not resurrect a boundary removed from saved history", async () => {
+    const full = detail({ messages: Array.from({ length: 120 }, (_, index) => message(`m-${index}`, "Text", index)) });
+    const snapshot = projectedThreadBoundedSnapshot(createProjectedThreadStreamState(full)) as any;
+    const empty = createProjectedThreadStreamState(detail());
+    await expect(readProjectedOlderPage(empty, snapshot.snapshot.historyPage.olderCursor, async () => detail())).rejects.toThrow("page boundary");
+  });
+});
 
 function message(id: string, text: string, sequence: number, streaming = false): JsonRecord {
   const createdAt = new Date(Date.parse("2026-08-11T00:00:00.000Z") + sequence * 1_000).toISOString();

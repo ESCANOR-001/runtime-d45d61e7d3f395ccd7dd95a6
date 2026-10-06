@@ -27,6 +27,10 @@ export function windowsNativeHistoryNeedsSessionRecovery(
   platform: NodeJS.Platform = process.platform,
 ): boolean {
   if (platform !== "win32") return false;
+  return nativeHistoryNeedsSessionRecovery(error);
+}
+
+export function nativeHistoryNeedsSessionRecovery(error: unknown): boolean {
   const value = error as { message?: unknown } | null;
   return typeof value?.message === "string"
     && /invalid paginated history lineage\b[\s\S]*source rollout belongs to another thread\b/iu.test(value.message);

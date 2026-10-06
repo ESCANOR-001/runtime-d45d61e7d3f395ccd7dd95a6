@@ -542,8 +542,11 @@ describe("Android Remote Codex Desktop workspace membership", () => {
         turns: [{ ...interruptedRead.turns[0], ...overrides }],
       }, 1).thread as { session: { status: string } }).session.status).toBe("idle");
     }
-    expect((projectCodexThreadDetail({ ...interruptedRead, androidRemoteActivityUnverified: true }, 1)
-      .thread as { session: { status: string } }).session.status).toBe("idle");
+    const uncertain = projectCodexThreadDetail({ ...interruptedRead, androidRemoteActivityUnverified: true }, 1)
+      .thread as { session: { status: string; lastError: string }; latestTurn: unknown };
+    expect(uncertain.session.status).toBe("error");
+    expect(uncertain.session.lastError).toContain("Task status is unavailable");
+    expect(uncertain.latestTurn).toBeNull();
     expect((projectCodexThreadDetail({ ...interruptedRead,
       turns: [...interruptedRead.turns, { id: "later-turn", status: "completed", items: [] }],
     }, 1).thread as { session: { status: string } }).session.status).toBe("idle");

@@ -161,7 +161,7 @@ class ReadyCloudflareTunnel implements AndroidRemoteCloudflareTunnel {
   }
   async configureToken(): Promise<void> {}
   async removeToken(): Promise<void> {}
-  async apply(): Promise<void> {}
+  async apply(_input: Parameters<AndroidRemoteCloudflareTunnel["apply"]>[0]): Promise<void> {}
   async retry(): Promise<void> {}
   async check(): Promise<void> {}
   async stop(): Promise<void> {}
@@ -169,8 +169,8 @@ class ReadyCloudflareTunnel implements AndroidRemoteCloudflareTunnel {
     this.listener = listener;
     return () => { this.listener = null; };
   }
-  publish(url: string): void {
-    this.current = { mode: this.current.mode, status: "ready", publicUrl: url, error: null };
+  publish(url: string | null, status: AndroidRemoteCloudflareState["status"] = "ready"): void {
+    this.current = { mode: this.current.mode, status, publicUrl: url, error: null };
     this.listener?.(this.state());
   }
 }
@@ -1098,12 +1098,21 @@ describe("Android Remote credentials", () => {
       runtime: { start: async () => new FakeCodexClient(), stop: async () => {} },
       desktopIpcSync: new FakeDesktopIpcSync(), cloudflareTunnel: tunnel,
     });
+    const applyTunnel = spyOn(tunnel, "apply").mockImplementation(async input => {
+      expect(controller.status().status).toBe("ready");
+      expect(input.enabled).toBe(true);
+      expect(input.port).toBe(controller.status().port);
+      expect(input.settings.tunnelMode).toBe("quick");
+    });
     let socket: WebSocket | null = null;
     try {
       await controller.applySettings(store.read().settings);
+      expect(applyTunnel).toHaveBeenCalledTimes(1);
       const invitation = controller.createPairingInvitation("Local test PC");
       expect(invitation.payload.localUrls).toEqual([`http://192.168.1.3:${controller.status().port}`]);
       expect(invitation.payload.cloudflareUrl).toBeNull();
+      tunnel.publish("https://unverified.trycloudflare.com", "checking");
+      expect(controller.createPairingInvitation("Checking PC").payload.cloudflareUrl).toBeNull();
       const exchanged = controller.auth.exchangePairingToken({ pairingToken: invitation.payload.pairingToken, metadata: { label: "Test phone" } });
       expect(exchanged).not.toBeNull();
       const ticket = controller.auth.issueWebSocketTicket(exchanged!.client.id);
@@ -1114,12 +1123,56 @@ describe("Android Remote credentials", () => {
       await first;
       const update = socketMessage(socket, 3000, "remote connection ready");
       tunnel.publish("https://new-route.trycloudflare.com");
+      const dualRouteInvitation = controller.createPairingInvitation("Remote-ready PC");
+      expect(dualRouteInvitation.payload.localUrls).toEqual(invitation.payload.localUrls);
+      expect(dualRouteInvitation.payload.cloudflareUrl).toBe("https://new-route.trycloudflare.com");
+      expect(dualRouteInvitation.payload.directUrl).toBe(invitation.payload.localUrls[0]);
       expect((await update).event).toMatchObject({ type: "remodexMobileConnectionUpdated", payload: { connection: {
         localUrls: invitation.payload.localUrls, cloudflare: { status: "ready", url: "https://new-route.trycloudflare.com" },
       } } });
       expect(store.read().clients).toHaveLength(1);
     } finally { socket?.close(); await controller.stop(); }
   });
+  test("a server restart closes config subscriptions before removing transient connection routes", async () => {
+    const store = memoryStore();
+    store.updateSettings({ controlEnabled: true, localNetworkEnabled: true });
+    const tunnel = new ReadyCloudflareTunnel("https://restart.trycloudflare.com");
+    tunnel.stop = async () => { tunnel.publish(null, "stopped"); };
+    const controller = new AndroidRemoteGatewayController(store, {
+      port: 0, runtime: { start: async () => new FakeCodexClient(), stop: async () => {} },
+      desktopIpcSync: new FakeDesktopIpcSync(), cloudflareTunnel: tunnel,
+      networkInterfaces: () => ({ wlan0: [{ address: "192.168.1.3", family: "IPv4", internal: false,
+        netmask: "255.255.255.0", mac: "00:00:00:00:00:00", cidr: "192.168.1.3/24" }] }),
+    });
+    let socket: WebSocket | null = null;
+    try {
+      await controller.applySettings(store.read().settings);
+      const invitation = controller.createPairingInvitation("Restart test PC");
+      const paired = controller.auth.exchangePairingToken({ pairingToken: invitation.payload.pairingToken,
+        metadata: { label: "Phone" } })!;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const ticket = controller.auth.issueWebSocketTicket(paired.client.id);
+        socket = new WebSocket(`ws://127.0.0.1:${controller.status().port}/ws?wsTicket=${encodeURIComponent(ticket.ticket)}`, "opencodex-json-v1");
+        await socketOpen(socket);
+        const initial = socketMessage(socket, 3000, "restart config");
+        socket.send(JSON.stringify({ id: "config", method: "subscribeServerConfig", params: {} }));
+        expect((await initial).event).toMatchObject({ config: { remodexMobileConnection: {
+          cloudflare: { status: "ready", url: "https://restart.trycloudflare.com" },
+        } } });
+        const updates: unknown[] = [];
+        socket.addEventListener("message", event => { updates.push(JSON.parse(String(event.data))); });
+        const closed = new Promise<void>(resolve => socket!.addEventListener("close", () => resolve(), { once: true }));
+        await controller.stop();
+        await closed;
+        expect(updates).toEqual([]);
+        expect(controller.auth.authenticateAccessToken(paired.accessToken)?.client.id).toBe(paired.client.id);
+        tunnel.publish("https://restart.trycloudflare.com");
+        await controller.applySettings(store.read().settings);
+      }
+      expect(store.read().clients).toHaveLength(1);
+    } finally { socket?.close(); await controller.stop(); }
+  });
+
   test("changing local access preserves the tunnel, credentials and Codex runtime", async () => {
     const store = memoryStore();
     store.updateSettings({ controlEnabled: true, localNetworkEnabled: true });
@@ -3269,6 +3322,79 @@ describe("Android Remote Codex projection", () => {
     expect(JSON.stringify(live)).not.toContain("private text");
   });
 
+  test.each(["pending", "answered", "unverified", "verified-after-gap", "question-before-gap"])("verifies async answers against saved history when Desktop only supplies a recent summary: %s", async outcome => {
+    const threadId = "saved-question-thread";
+    const questionId = '["request_user_input_async","saved-question",0]';
+    const codex = new FakeCodexClient();
+    const desktopIpc = new FakeDesktopIpcSync();
+    desktopIpc.markDesktopOwned(threadId);
+    desktopIpc.followerStateAction = async () => ({ id: threadId, androidRemoteHistoryOnly: true, turns: [] });
+    const reply = `<send_user_message_question_reply>${JSON.stringify([{ questionItemId: questionId, question: "Which platform?", answer: "Already answered" }])}</send_user_message_question_reply>`;
+    const saved = {
+      id: threadId,
+      ...(outcome === "unverified" ? { androidRemoteHistoryRecoveryError: "unreadable source" } : {}),
+      ...(["verified-after-gap", "question-before-gap"].includes(outcome) ? {
+        androidRemoteHistoryRecoveryError: "Some older saved records are unreadable",
+        androidRemoteVerifiedAsyncQuestionItemIds: outcome === "verified-after-gap" ? ["saved-question"] : [],
+      } : {}),
+      turns: [{ id: "question-turn", status: "completed", items: [
+        { type: "agentMessage", id: "saved-question", questions: [{ title: "Which platform?", options: ["Android"] }] },
+        ...(outcome === "answered" ? [{ type: "userMessage", content: [{ type: "text", text: reply }] }] : []),
+      ] }],
+    };
+    const controller = new AndroidRemoteGatewayController(memoryStore(), {
+      port: 0, hostname: "127.0.0.1", desktopIpcSync: desktopIpc,
+      runtime: { start: async () => codex, stop: async () => {} },
+      sessionCommandRecovery: { enrichThread: async () => saved, clear() {} },
+    });
+    const internal = controller as any;
+    const pending = internal.rememberDesktopPendingUserInput({ nativeThreadId: threadId, remoteThreadId: threadId,
+      itemId: "saved-question", callId: "saved-question", turnId: "question-turn", requestedAt: "",
+      questions: [{ id: questionId, question: "Which platform?", options: [] }],
+    });
+    const active = spyOn(internal, "activeTurnId").mockResolvedValue("");
+    const deliver = spyOn(internal, "startTurnUsingOwner").mockResolvedValue(undefined);
+    try {
+      const answer = internal.respondToUserInput("phone", { threadId, requestId: pending.publicRequestId, answers: { [questionId]: "Android" } });
+      if (outcome === "pending" || outcome === "verified-after-gap") {
+        await answer;
+        expect(deliver).toHaveBeenCalledTimes(1);
+        expect((deliver.mock.calls[0]![1] as any).message.text).toContain("Android");
+      } else {
+        await expect(answer).rejects.toThrow(outcome === "answered" ? "no longer waiting" : "Could not verify");
+        expect(deliver).not.toHaveBeenCalled();
+      }
+      expect(codex.requests.some(row => row.method === "thread/resume" || row.method === "turn/start")).toBe(false);
+    } finally {
+      active.mockRestore();
+      deliver.mockRestore();
+      await controller.stop();
+    }
+  });
+
+  test("question activity keeps its original placement when later metadata is refreshed", () => {
+    const controller = new AndroidRemoteGatewayController(memoryStore(), {
+      port: 0, hostname: "127.0.0.1", desktopIpcSync: new FakeDesktopIpcSync(),
+    });
+    const internal = controller as any;
+    const input = { nativeThreadId: "question-thread", remoteThreadId: "question-thread",
+      itemId: "old-question", callId: "old-question", turnId: "old-turn", requestedAt: "2026-01-01T00:00:00.000Z",
+      sequence: 12, questions: [{ id: '["request_user_input_async","old-question",0]', question: "Continue?", options: [] }],
+    };
+    const original = internal.rememberDesktopPendingUserInput(input);
+    internal.rememberSupplementalActivity(input.remoteThreadId, original.activity);
+    const refreshed = internal.rememberDesktopPendingUserInput({ ...input, sequence: undefined,
+      turnId: "latest-turn", requestedAt: "2026-10-03T00:00:00.000Z",
+    });
+    expect(refreshed.turnId).toBe("old-turn");
+    expect(refreshed.activity).toMatchObject({ turnId: "old-turn", sequence: 12,
+      createdAt: input.requestedAt, summary: "Answer the question",
+    });
+    const corrected = internal.rememberDesktopPendingUserInput({ ...input, sequence: 10 });
+    expect(internal.supplementalActivities.get(input.remoteThreadId)[0]).toEqual(corrected.activity);
+    expect(internal.pendingDesktopUserInputs.size).toBe(1);
+  });
+
   test.each(["legacy", "canonical"])("mirrors live Desktop compaction and async questions despite an idle private snapshot: %s", async shape => {
     let now = Date.now();
     const codex = new FakeCodexClient();
@@ -3350,6 +3476,83 @@ describe("Android Remote Codex projection", () => {
     }
   });
 
+  test.each([
+    ["app-server", "completed"], ["desktop-session", "completed"],
+    ["app-server", "failed"], ["desktop-session", "interrupted"],
+  ])("live compaction survives quiet history polls until its real completion: %s %s", async (source, terminalStatus) => {
+    let now = Date.now();
+    const codex = new FakeCodexClient();
+    codex.threads.push({ id: "compacting-task", cwd: process.cwd(), modelProvider: "openai", status: { type: "idle" }, turns: [] });
+    const desktopIpc = new FakeDesktopIpcSync();
+    desktopIpc.markDesktopOwned("compacting-task");
+    desktopIpc.followerStateAction = async () => ({
+      id: "compacting-task", androidRemoteHistoryOnly: true,
+      turns: [{ id: "compacting-turn", status: "interrupted", items: [] }],
+    });
+    const controller = new AndroidRemoteGatewayController(memoryStore(), {
+      port: 0, hostname: "127.0.0.1", now: () => now, desktopIpcSync: desktopIpc,
+      runtime: { start: async () => codex, stop: async () => {} },
+    });
+    const internal = controller as unknown as {
+      refreshDesktopInteractions(id: string): Promise<void>;
+      ensureThreadStream(id: string): Promise<{ detail: { thread: Record<string, any> } }>;
+      readFullThreadDetail(id: string): Promise<{ thread: Record<string, any> }>;
+      applyLiveCodexNotification(message: CodexJsonRpcMessage, publish: boolean, source: string): boolean;
+      desktopInteractions: Map<string, { compaction: { active: boolean } }>;
+      liveCompactionSources: Map<string, string>;
+      threadStreams: Map<string, { detail: { thread: Record<string, any> } }>;
+      readDesktopActiveTurn(id: string, options: { fresh: boolean }): Promise<{ active: boolean | null; turnId: string }>;
+      isDesktopThreadActive(id: string, options: { fresh: boolean }): Promise<boolean | null>;
+    };
+    const emit = (method: string, eventSource = source) => internal.applyLiveCodexNotification({ method, params: {
+      threadId: "compacting-task", turnId: "compacting-turn",
+      ...(method.startsWith("item/") ? { item: { type: "contextCompaction", id: "compacting-item" } }
+        : { turn: { id: "compacting-turn", status: terminalStatus } }),
+    } }, true, eventSource);
+    try {
+      await controller.start();
+      await internal.ensureThreadStream("compacting-task");
+      emit("item/started");
+      expect(internal.threadStreams.get("compacting-task")?.detail.thread.session.status).toBe("running");
+      now += 5 * 60_000;
+      await internal.refreshDesktopInteractions("compacting-task");
+      expect(await internal.isDesktopThreadActive("compacting-task", { fresh: true })).toBe(true);
+      const detail = await internal.readFullThreadDetail("compacting-task");
+      expect(detail.thread.session.status).toBe("running");
+      expect(detail.thread.activities).toContainEqual(expect.objectContaining({ kind: "context-compaction", payload: expect.objectContaining({ status: "inProgress" }) }));
+      if (source === "desktop-session") {
+        emit("turn/completed", "app-server");
+        expect(internal.desktopInteractions.get("compacting-task")?.compaction.active).toBe(true);
+      }
+      if (terminalStatus === "completed") {
+        emit("item/completed");
+        expect(internal.desktopInteractions.get("compacting-task")?.compaction.active).toBe(false);
+        expect(internal.liveCompactionSources.has("compacting-task")).toBe(false);
+        expect(internal.threadStreams.get("compacting-task")?.detail.thread.session.status).toBe("running");
+      }
+      emit("turn/completed");
+      expect(internal.desktopInteractions.get("compacting-task")?.compaction.active).toBe(false);
+      expect(internal.liveCompactionSources.has("compacting-task")).toBe(false);
+      expect(internal.threadStreams.get("compacting-task")?.detail.thread.session.status).not.toBe("running");
+      expect(await internal.readDesktopActiveTurn("compacting-task", { fresh: true })).toMatchObject({ active: null, turnId: "" });
+      if (source === "desktop-session") {
+        emit("item/started");
+        expect(internal.liveCompactionSources.has("compacting-task")).toBe(false);
+        expect(internal.threadStreams.get("compacting-task")?.detail.thread.session.status).not.toBe("running");
+      }
+      internal.applyLiveCodexNotification({ method: "item/started", params: {
+        threadId: "compacting-task", turnId: "second-turn",
+        item: { type: "contextCompaction", id: "second-compaction" },
+      } }, true, source);
+      internal.applyLiveCodexNotification({ method: "turn/started", params: {
+        threadId: "compacting-task", turn: { id: "third-turn", status: "inProgress" },
+      } }, true, source);
+      expect(internal.desktopInteractions.get("compacting-task")?.compaction.active).toBe(false);
+      expect(internal.liveCompactionSources.has("compacting-task")).toBe(false);
+      expect(internal.threadStreams.get("compacting-task")?.detail.thread.session.activeTurnId).toBe("third-turn");
+    } finally { await controller.stop(); }
+  });
+
   test("projects Codex context compaction as a safe ordered marker", () => {
     const snapshot = projectCodexThreadDetail({
       id: "native-1",
@@ -3393,6 +3596,25 @@ describe("Android Remote Codex projection", () => {
     ]);
     expect(JSON.stringify(snapshot)).not.toContain("must-not-reach-the-phone");
     expect(JSON.stringify(snapshot)).not.toContain("Private replacement history");
+  });
+
+  test.each([false, true])("unverified work is not a fabricated pause unless a terminal timestamp exists: %s", terminalTimestamp => {
+    const detail = projectCodexThreadDetail({
+      id: "uncertain-task", cwd: process.cwd(), modelProvider: "openai",
+      createdAt: 1_786_320_000, updatedAt: 1_786_320_010, status: { type: "idle" },
+      androidRemoteLatestTurnState: "running", androidRemoteLatestTurnId: "uncertain-turn",
+      androidRemoteLatestTurnAt: "2026-08-10T00:00:00Z", androidRemoteActivityUnverified: true,
+      turns: [{ id: "uncertain-turn", status: "interrupted", startedAt: 1_786_320_000,
+        completedAt: terminalTimestamp ? 1_786_320_010 : null, items: [] }],
+    }, 1) as { thread: { session: Record<string, unknown>; latestTurn: Record<string, unknown> | null } };
+    if (terminalTimestamp) {
+      expect(detail.thread.latestTurn?.state).toBe("interrupted");
+      expect(detail.thread.session.status).toBe("idle");
+    } else {
+      expect(detail.thread.latestTurn).toBeNull();
+      expect(detail.thread.session.status).toBe("error");
+      expect(detail.thread.session.lastError).toContain("Task status is unavailable");
+    }
   });
 });
 
@@ -3467,6 +3689,80 @@ describe("Android Remote Codex connection", () => {
       await controller.stop();
     }
   });
+  test.each(["function_call", "dynamicToolCall"])("async rollout questions reach the phone and answer through the current owner: %s", async shape => {
+    const desktopIpc = new FakeDesktopIpcSync();
+    const controller = new AndroidRemoteGatewayController(memoryStore(), { desktopIpcSync: desktopIpc });
+    const internal = controller as any;
+    internal.threadStreams.set("thread-async", createProjectedThreadStreamState(projectCodexThreadDetail({
+      id: "thread-async", turns: [], status: { type: "idle" },
+    }, 1), Date.now()));
+    const projector = new DesktopSessionRecordProjector("thread-async", message => {
+      internal.applyLiveCodexNotification(message, false, "desktop-session");
+    });
+    const consume = (type: string, payload: Record<string, unknown>) => projector.consume({ type, payload });
+    const current = () => internal.threadStreams.get("thread-async").detail.thread;
+    const pending = () => [...internal.pendingDesktopUserInputs.values()] as Array<Record<string, any>>;
+    const questions = [{ title: "Choose scope", options: ["Local", "All"] }, { title: "Notes?" }];
+    const call = shape === "function_call"
+      ? { type: shape, name: "request_user_input_async", id: "fc-async", call_id: "call-async", arguments: JSON.stringify({ questions }) }
+      : { type: shape, tool: "request_user_input_async", id: "fc-async", callId: "call-async", arguments: { questions } };
+    desktopIpc.markDesktopOwned("thread-async");
+    desktopIpc.followerAction = async () => ({ turnId: "turn-async" });
+    const workspace = spyOn(internal, "taskWorkspaceRoot").mockResolvedValue("/workspace");
+    const deliver = spyOn(internal, "steerTurn");
+    const notify = (method: string, item: unknown) => internal.applyLiveCodexNotification({ method, params: {
+      threadId: "thread-async", turnId: "turn-async", item,
+    } }, false, "desktop-session");
+    try {
+      consume("event_msg", { type: "task_started", turn_id: "turn-async" });
+      if (shape === "function_call") consume("response_item", call);
+      else notify("item/started", call);
+      expect(current().hasPendingUserInput).toBe(true);
+      expect(pending()[0]!.questions[1].options).toEqual([]);
+      if (shape === "function_call") {
+        consume("event_msg", { type: "item_completed", turn_id: "turn-async", item: {
+          type: "AgentMessage", id: "call-async", questions, delivery: "async", phase: "final_answer",
+          content: [{ type: "Text", text: "Choose scope\nNotes?" }],
+        } });
+        consume("response_item", { type: "function_call_output", call_id: "call-async", output: '{"accepted":true}' });
+      } else notify("item/completed", { ...call, status: "completed" });
+      expect(current().hasPendingUserInput).toBe(true);
+      expect(pending()).toHaveLength(1);
+      const requestId = pending()[0]!.publicRequestId;
+      const questionIds = pending()[0]!.questions.map((question: any) => question.id);
+      const command = { threadId: "thread-async", requestId, answers: { [questionIds[0]]: "Local", [questionIds[1]]: "Keep it small" } };
+      let items: unknown[] = [call];
+      desktopIpc.followerStateAction = async () => ({ turns: [{ turnId: "turn-async", status: "in_progress", items }] });
+      await expect(internal.respondToUserInput("phone", { ...command, threadId: "other" })).rejects.toThrow("does not belong");
+      await expect(internal.respondToUserInput("phone", { ...command, answers: {} })).rejects.toThrow("Every question");
+      internal.pendingRequests.set("sync-request", { method: "item/tool/requestUserInput", remoteThreadId: "thread-async" });
+      await internal.respondToUserInput("phone", command);
+      expect(deliver).toHaveBeenCalledTimes(1);
+      expect(desktopIpc.followerActions.at(-1)).toMatchObject({ method: "thread-follower-steer-turn", params: {
+        conversationId: "thread-async", expectedTurnId: "turn-async",
+      } });
+      expect(internal.pendingRequests.has("sync-request")).toBe(true);
+      const message = (deliver.mock.calls[0]![1] as any).message.text;
+      expect(message).toBe(`<send_user_message_question_reply>\n${JSON.stringify([
+        { questionItemId: '["request_user_input_async","call-async",0]', question: "Choose scope", answer: "Local" },
+        { questionItemId: '["request_user_input_async","call-async",1]', question: "Notes?", answer: "Keep it small" },
+      ])}\n</send_user_message_question_reply>`);
+      expect(pending()).toHaveLength(0);
+      internal.pendingRequests.clear();
+      await expect(internal.respondToUserInput("phone", command)).rejects.toThrow("no longer waiting");
+      const answer = { type: "userMessage", id: "answer", content: [{ type: "text", text: message }] };
+      notify("item/completed", answer);
+      expect(current().hasPendingUserInput).toBe(false);
+      notify("item/completed", call);
+      expect(pending()).toHaveLength(0);
+      internal.answeredDesktopQuestions.clear();
+      notify("item/started", call);
+      items = [call, answer];
+      await expect(internal.respondToUserInput("phone", command)).rejects.toThrow("no longer waiting");
+      expect(deliver).toHaveBeenCalledTimes(1);
+    } finally { deliver.mockRestore(); workspace.mockRestore(); await controller.stop(); }
+  });
+
   test("live Desktop tools replace inferred rows without duplicate tools or stuck working labels", async () => {
     const codex = new FakeCodexClient();
     const controller = new AndroidRemoteGatewayController(memoryStore(), {
@@ -11670,6 +11966,42 @@ describe("Android Remote Codex connection", () => {
 });
 
 describe("Android bounded first-open history", () => {
+  test("an empty native page recovers saved history and cannot wipe already loaded messages", async () => {
+    const codex = new FakeCodexClient();
+    codex.threads.push({ id: "empty-page", name: "Saved conversation", turns: [] });
+    const original = codex.request.bind(codex);
+    codex.request = async <T>(method: string, params: unknown = {}): Promise<T> => {
+      if (method === "thread/turns/list") return { data: [], nextCursor: null } as T;
+      return original<T>(method, params);
+    };
+    let missing = false;
+    const controller = new AndroidRemoteGatewayController(memoryStore(), {
+      port: 0, hostname: "127.0.0.1", runtime: { start: async () => codex, stop: async () => {} },
+      desktopIpcSync: new FakeDesktopIpcSync(),
+      sessionCommandRecovery: {
+        async enrichThread(seed) {
+          return { ...seed, turns: missing ? [] : [{ id: "saved-turn", status: "completed", startedAt: 100,
+            items: [{ id: "saved-answer", type: "agentMessage", text: "Keep this answer" }] }] };
+        },
+        clear() {},
+      },
+    });
+    try {
+      await controller.start();
+      const internals = controller as any;
+      const detail = await internals.readFullThreadDetail("empty-page", { boundedInitial: true });
+      expect(detail.thread.messages.map((row: any) => row.text)).toEqual(["Keep this answer"]);
+      internals.threadStreams.set("empty-page", { detail });
+      missing = true;
+      await expect(internals.readFullThreadDetail("empty-page", { boundedInitial: true })).rejects.toThrow("Keeping the messages already loaded");
+      expect(internals.threadStreams.get("empty-page").detail.thread.messages).toHaveLength(1);
+      const empty = await internals.readFullThreadDetail("empty-page", { boundedInitial: true, allowEmptyHistory: true });
+      expect(empty.thread.messages).toHaveLength(0);
+    } finally {
+      await controller.stop();
+    }
+  });
+
   test.skipIf(process.platform !== "win32")("Windows empty native page publishes newest messages before older saved history finishes", async () => {
     const codex = new FakeCodexClient();
     codex.threads.push({ id: "empty-native", name: "Saved conversation", cwd: process.cwd(), turns: [] });
@@ -11797,12 +12129,6 @@ describe("Android bounded first-open history", () => {
       const pending = socketMessageMatching(socket, message => message.id === "lineage");
       socket.send(JSON.stringify({ id: "lineage", method: "orchestration.subscribeThread", params: { threadId } }));
       const first = await pending as any;
-      if (process.platform !== "win32" && scenario !== "oversized") {
-        if (scenario === "lineage-error") expect(first.error.message).toBe(lineageError.message);
-        else expect(first.event.snapshot.thread.messages).toHaveLength(1);
-        expect(fullReads).toBe(0);
-        return;
-      }
       expect(first.error).toBeUndefined();
       expect(first.event.snapshot.thread.title).toBe("Recovered task");
       expect(first.event.snapshot.thread.messages.length).toBeGreaterThan(0);
@@ -11854,7 +12180,7 @@ describe("Android bounded first-open history", () => {
     });
     try {
       await controller.start();
-      const shouldRecover = process.platform === "win32" && message.includes("invalid paginated history lineage");
+      const shouldRecover = message.includes("invalid paginated history lineage");
       await expect((controller as any).readFullThreadDetail("missing-history", { boundedInitial: true }))
         .rejects.toThrow(shouldRecover ? "no readable saved history was found" : message);
       expect(recoveryReads).toBe(shouldRecover ? 1 : 0);

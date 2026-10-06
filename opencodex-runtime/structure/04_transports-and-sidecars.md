@@ -8,6 +8,10 @@ come from `agentMessage.questions`, not the tool's immediate acceptance receipt.
 Their IDs match Desktop's `request_user_input_async` item/index encoding. Answers
 use Desktop's question-reply envelope through the existing owner-safe steer/start
 path; every answer is revalidated against fresh Desktop state before delivery.
+When Desktop supplies only a bounded saved-history summary, verify the question
+and any existing answer against the identity-checked rollout lineage instead.
+A missing question in the recent summary alone is not proof that it expired.
+Unverifiable saved history fails closed without sending or resolving the answer.
 Accepted steering replies and ordinary user replies resolve the same questions.
 Android displays a question sheet with options and an optional custom answer,
 then compact question/answer bubbles instead of transport JSON.
@@ -16,6 +20,33 @@ A current, explicitly unfinished `contextCompaction` item keeps the task running
 even if the secondary app-server says idle. Completed or historical compaction
 does not establish activity. A saved `compacted` record denotes completion, not
 the beginning of compaction. Private handoff text is never part of this metadata.
+
+Native `item/started` events do not need an item-level status field: the event
+method establishes live compaction. Retain that evidence across quiet polls until
+the matching item completes or its owning turn terminates. A secondary reader's
+terminal event cannot close a compaction observed from the Desktop owner.
+Bounded saved-history fallbacks carry `androidRemoteHistoryOnly`; they cannot
+verify live activity or overwrite a known unfinished compaction. Installed
+Desktop versions without bounded live-state support may expose only the saved
+completion marker, not the compaction start. In that case report unverified
+activity rather than infer compaction or a pause from silence. Do not restore
+unbounded full-history IPC reads to work around that upstream limitation.
+
+Legacy Desktop routers may reject the read-only bounded-page method with
+`no-client-found` rather than `unknown method`. That specific read can use the
+bounded compatibility reader; this does not release Desktop ownership or allow
+any mutation through the private app-server. Timeouts remain errors.
+Verified continuation discovery applies on Linux, macOS, and Windows. A native
+page may silently omit a middle continuation even when it reports success;
+recover the proven lineage and page locally rather than trusting that cursor.
+
+Zero-filled records in an otherwise verified continuation are retained as an
+explicit history gap, not a reason to discard every readable turn. Questions
+before the last gap remain unverifiable; only recovered question IDs after it
+may pass reply validation, including the existing answered/stale checks.
+Other malformed records still fail closed. Concurrent appends are accepted only
+when a bounded SHA-256 reread proves the scanned prefix unchanged; replacements,
+truncations, and rewritten prefixes invalidate recovery. No rollout is modified.
 
 ## Android sidebar updates
 
@@ -82,7 +113,7 @@ invalidated after persistence succeeds. Revoked or already-replaced repair targe
 
 `rmx onboard` explicitly enables `localNetworkEnabled` and starts the Android gateway on IPv4 LAN interfaces. Existing settings without this opt-in keep the loopback-only bind. Main dashboard port 10100 and default private Codex port 10106 remain unchanged; an incompatible existing private listener can cause selection of another loopback port. Only RFC1918 private IPv4 addresses are advertised; loopback, public, link-local, and host-only adapters are excluded from phone-facing readiness. Direct public peers are rejected; cloudflared still connects through loopback. LAN HTTP requires a trusted network and existing phone authentication.
 
-The local QR becomes available independently of remote-link verification, including when a saved named domain is unavailable. The six-step onboarding flow installs/verifies the Windows tray and checks Codex before offering LAN pairing in step six; only public tunnel verification remains independent. Remote setup continues in the persistent service. A lightweight 15-second interface check announces changed local addresses; it reads no conversation history and spawns no commands.
+The three-stage onboarding flow starts Remodex without requiring optional service or tray installation. Tunnel startup begins automatically after the Android gateway is ready. The dashboard waits for verified remote access by default, then generates one QR with all available LAN addresses and the verified remote address. An explicit same-Wi-Fi action still offers local-only pairing independently of tunnel readiness. Route changes replace an unpaired QR without remounting the dialog or forgetting a newly connected phone. Stale QR responses are discarded; a QR missing the expected verified remote address is not shown as ready. A local-only QR already scanned from another network requires a new scan. A lightweight 15-second interface check announces changed local addresses; it reads no conversation history and spawns no commands.
 
 Paired Android clients verify remote identity and authentication before saving new routes. They retain one pairing while switching Wi-Fi/cellular routes. A changed Quick Tunnel URL cannot reach a phone that is already away and only knows the old URL; reconnecting on Wi-Fi refreshes it, or an optional named domain provides a stable address.
 

@@ -1,5 +1,7 @@
 type JsonRecord = Record<string, unknown>;
 
+export class ProjectedHistoryCursorExpiredError extends Error {}
+
 export const PROJECTED_THREAD_RECENT_BLOCK_LIMIT = 96;
 export const PROJECTED_THREAD_REPLAY_LIMIT = 256;
 
@@ -208,9 +210,24 @@ export function projectedThreadOlderPage(
   const beforeKey = blockKeyFromCursor(cursor);
   if (!beforeKey) throw new Error("The older-message cursor is invalid");
   const end = blocks.findIndex(block => block.key === beforeKey);
-  if (end < 0) throw new Error("The task changed; reopen it before loading older messages");
+  if (end < 0) throw new ProjectedHistoryCursorExpiredError("The saved history no longer contains this page boundary. Refresh the chat and retry.");
   const start = selectionStart(blocks, end, limit);
   return pageFromRange(thread, blocks, start, end);
+}
+
+export async function readProjectedOlderPage(
+  state: ProjectedThreadStreamState,
+  cursor: string,
+  recoverDetail: () => Promise<JsonRecord>,
+): Promise<ProjectedThreadHistoryPage> {
+  try {
+    return projectedThreadOlderPage(state, cursor);
+  } catch (error) {
+    if (!(error instanceof ProjectedHistoryCursorExpiredError)) throw error;
+    const detail = await recoverDetail();
+    if (threadOf(detail).id !== threadOf(state.detail).id) throw new Error("History belongs to a different task");
+    return projectedThreadOlderPage(createProjectedThreadStreamState(detail), cursor);
+  }
 }
 
 /** Bookmark the beginning of a recent saved-file tail before older work arrives. */

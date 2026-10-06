@@ -13,6 +13,7 @@ export type ProjectedTurnLifecycleMarker = {
   turnId?: unknown;
   occurredAt?: unknown;
   lastProgressAt?: unknown;
+  unverified?: boolean;
 };
 
 export const ANDROID_REMOTE_TURN_ERROR_LIMIT = 4096;
@@ -179,6 +180,8 @@ export function projectedTurnLifecycleWins(
       const hasTerminalTime = [latestTurn.completedAt, latestTurn.completed_at,
         latestTurn.endedAt, latestTurn.ended_at, latestTurn.finishedAt, latestTurn.finished_at]
         .some(value => lifecycleTimestampMs(value) !== null);
+      if (markerActive && normalizedCanonicalTurnStatus(latestStatus).includes("interrupt")
+        && !hasTerminalTime && marker.unverified === true) return true;
       if (markerActive && normalizedCanonicalTurnStatus(latestStatus).includes("interrupt")
         && !hasTerminalTime && progressAt !== null && canonicalAt !== null
         && progressAt > canonicalAt) return true;

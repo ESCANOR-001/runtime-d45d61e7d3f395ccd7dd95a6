@@ -1,4 +1,5 @@
 import { open, realpath, stat } from "node:fs/promises";
+import { createHash, type Hash } from "node:crypto";
 import { generatedImagePaths, imageGenerationWaitCell, runningImageGenerationCell } from "./generated-images";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import { deepCamelValue, durationMilliseconds, itemType, normalizedCompletedItem } from "./desktop-thread-item";
@@ -12,11 +13,12 @@ import {
   sanitizePublicTranscriptText,
 } from "./user-message-identity";
 import { resolveThreadSourcePaths } from "./thread-source-paths";
+import { desktopAsyncQuestionItem, desktopQuestionReplyIds } from "./desktop-interactions";
 
 type JsonRecord = Record<string, unknown>;
 
-// Match the live session reader: valid compaction and tool records can exceed 2 MiB.
-const MAX_RECORD_BYTES = 16 * 1024 * 1024;
+const MAX_RECORD_BYTES = 64 * 1024 * 1024;
+const MAX_METADATA_BYTES = 16 * 1024 * 1024;
 const READ_CHUNK_BYTES = 64 * 1024;
 const MAX_COMMAND_BYTES = 64 * 1024;
 const MAX_OUTPUT_BYTES = 64 * 1024;
@@ -107,6 +109,7 @@ type SessionCache = {
   turns: Map<string, TurnRecovery>;
   pendingUserMessage: PendingDurableUserMessage | null;
   touchedAt: number;
+  lastDamagedRecordOrder?: number;
 };
 
 export interface AndroidRemoteCommandRecovery {
@@ -575,6 +578,18 @@ function consumeRecord(
     return;
   }
   if (rowType === "response_item" && payloadType === "message" && payload.role === "user") {
+    const answeredIds = desktopQuestionReplyIds(payload);
+    if (answeredIds.length) {
+      for (const turn of state.cache.recoveredTurns.values()) {
+        for (const entry of turn.items.values()) {
+          if (!desktopAsyncQuestionItem(entry.item)) continue;
+          entry.item = { ...entry.item, androidRemoteAnsweredQuestionIds: [
+            ...(Array.isArray(entry.item.androidRemoteAnsweredQuestionIds) ? entry.item.androidRemoteAnsweredQuestionIds : []),
+            ...answeredIds,
+          ] };
+        }
+      }
+    }
     const metadata = record(payload.internal_chat_message_metadata_passthrough);
     const turnId = stringValue(metadata?.turn_id) || state.currentTurnId;
     const id = stringValue(payload.id).trim();
@@ -620,6 +635,11 @@ function consumeRecord(
   }
   const callId = stringValue(payload.call_id) || stringValue(payload.id);
   if (!callId) return;
+  const asyncQuestion = desktopAsyncQuestionItem(payload);
+  if (asyncQuestion) {
+    rememberRecoveredTurnItem(state.cache, state.currentTurnId, order, asyncQuestion, false);
+    return;
+  }
 
   const planUpdate = planUpdateFromToolCall(payload);
   if (planUpdate) {
@@ -749,6 +769,7 @@ async function scanSession(
   endOffset = cache.size,
   orderBase = 0,
   strict = false,
+  fingerprint?: Hash,
 ): Promise<number> {
   const decoder = new TextDecoder();
   let absoluteOffset = startOffset;
@@ -756,9 +777,11 @@ async function scanSession(
   let parts: Uint8Array[] = [];
   let lineBytes = 0;
   let oversized = false;
+  let zeroFilled = true;
   const state = { currentTurnId: cache.currentTurnId, cache };
 
   const append = (bytes: Uint8Array) => {
+    if (zeroFilled && bytes.some(byte => byte !== 0)) zeroFilled = false;
     lineBytes += bytes.byteLength;
     if (lineBytes > MAX_RECORD_BYTES) {
       oversized = true;
@@ -769,6 +792,18 @@ async function scanSession(
   };
 
   const emit = (nextOffset: number) => {
+    if (strict && lineBytes > 0 && zeroFilled) {
+      cache.lastDamagedRecordOrder = orderBase + lineStart;
+      cache.pendingUserMessage = null;
+      cache.currentTurnId = null;
+      state.currentTurnId = null;
+      lineStart = nextOffset;
+      parts = [];
+      lineBytes = 0;
+      oversized = false;
+      zeroFilled = true;
+      return;
+    }
     if (strict && oversized) throw new Error("Recovery record exceeds the safe read limit");
     if (!oversized && lineBytes > 0) {
       const joined = new Uint8Array(lineBytes);
@@ -790,6 +825,7 @@ async function scanSession(
     parts = [];
     lineBytes = 0;
     oversized = false;
+    zeroFilled = true;
   };
 
   const file = await open(sourcePath, "r");
@@ -803,6 +839,7 @@ async function scanSession(
       );
       if (bytesRead === 0) break;
       const chunk = buffer.subarray(0, bytesRead);
+      fingerprint?.update(chunk);
       let segmentStart = 0;
       for (let index = 0; index < chunk.byteLength; index += 1) {
         if (chunk[index] !== 0x0a) continue;
@@ -818,6 +855,24 @@ async function scanSession(
     await file.close();
   }
   return lineStart;
+}
+
+async function sessionPrefixFingerprint(path: string, end: number): Promise<string> {
+  const file = await open(path, "r");
+  const digest = createHash("sha256");
+  try {
+    const bytes = new Uint8Array(READ_CHUNK_BYTES);
+    let offset = 0;
+    while (offset < end) {
+      const { bytesRead } = await file.read(bytes, 0, Math.min(bytes.length, end - offset), offset);
+      if (!bytesRead) throw new Error("History prefix was truncated");
+      digest.update(bytes.subarray(0, bytesRead));
+      offset += bytesRead;
+    }
+    return digest.digest("hex");
+  } finally {
+    await file.close();
+  }
 }
 
 function inside(root: string, candidate: string): boolean {
@@ -1180,6 +1235,7 @@ export class AndroidRemoteSessionCommandRecovery implements AndroidRemoteCommand
       const recent: SessionCache = {
         ...header, currentTurnId: null, nextTurnPlanMode: false,
         turnsInOrder: [], recoveredTurns: new Map(), turns: new Map(), pendingUserMessage: null,
+        lastDamagedRecordOrder: undefined,
       };
       await scanSession(recent, start, header.canonicalPath, header.size);
       const result = mergeRecoveredCommands(mergeRecoveredTurns({ ...thread, turns: [] }, recent), recent);
@@ -1189,6 +1245,10 @@ export class AndroidRemoteSessionCommandRecovery implements AndroidRemoteCommand
   }
 
   async enrichThread(thread: JsonRecord, sourcePaths: readonly string[] = []): Promise<JsonRecord> {
+    if (Object.hasOwn(thread, "androidRemoteVerifiedAsyncQuestionItemIds")) {
+      thread = { ...thread };
+      delete thread.androidRemoteVerifiedAsyncQuestionItemIds;
+    }
     const threadId = stringValue(thread.id).trim();
     if (!threadId) return thread;
     try {
@@ -1256,7 +1316,7 @@ export class AndroidRemoteSessionCommandRecovery implements AndroidRemoteCommand
       const explicitPath = explicit ? await realpath(resolve(explicit)).catch(() => "") : "";
       const leaf = leaves.length === 1 ? leaves[0] : leaves.find(cache => cache.canonicalPath === explicitPath);
       if (!leaf) throw new Error("Ambiguous continuation");
-      const segments: Array<{ cache: SessionCache; end: number }> = [];
+      const segments: Array<{ cache: SessionCache; end: number; fingerprint?: string }> = [];
       const seen = new Set<string>();
       let current: SessionCache = leaf;
       let end = current.completeOffset;
@@ -1284,20 +1344,28 @@ export class AndroidRemoteSessionCommandRecovery implements AndroidRemoteCommand
         ...leaf, threadId: stringValue(thread.id), currentTurnId: null,
         firstTimestamp: null, lastTimestamp: null, nextTurnPlanMode: false,
         turnsInOrder: [], recoveredTurns: new Map(), turns: new Map(), pendingUserMessage: null,
+        lastDamagedRecordOrder: undefined,
       };
       if (this.lineageReplay?.signature !== signature) {
         let orderBase = 0;
         for (const segment of segments) {
-          const offset = await scanSession(replay, 0, segment.cache.canonicalPath, segment.end, orderBase, true);
+          const digest = createHash("sha256");
+          const offset = await scanSession(replay, 0, segment.cache.canonicalPath, segment.end, orderBase, true, digest);
           if (offset !== segment.end) throw new Error("Continuation cutoff is not a complete record");
+          segment.fingerprint = digest.digest("hex");
           orderBase += segment.end;
         }
         // Don't publish a mixture if a parent was replaced or rewritten while
         // the chain was being replayed. A later refresh will retry normally.
-        for (const { cache } of segments) {
+        for (const { cache, end, fingerprint } of segments) {
           const source = await stat(cache.canonicalPath, { bigint: true });
-          if (source.ino !== cache.inode || source.dev !== cache.device || source.mtimeNs !== cache.mtimeNs || Number(source.size) !== cache.size) {
+          if (source.ino !== cache.inode || source.dev !== cache.device || Number(source.size) < cache.size) {
             throw new Error("History changed during recovery");
+          }
+          if (source.mtimeNs !== cache.mtimeNs || Number(source.size) !== cache.size) {
+            if (Number(source.size) === cache.size || await sessionPrefixFingerprint(cache.canonicalPath, end) !== fingerprint) {
+              throw new Error("History changed during recovery");
+            }
           }
         }
         this.lineageReplay = { signature, cache: replay };
@@ -1309,11 +1377,22 @@ export class AndroidRemoteSessionCommandRecovery implements AndroidRemoteCommand
       const byId = new Map((result.turns as JsonRecord[]).map(turn => [stringValue(turn.id), turn]));
       result.turns = replay.turnsInOrder.flatMap(id => byId.has(id) ? [byId.get(id)!] : []);
       delete result.androidRemoteHistoryRecoveryError;
+      delete result.androidRemoteVerifiedAsyncQuestionItemIds;
+      if (replay.lastDamagedRecordOrder !== undefined) {
+        result.androidRemoteHistoryRecoveryError = "Some older saved records are unreadable. Readable messages are shown; missing content has not been reconstructed.";
+        result.androidRemoteVerifiedAsyncQuestionItemIds = [...replay.recoveredTurns.values()]
+          .flatMap(turn => [...turn.items.values()])
+          .filter(entry => entry.order > replay.lastDamagedRecordOrder!)
+          .flatMap(entry => {
+            const question = desktopAsyncQuestionItem(entry.item);
+            return question ? [stringValue(question.id)] : [];
+          });
+      }
       return result;
     } catch {
       // A partial guessed merge is worse than an explicitly incomplete native
       // snapshot. This warning is surfaced through the existing session error.
-      return { ...thread, androidRemoteHistoryRecoveryError: "Some saved history could not be verified. Showing the Codex history without combining uncertain continuations." };
+      return { ...thread, androidRemoteVerifiedAsyncQuestionItemIds: [], androidRemoteHistoryRecoveryError: "Some saved history could not be verified. Showing the Codex history without combining uncertain continuations." };
     }
   }
 
@@ -1386,8 +1465,8 @@ export class AndroidRemoteSessionCommandRecovery implements AndroidRemoteCommand
       const chunks: Buffer[] = [];
       try {
         let offset = 0;
-        while (offset < Math.min(size, MAX_RECORD_BYTES)) {
-          const chunk = Buffer.alloc(Math.min(READ_CHUNK_BYTES, size - offset, MAX_RECORD_BYTES - offset));
+        while (offset < Math.min(size, MAX_METADATA_BYTES)) {
+          const chunk = Buffer.alloc(Math.min(READ_CHUNK_BYTES, size - offset, MAX_METADATA_BYTES - offset));
           const { bytesRead } = await file.read(chunk, 0, chunk.length, offset);
           if (!bytesRead) break;
           const newline = chunk.subarray(0, bytesRead).indexOf(0x0a);

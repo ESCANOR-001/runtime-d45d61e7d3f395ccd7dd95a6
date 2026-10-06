@@ -148,7 +148,10 @@ beforeEach(() => {
           version: 1,
           id: `pairing-${pairingCalls}`,
           expiresAt: new Date(Date.now() + 300_000).toISOString(),
-          qrPayload: JSON.stringify({ type: "remodex-mobile-pairing", version: 1, pairingToken: `test-token-${pairingCalls}` }),
+          qrPayload: JSON.stringify({ type: "remodex-mobile-pairing", version: 1,
+            localUrls: localNetworkEnabled ? ["http://192.168.1.3:10105"] : [],
+            cloudflareUrl: tunnelRuntimeStatus === "ready" ? tunnelPublicUrl : null,
+            pairingToken: `test-token-${pairingCalls}` }),
         }), { status: 201, headers: { "Content-Type": "application/json" } });
       }
       if (init?.method === "POST" && url === "/api/android-remote/cloudflare/discover") {
@@ -228,29 +231,73 @@ test("the Android Remote hash is a first-class page", () => {
   expect(hashBelongsToPage("android-remote/pair", "android-remote")).toBe(true);
 });
 
-test("shows a Wi-Fi QR immediately and keeps it while remote access prepares or fails", async () => {
+test("waits for a verified remote route by default even when local pairing is ready", async () => {
   controlEnabled = true;
   localNetworkEnabled = true;
   tunnelRuntimeStatus = "starting";
   testWindow.location.hash = "android-remote/pair";
   await mount();
+  expect(container.querySelector("dialog svg[role=img]")).toBeNull();
+  expect(pairingCalls).toBe(0);
+  tunnelRuntimeStatus = "checking";
+  tunnelPublicUrl = "https://checking.trycloudflare.com";
+  await publishStatus();
+  expect(pairingCalls).toBe(0);
+  readyTunnel();
+  await publishStatus();
+  expect(pairingCalls).toBe(1);
+  expect(container.querySelector("dialog svg[role=img]")).toBeTruthy();
+  expect(container.querySelector("dialog")?.textContent).toContain("Remote fallback is ready");
+  await publishStatus();
+  expect(pairingCalls).toBe(1);
+});
+
+test("offers explicit local-only pairing and refreshes it when the verified tunnel changes", async () => {
+  controlEnabled = true;
+  localNetworkEnabled = true;
+  tunnelRuntimeStatus = "starting";
+  testWindow.location.hash = "android-remote/pair";
+  await mount();
+  const local = Array.from(container.querySelectorAll<HTMLButtonElement>("dialog button"))
+    .find(button => button.textContent === "Use same-Wi-Fi QR now");
+  await act(async () => { local!.click(); });
+  await act(async () => { await new Promise(resolve => testWindow.setTimeout(resolve, 30)); });
   const firstQr = container.querySelector("dialog svg[role=img] path")?.getAttribute("d");
   expect(firstQr).toBeTruthy();
   expect(pairingCalls).toBe(1);
   expect(container.textContent).toContain("same trusted Wi-Fi");
   readyTunnel();
   await publishStatus();
-  expect(pairingCalls).toBe(1);
+  expect(pairingCalls).toBe(2);
+  expect(container.querySelector("dialog svg[role=img] path")?.getAttribute("d")).not.toBe(firstQr);
+  tunnelPublicUrl = "https://replacement.trycloudflare.com";
+  await publishStatus();
+  expect(pairingCalls).toBe(3);
   tunnelRuntimeStatus = "error";
   tunnelRuntimeError = "verification_failed";
   await publishStatus();
-  expect(pairingCalls).toBe(1);
-  expect(container.querySelector("dialog svg[role=img] path")?.getAttribute("d")).toBe(firstQr);
+  expect(pairingCalls).toBe(4);
+  expect(container.querySelector("dialog")?.textContent).toContain("remote access is unavailable");
   await act(async () => {
     setClientResourceData(androidRemoteResourceKey(""), { ...status(), reachableAddresses: ["http://192.168.1.4:10105"] });
   });
   await act(async () => { await new Promise(resolve => testWindow.setTimeout(resolve, 30)); });
-  expect(pairingCalls).toBe(2);
+  expect(pairingCalls).toBe(5);
+});
+
+test("keeps a newly connected phone confirmed when tunnel status changes", async () => {
+  localNetworkEnabled = true;
+  readyTunnel();
+  testWindow.location.hash = "android-remote/pair";
+  await mount();
+  clients = [{ id: "new-phone", label: "Phone", deviceType: "mobile", os: "Android", scopes: [],
+    createdAt: new Date().toISOString(), online: true }];
+  await publishStatus();
+  expect(container.querySelector("dialog")?.textContent).toContain("New phone connected");
+  tunnelPublicUrl = "https://replacement.trycloudflare.com";
+  await publishStatus();
+  expect(container.querySelector("dialog")?.textContent).toContain("New phone connected");
+  expect(pairingCalls).toBe(1);
 });
 
 test("generates a non-obvious custom-domain label", () => {
@@ -345,6 +392,7 @@ test("a registered phone that never connects can retry with a fresh QR", async (
   const retry = Array.from(container.querySelectorAll<HTMLButtonElement>("dialog button"))
     .find(button => button.textContent?.includes("Create new code"));
   await act(async () => { retry!.click(); });
+  await act(async () => { await new Promise(resolve => testWindow.setTimeout(resolve, 30)); });
   expect(pairingCalls).toBe(2);
   expect(container.querySelector("dialog svg[role=img]")).toBeTruthy();
   clients = clients.map(client => ({ ...client, online: true }));
@@ -416,7 +464,8 @@ test("an expired QR is hidden with a clear action to create another", async () =
   const originalFetch = globalThis.fetch;
   Object.defineProperty(globalThis, "fetch", { configurable: true, value: async (url: string, init?: RequestInit) => {
     if (url !== "/api/android-remote/pairing") return originalFetch(url, init);
-    return Response.json({ version: 1, id: "expired-preview", expiresAt: new Date(Date.now() - 1_000).toISOString(), qrPayload: "expired preview" });
+    return Response.json({ version: 1, id: "expired-preview", expiresAt: new Date(Date.now() - 1_000).toISOString(),
+      qrPayload: JSON.stringify({ cloudflareUrl: tunnelPublicUrl }) });
   } });
   testWindow.location.hash = "android-remote/pair";
   await mount();
@@ -427,6 +476,22 @@ test("an expired QR is hidden with a clear action to create another", async () =
     .find(button => button.textContent?.includes("Create new code"));
   await act(async () => { refresh!.click(); });
   expect(container.querySelector("dialog svg[role=img]")).toBeTruthy();
+});
+
+test("does not label a local-only QR as remote-ready if the tunnel fails during creation", async () => {
+  readyTunnel();
+  localNetworkEnabled = true;
+  const originalFetch = globalThis.fetch;
+  Object.defineProperty(globalThis, "fetch", { configurable: true, value: async (url: string, init?: RequestInit) => {
+    if (url !== "/api/android-remote/pairing") return originalFetch(url, init);
+    return Response.json({ version: 1, id: "local-only", expiresAt: new Date(Date.now() + 300_000).toISOString(),
+      qrPayload: JSON.stringify({ cloudflareUrl: null, localUrls: ["http://192.168.1.3:10105"] }) });
+  } });
+  testWindow.location.hash = "android-remote/pair";
+  await mount();
+  expect(container.querySelector("dialog svg[role=img]")).toBeNull();
+  expect(container.querySelector("dialog")?.textContent).toContain("The pairing code could not be created");
+  expect(container.querySelector("dialog")?.textContent).not.toContain("Remote fallback is ready");
 });
 
 test("renders honest gateway, address, desktop, and empty-phone states", async () => {

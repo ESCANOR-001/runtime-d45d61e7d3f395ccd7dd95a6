@@ -34,8 +34,15 @@ function localPairingReady(status: AndroidRemoteStatus): boolean {
 
 function pairingConnectionKey(status: AndroidRemoteStatus): string {
   // This is an internal cache key; it is never displayed to the user.
-  // eslint-disable-next-line local-i18n/no-hardcoded-ui-strings
-  return localPairingReady(status) ? `wifi:${status.reachableAddresses.join(",")}` : `${status.tunnel.runtime.status}:${status.tunnel.runtime.error}:${status.tunnel.runtime.publicUrl}:${status.tunnel.configuration.mode}`;
+  return JSON.stringify([status.controlEnabled, status.pairingAvailable, status.gateway.status,
+    status.localNetworkEnabled, status.reachableAddresses, verifiedPairingTunnel(status)]);
+}
+
+function verifiedPairingTunnel(status: AndroidRemoteStatus): string | null {
+  const runtime = status.tunnel.runtime;
+  return runtime.status === "ready" && runtime.error === null
+    && runtime.mode === status.tunnel.configuration.mode && runtime.publicUrl?.startsWith("https://")
+    ? runtime.publicUrl : null;
 }
 
 function SetupDialog({
@@ -59,7 +66,8 @@ function SetupDialog({
 }) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const { t } = useI18n();
-  const [pairing, setPairing] = useState<AndroidRemotePairing | null>(null);
+  const [pairingResult, setPairing] = useState<{ key: string; value: AndroidRemotePairing } | null>(null);
+  const [allowLocalOnly, setAllowLocalOnly] = useState(false);
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
   const [now, setNow] = useState(0);
@@ -70,12 +78,14 @@ function SetupDialog({
   const newClients = status.clients.filter(client => !existingClients.has(client.id));
   const connected = !statusFailed && newClients.some(client => client.online);
   const registered = newClients.length > 0;
+  const connectionKey = pairingConnectionKey(status);
+  const pairing = pairingResult?.key === connectionKey ? pairingResult.value : null;
+  const remoteUrl = verifiedPairingTunnel(status);
+  const remoteReady = remoteUrl !== null;
+  const localReady = localPairingReady(status);
   const canPair = status.pairingAvailable && status.controlEnabled
     && status.gateway.status === "ready"
-    && (localPairingReady(status) || (status.tunnel.runtime.status === "ready"
-      && status.tunnel.runtime.error === null
-      && status.tunnel.runtime.mode === status.tunnel.configuration.mode
-      && status.tunnel.runtime.publicUrl?.startsWith("https://")));
+    && (remoteReady || (allowLocalOnly && localReady));
 
   const requestPairing = useCallback(async () => {
     if (!canPair || requestRef.current) return;
@@ -92,7 +102,12 @@ function SetupDialog({
     try {
       const next = await createAndroidRemotePairing(apiBase, controller.signal, replaceClientId);
       if (controller.signal.aborted || requestRef.current !== controller) return;
-      setPairing(next);
+      if (remoteUrl && JSON.parse(next.qrPayload).cloudflareUrl !== remoteUrl) {
+        setPairing(null);
+        setFailed(true);
+        return;
+      }
+      setPairing({ key: connectionKey, value: next });
       setNow(Date.now());
     } catch {
       if (requestRef.current !== controller) return;
@@ -105,7 +120,7 @@ function SetupDialog({
         setLoading(false);
       }
     }
-  }, [apiBase, canPair, replaceClientId]);
+  }, [apiBase, canPair, replaceClientId, connectionKey, remoteUrl]);
 
   useEffect(() => {
     return () => {
@@ -121,9 +136,14 @@ function SetupDialog({
   }, []);
 
   useEffect(() => {
+    if (registered) return;
     const timer = window.setTimeout(() => void requestPairing(), 0);
-    return () => window.clearTimeout(timer);
-  }, [requestPairing]);
+    return () => {
+      window.clearTimeout(timer);
+      requestRef.current?.abort();
+      requestRef.current = null;
+    };
+  }, [requestPairing, registered]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -177,9 +197,8 @@ function SetupDialog({
         {connected && <Notice tone="ok">{t("remote.dialog.connectedHint")}</Notice>}
         {repairClient && <Notice tone="warn">{t("remote.repairHint", { name: repairClient.label })}</Notice>}
         {registered && !connected && canPair && !repairClient && (
-          <button type="button" className="btn btn-ghost btn-sm" disabled={loading || statusFailed} onClick={() => {
+          <button type="button" className="btn btn-ghost btn-sm" disabled={statusFailed} onClick={() => {
             setExistingClients(new Set(status.clients.map(client => client.id)));
-            void requestPairing();
           }}>
             <IconRefresh aria-hidden="true" /> {t("remote.dialog.newCode")}
           </button>
@@ -192,9 +211,18 @@ function SetupDialog({
           </button>
         )}
 
-        {!canPair && status.controlEnabled && status.gateway.status === "ready" && (
+        {!canPair && !localReady && status.controlEnabled && status.gateway.status === "ready" && (
           <Notice tone="warn">{t("remote.dialog.tunnelPendingHint")}</Notice>
         )}
+
+        {!registered && !remoteReady && localReady && status.controlEnabled && status.gateway.status === "ready" && (
+          <Notice tone="warn">
+            <p>{t(status.tunnel.runtime.status === "error" ? "remote.dialog.localOnlyFailed" : "remote.dialog.localOnlyPreparing")}</p>
+            {!allowLocalOnly && <button type="button" className="btn btn-ghost btn-sm" onClick={() => setAllowLocalOnly(true)}>{t("remote.dialog.useLocalOnly")}</button>}
+          </Notice>
+        )}
+
+        {!registered && canPair && remoteReady && pairing && !expired && <Notice tone="ok">{t("remote.dialog.fallbackReady")}</Notice>}
 
         {!canPair && (!status.controlEnabled || status.gateway.status !== "ready") && (
           <div className="android-remote-readiness" role="status">
@@ -216,7 +244,7 @@ function SetupDialog({
           </div>
         )}
 
-        {!registered && canPair && status.localNetworkEnabled && status.reachableAddresses.length > 0 && <Notice tone="ok">{t("remote.local.pairHint")}</Notice>}
+        {!registered && canPair && !remoteReady && <Notice tone="ok">{t("remote.local.pairHint")}</Notice>}
         {!registered && canPair && loading && !pairing && (
           <div className="android-remote-pairing-state" role="status">
             <IconRefresh className="spin-icon" aria-hidden="true" />
@@ -1142,7 +1170,7 @@ export default function AndroidRemote({ apiBase }: { apiBase: string }) {
       ) : null}
 
       {setupOpen && status && <SetupDialog
-        key={`${repairClient?.id ?? "new"}:${status.pairingAvailable}:${status.controlEnabled}:${status.gateway.status}:${pairingConnectionKey(status)}`}
+        key={repairClient?.id ?? "new"}
         apiBase={apiBase} status={status} onClose={closeSetup}
         repairClient={repairClient}
         statusFailed={state.showError || actionError}
