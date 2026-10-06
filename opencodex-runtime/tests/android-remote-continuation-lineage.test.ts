@@ -96,10 +96,11 @@ for (const rewrite of [false, true]) {
     const leaf = fixture.path("task", "leaf");
     const body = encode([meta("task", "parent", Buffer.byteLength(prefix)), ...events("chosen")]);
     await writeFile(leaf, body);
+    const canonicalLeaf = await fsPromises.realpath(leaf);
     const originalStat = fsPromises.stat;
     let leafChecks = 0;
     const statSpy = spyOn(fsPromises, "stat").mockImplementation((async (...args: Parameters<typeof fsPromises.stat>) => {
-      if (args[0] === leaf && args[1]?.bigint && ++leafChecks === 2) {
+      if (args[0] === canonicalLeaf && args[1]?.bigint && ++leafChecks === 2) {
         if (rewrite) await writeFile(leaf, body.replaceAll("chosen", "edited"));
         await appendFile(leaf, encode(events("appended")));
       }
