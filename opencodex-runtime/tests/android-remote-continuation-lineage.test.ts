@@ -19,7 +19,7 @@ const events = (id: string, timestamp = "2026-09-06T08:00:00Z") => [
   { timestamp, type: "event_msg", payload: { type: "task_complete", turn_id: id } },
 ];
 async function setup() {
-  const home = await mkdtemp(join(tmpdir(), "remodex-lineage-"));
+  const home = await fsPromises.realpath(await mkdtemp(join(tmpdir(), "remodex-lineage-")));
   roots.push(home);
   await mkdir(join(home, "sessions"));
   const path = (logical: string, physical: string) => join(home, "sessions", `rollout-${logical}_${physical}.jsonl`);
