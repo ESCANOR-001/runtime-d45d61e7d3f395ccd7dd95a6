@@ -314,7 +314,7 @@ function isOwnedSchedulerCreate(args: string[]): boolean {
   const taskIndex = normalized.indexOf("/tn");
   const xmlIndex = normalized.indexOf("/xml");
   return normalized[0] === "/create"
-    && normalized[taskIndex + 1] === "opencodex-proxy"
+    && ["opencodex-proxy", "remodex-connect"].includes(normalized[taskIndex + 1] ?? "")
     && taskIndex > 0
     && xmlIndex > 0
     && Boolean(args[xmlIndex + 1])

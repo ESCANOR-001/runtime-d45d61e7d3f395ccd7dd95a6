@@ -9,6 +9,7 @@ import type { BunRuntimeSource } from "../lib/bun-runtime";
 import { forgetEphemeralSecretPath, hardenSecretDir, hardenSecretPath } from "../lib/windows-secret-acl";
 import { recordOwnedConfigPath } from "../lib/config-ownership";
 import { launchWindowsProcessWithoutInheritedHandles } from "../lib/windows-no-inherit-process";
+import { isConnectRuntime } from "../connect/mode";
 
 const RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const RUN_PARENT_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion";
@@ -30,6 +31,7 @@ export interface WindowsTrayEntry {
   script: string;
   codexHome: string;
   opencodexHome: string;
+  connectOnly?: boolean;
 }
 
 interface WindowsTrayState extends WindowsTrayEntry {
@@ -86,17 +88,20 @@ function currentCodexHome(): string {
   return raw ? resolve(expandUserPath(raw)) : join(homedir(), ".codex");
 }
 
-function currentEntry(): WindowsTrayEntry {
+export function currentWindowsTrayEntry(): WindowsTrayEntry {
   const runtime = durableBunRuntime();
   return {
     bun: runtime.path,
     bunRuntimeSource: runtime.source,
-    cli: join(import.meta.dir, "..", "cli", "index.ts"),
+    cli: join(import.meta.dir, "..", "cli", isConnectRuntime() ? "connect.ts" : "index.ts"),
     script: installedTrayScriptPath(),
     codexHome: currentCodexHome(),
     opencodexHome: getConfigDir(),
+    connectOnly: isConnectRuntime(),
   };
 }
+
+const currentEntry = currentWindowsTrayEntry;
 
 export function windowsTrayRunValue(opencodexHome: string): string {
   const normalized = resolve(opencodexHome).replace(/[\\/](?:\.)?[\\/]*$/, "").toLowerCase();
@@ -151,6 +156,7 @@ export function windowsTrayProcessArgs(entry: WindowsTrayEntry, mode: "Run" | "S
     "-Mode", mode,
   ];
   if (Number.isSafeInteger(hostPid) && (hostPid ?? 0) > 0) args.push("-HostPid", String(hostPid));
+  if (entry.connectOnly) args.push("-ConnectOnly");
   return args;
 }
 
@@ -184,6 +190,7 @@ export function buildWindowsTrayPowerShellCommand(entry: WindowsTrayEntry, power
     "-CodexHome", quoteRunValue(entry.codexHome),
     "-OpenCodexHome", quoteRunValue(entry.opencodexHome),
     "-Mode", "Run",
+    ...(entry.connectOnly ? ["-ConnectOnly"] : []),
   ].join(" ");
 }
 

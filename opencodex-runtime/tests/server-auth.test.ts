@@ -94,13 +94,14 @@ function poolProviders(): OcxConfig["providers"] {
   };
 }
 
-function redirectCanonicalCodexTo(baseUrl: string): void {
+function redirectCanonicalCodexTo(baseUrl: string, reply?: (request: Request) => Promise<Response>): void {
   globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
     const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     const url = new URL(requestUrl);
     const prefix = "/backend-api/codex";
     if (url.hostname === "chatgpt.com" && url.pathname.startsWith(prefix)) {
       const target = new URL(`${url.pathname.slice(prefix.length)}${url.search}`, baseUrl);
+      if (reply) return reply(new Request(target, init));
       return originalGlobalFetch(target, init);
     }
     return originalGlobalFetch(input, init);
@@ -194,6 +195,7 @@ async function startPoolRetryHarness(
     pausedAccountIds?: string[];
     reauthAccountIds?: string[];
     omitCredentialAccountIds?: string[];
+    directReply?: boolean;
   } = {},
 ): Promise<PoolRetryHarness> {
   await removeTestDirBestEffort(TEST_DIR);
@@ -213,15 +215,13 @@ async function startPoolRetryHarness(
   clearCodexWebSocketRegistry();
 
   const dispatches: string[] = [];
-  const upstream = Bun.serve({
-    port: 0,
-    async fetch(request) {
-      const accountId = request.headers.get("chatgpt-account-id") ?? "missing";
-      dispatches.push(accountId);
-      return reply(accountId, request);
-    },
-  });
-  redirectCanonicalCodexTo(upstream.url.toString());
+  const handleUpstream = async (request: Request): Promise<Response> => {
+    const accountId = request.headers.get("chatgpt-account-id") ?? "missing";
+    dispatches.push(accountId);
+    return reply(accountId, request);
+  };
+  const upstream = Bun.serve({ port: 0, fetch: handleUpstream });
+  redirectCanonicalCodexTo(upstream.url.toString(), options.directReply ? handleUpstream : undefined);
   const redirectedFetch = globalThis.fetch;
 
   const secondAccount = options.secondAccount ?? true;
@@ -2417,21 +2417,21 @@ describe("server local API auth", () => {
     }
   });
 
-  // Stall past BOUNDED_BODY_TIMEOUT_MS (5s). The old 7s test budget left ~1.9s of
-  // headroom and timed out on windows-latest under runner contention.
+  // Start the stall when the inspected body is consumed. A network fixture can
+  // buffer the tiny 400 body or spend the 100ms margin before inspection starts,
+  // so its server-side timer does not prove the body reader reached its deadline.
   test("stalled 400 body timeout never authorizes a pool retry", async () => {
     const prefix = unsupportedModelBody().slice(0, -1);
     const suffix = "}";
     const body = prefix + suffix;
     const harness = await startPoolRetryHarness(() => rejectionResponse(new ReadableStream({
-      start(controller) {
+      async pull(controller) {
         controller.enqueue(new TextEncoder().encode(prefix));
-        setTimeout(() => {
-          controller.enqueue(new TextEncoder().encode(suffix));
-          controller.close();
-        }, 5_100);
+        await Bun.sleep(5_100);
+        controller.enqueue(new TextEncoder().encode(suffix));
+        controller.close();
       },
-    })));
+    }, { highWaterMark: 0 })), { directReply: true });
     try {
       const response = await harness.request();
       expect(response.status).toBe(400);

@@ -22,6 +22,13 @@ import {
 } from "../src/lib/windows-elevation";
 
 describe("windows elevation helpers", () => {
+  test.each(["opencodex-proxy", "remodex-connect"])("owned %s task requests elevation after create is denied", taskName => {
+    const error = Object.assign(new Error("Command failed"), { stderr: "Access is denied.", status: 1 });
+    const failure = toWindowsSchtasksError(error, ["/create", "/tn", taskName, "/xml", "task.xml", "/f"]);
+    expect(failure.reason).toBe("access-denied");
+    expect(isWindowsSchtasksCreateAccessDenied(failure.message)).toBe(true);
+    expect(toWindowsSchtasksError(error, ["/run", "/tn", taskName]).machineMarker).toBeNull();
+  });
   test("detects English and German access-denied text", () => {
     expect(isWindowsAccessDenied("FEHLER: Zugriff verweigert")).toBe(true);
     expect(isWindowsAccessDenied("ERROR: Access is denied.")).toBe(true);

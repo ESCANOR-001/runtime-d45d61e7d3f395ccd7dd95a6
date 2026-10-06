@@ -45,10 +45,12 @@ for (const platform of ["win32", "linux", "darwin"]) {
     await act(async () => render());
     expect(requests.map(request => request.method)).toEqual(["GET"]);
     expect(container.textContent).toContain("Not needed for QR pairing");
-    window.confirm = () => false;
     await act(async () => actionButton().click());
     expect(requests).toHaveLength(1);
-    window.confirm = message => { expect(message).toContain("briefly disconnect"); return true; };
+    expect(container.querySelector(".advanced-service-confirm")?.textContent).toContain("briefly disconnect");
+    await act(async () => container.querySelector<HTMLButtonElement>(".advanced-service-confirm .btn-ghost")!.click());
+    expect(requests).toHaveLength(1);
+    await act(async () => actionButton().click());
     await act(async () => actionButton().click());
     expect(requests.filter(request => request.method === "POST")).toEqual([{ method: "POST", body: { action: "install", confirm: true } }]);
     expect(container.textContent).toContain("Background service is ready");
@@ -61,8 +63,8 @@ test("an in-flight service action shows progress and failed confirmation does no
   let finish!: (response: Response) => void;
   globalThis.fetch = (async (_url, options) => options?.method === "POST"
     ? new Promise<Response>(resolve => { finish = resolve; }) : Response.json({ ...initial, platform: "linux" })) as typeof fetch;
-  window.confirm = () => true;
   await act(async () => render());
+  await act(async () => actionButton().click());
   await act(async () => actionButton().click());
   expect(actionButton().disabled).toBe(true);
   expect(container.textContent).toContain("Setting up the service — please wait");
@@ -78,4 +80,45 @@ test("unavailable status and conflicting service ownership never enable installa
     await act(async () => root.render(<LanguageProvider><AdvancedSettings key={response.status} apiBase={`/${response.status}`} /></LanguageProvider>));
     expect(actionButton().disabled).toBe(true);
   }
+});
+
+test("a refresh keeps the known status visible and does not disable a valid service action", async () => {
+  let finish!: (response: Response) => void;
+  let calls = 0;
+  globalThis.fetch = (async () => ++calls === 1 ? Response.json(initial)
+    : new Promise<Response>(resolve => { finish = resolve; })) as typeof fetch;
+  await act(async () => render());
+  await act(async () => container.querySelector<HTMLButtonElement>(".btn-ghost")!.click());
+  expect(container.textContent).toContain("Background service is not installed");
+  expect(container.textContent).not.toContain("Checking service status");
+  expect(actionButton().disabled).toBe(false);
+  await act(async () => finish(Response.json(initial)));
+});
+
+test("a failed status request stays visible throughout the next retry", async () => {
+  let finish!: (response: Response) => void;
+  let calls = 0;
+  globalThis.fetch = (async () => ++calls === 1 ? new Response(null, { status: 503 })
+    : new Promise<Response>(resolve => { finish = resolve; })) as typeof fetch;
+  await act(async () => render());
+  expect(container.textContent).toContain("Could not read service status");
+  await act(async () => container.querySelector<HTMLButtonElement>(".btn-ghost")!.click());
+  expect(container.textContent).toContain("Could not read service status");
+  expect(container.textContent).not.toContain("Checking service status");
+  expect(actionButton().disabled).toBe(true);
+  await act(async () => finish(Response.json(initial)));
+  expect(actionButton().disabled).toBe(false);
+});
+
+test("a recovered healthy service clears an earlier unconfirmed action warning", async () => {
+  let installed = false;
+  globalThis.fetch = (async (_url, options) => {
+    if (options?.method === "POST") { installed = true; throw new Error("Server restarted"); }
+    return Response.json({ ...initial, installed, healthy: installed });
+  }) as typeof fetch;
+  await act(async () => render());
+  await act(async () => actionButton().click());
+  await act(async () => actionButton().click());
+  expect(container.textContent).toContain("Background service is ready");
+  expect(container.textContent).not.toContain("The result could not be confirmed");
 });

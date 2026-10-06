@@ -12,13 +12,6 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const OWNED_PROCESS_TERM_GRACE_MS = 1_000;
 const OWNED_PROCESS_KILL_GRACE_MS = 1_000;
 
-async function unusedLoopbackPort(): Promise<number> {
-  const reservation = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response(null, { status: 503 }) });
-  const port = reservation.port!;
-  await reservation.stop(true);
-  return port;
-}
-
 const APP_SERVER_PROFILE_KEYS = new Set([
   "model_provider",
   "openai_base_url",
@@ -473,7 +466,7 @@ export class AndroidCodexRuntime {
   constructor(
     private port = DEFAULT_CODEX_APP_SERVER_PORT,
     private readonly selectRuntime: () => AndroidRuntimeSelection | Promise<AndroidRuntimeSelection> = resolveAndroidRuntimeInBackground,
-    private readonly alternatePort: (() => Promise<number>) | undefined = port === DEFAULT_CODEX_APP_SERVER_PORT ? unusedLoopbackPort : undefined,
+    private readonly alternatePort: (() => Promise<number>) | undefined = undefined,
   ) {}
 
   status(): AndroidCodexRuntimeStatus {

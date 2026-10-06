@@ -4,6 +4,7 @@ import { closeSync, existsSync, openSync, readFileSync, renameSync, statSync, un
 import { join } from "node:path";
 import { getConfigDir } from "../config";
 import { isProcessAlive } from "../lib/process-control";
+import { spawnWindowsProcessWithoutInheritedHandlesAsync } from "../lib/windows-no-inherit-process";
 
 type SetupJob = { id: string; pid: number; startedAt: number; status: "running" | "succeeded" | "failed" | "blocked" };
 const jobPath = () => join(getConfigDir(), "connect-service-setup.json");
@@ -22,8 +23,10 @@ export function serviceSetupState(): "idle" | "running" | "indeterminate" | "blo
     const job = readServiceSetup();
     if (!job) return "idle";
     if (job.status === "blocked") return "blocked";
+    if (job.status === "succeeded") return "idle";
+    if (job.status === "failed") return "failed";
     if (isProcessAlive(job.pid)) return Date.now() - job.startedAt > 180_000 ? "indeterminate" : "running";
-    return job.status === "succeeded" ? "idle" : "failed";
+    return "failed";
   } catch { return "blocked"; }
 }
 
@@ -47,6 +50,16 @@ export async function startServiceSetup(action: "install" | "repair", spawnFn: t
     writeFileSync(lock, JSON.stringify({ id, pid: process.pid, startedAt, status: "running" }));
     const env = { ...process.env };
     delete env.OCX_SERVICE;
+    if (process.platform === "win32" && spawnFn === spawn) {
+      // A Bun child can inherit the dashboard's listening socket. The worker
+      // must outlive that dashboard without keeping its old port occupied.
+      const child = await spawnWindowsProcessWithoutInheritedHandlesAsync(
+        process.execPath, [join(import.meta.dir, "service-worker.ts"), id, action],
+        { environment: { OCX_SERVICE: "" } },
+      );
+      writeFileSync(jobPath(), JSON.stringify({ id, pid: child.pid, startedAt, status: "running" }), { mode: 0o600 });
+      return;
+    }
     await new Promise<void>((resolve, reject) => {
       const child = spawnFn(process.execPath, [join(import.meta.dir, "service-worker.ts"), id, action], {
         detached: true, windowsHide: true, shell: false, env, stdio: ["ignore", log, log],

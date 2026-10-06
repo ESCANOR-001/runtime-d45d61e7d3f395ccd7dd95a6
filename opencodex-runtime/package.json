@@ -1,6 +1,6 @@
 {
   "name": "@remodex/rmx",
-  "version": "1.2.24",
+  "version": "1.2.25",
   "description": "Remodex Connect — native ChatGPT/Codex remote access and local activity",
   "displayName": "Remodex",
   "type": "module",
@@ -78,7 +78,8 @@
     "@hono/node-server": "2.1.0",
     "fast-uri": "3.1.7",
     "hono": "4.13.1",
-    "ip-address": "^10.4.0"
+    "ip-address": "^10.4.0",
+    "proxy-addr": "2.0.8"
   },
   "keywords": [
     "codex",

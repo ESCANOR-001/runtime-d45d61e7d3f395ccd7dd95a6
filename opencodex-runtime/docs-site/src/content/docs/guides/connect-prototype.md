@@ -21,7 +21,7 @@ Update checks distinguish network failures, timeouts, unavailable release channe
 
 On Windows, macOS, and Linux, `rmx onboard` prepares local settings, reuses a verified running instance or starts a hidden background process for the current user, then verifies a usable connection before reporting QR pairing ready. It does not install, repair, or require an operating-system service. Progress messages continue while waiting. Existing Codex settings remain untouched.
 
-Fresh Connect profiles prefer port 10110. If the preferred dashboard port is occupied when onboarding starts the user runtime, setup selects an available port and saves it only in Connect's own settings. Other listeners are left running. An explicit `rmx start --port` or installed-service port is not automatically moved. Gateway startup uses the same bounded retries on Windows, macOS, and Linux, showing a starting state while retrying.
+Fresh Connect profiles use dashboard port 10100, Android gateway port 10105, and private Codex port 10106. Onboarding, service setup, recovery, and restart keep their configured ports. If a port is occupied or its existing peer is incompatible, setup reports the conflict rather than silently switching ports. Other listeners are left running. Gateway startup uses the same bounded retries on Windows, macOS, and Linux, showing a starting state while retrying.
 
 Advanced manual tunnel setup displays the actual Android gateway address returned by the server. Use that address, not the management dashboard port or the old app's gateway port.
 
@@ -32,6 +32,12 @@ This user-level process is not a service: it has no guaranteed restart after a c
 Advanced Settings contains only the optional background-service setup, not provider or Codex configuration. Opening the page reads status. Enabling or repairing a stopped service requires an explicit confirmation; Windows may then show an OS administrator prompt, while macOS and Linux use per-user service managers. Setup runs in a separate hidden worker so it can complete when the current server stops. Status survives the server handoff; duplicate actions are blocked while setup or elevation reconciliation remains pending. On failure, the worker attempts to restart the ordinary user-level server without claiming service installation succeeded.
 
 Do not repair a currently supervised server from inside its own service process: its service manager could terminate the repair worker along with the server. For that case, inspect `rmx service status` and run `rmx service repair` separately on the computer. Unsupported service managers or a service owned by another profile are not changed. No administrator password is collected by the dashboard.
+
+## Windows tray icon
+
+Run `rmx tray install` to add the Remodex icon beside the Windows clock and start it automatically when you sign in. The tray is separate from the background service: enabling the service alone does not install the icon. Windows may place it under the hidden-icons arrow.
+
+The Connect tray opens the dashboard, shows the server status, and starts, stops, or restarts Remodex on its configured port. It does not offer Codex configuration or desktop-restart controls. Its saved launcher keeps Connect mode after signing in again. Use `rmx tray status` to check it, `rmx tray start` to reopen it, or `rmx tray uninstall` to remove only the tray.
 
 ## Current activity and usage
 
@@ -50,3 +56,5 @@ The Connect entry point refuses provider/configuration mutation even when older 
 Connect settings and pairing records default to `~/.remodex-connect`; native activity is read from the existing Codex home. An isolated preview must use its own runtime profile and unoccupied ports, not the old service's settings. Storage cleanup is still an explicit user action and can delete the selected history.
 
 This fork still needs fresh Windows installation and real-phone pairing checks before publication. It does not establish that a pairing or trial-conversion issue is resolved.
+
+On Windows, service setup checks both the current and legacy task names. It repairs and reuses an existing task whose launcher belongs to the current profile, and creates a new task only when neither exists. Duplicate tasks, an unreadable task list, or another profile's launcher require attention before setup proceeds. The Advanced Settings page retains the last known status during a refresh and keeps a failed status request visible while retrying.

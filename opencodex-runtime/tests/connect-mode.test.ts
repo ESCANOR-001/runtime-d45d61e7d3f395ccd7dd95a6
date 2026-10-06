@@ -56,5 +56,8 @@ test("removed provider, account, model, and integration routes cannot mutate con
   expect(connectManagementRouteAllowed("/api/update/check", "GET")).toBe(true);
   expect(connectManagementRouteAllowed("/api/update/check", "POST")).toBe(false);
   expect(connectManagementRouteAllowed("/api/update/run", "POST")).toBe(false);
+  expect(connectManagementRouteAllowed("/api/system/restart", "POST")).toBe(true);
+  expect(connectManagementRouteAllowed("/api/system/restart", "PUT")).toBe(false);
+  expect(connectManagementRouteAllowed("/api/system/env", "POST")).toBe(false);
   expect(connectManagementRouteAllowed("/api/android-remote/pairing", "POST")).toBe(true);
 });

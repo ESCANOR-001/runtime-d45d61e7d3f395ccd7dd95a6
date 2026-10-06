@@ -58,6 +58,10 @@ test("Connect startup, authenticated activity, and shutdown leave existing clien
     if (!ready) throw new Error(`Isolated startup failed: ${output}`);
     expect((await request("/api/connect/activity")).status).toBe(401);
     const headers = { "x-opencodex-api-key": token };
+    expect((await request("/api/system/restart", { method: "POST" })).status).toBe(401);
+    const restartHeaders = { ...headers, "x-opencodex-restart-expected-pid": "2147483647" };
+    expect((await request("/api/system/restart", { method: "POST", headers: restartHeaders })).status).toBe(409);
+    expect((await request("/api/system/restart", { method: "POST", headers: { ...restartHeaders, Origin: "https://unrelated.example" } })).status).toBe(403);
     const response = await request("/api/connect/activity", { headers });
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-store");

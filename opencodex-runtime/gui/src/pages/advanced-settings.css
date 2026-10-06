@@ -1,0 +1,22 @@
+.advanced-settings { display: grid; gap: 28px; max-width: 880px; padding-block: 24px; }
+.advanced-settings-heading { display: grid; gap: 10px; }
+.advanced-settings-heading h2, .advanced-settings-heading p { margin: 0; }
+.advanced-service-card { display: grid; gap: 22px; padding: 28px; }
+.advanced-service-heading { display: grid; gap: 10px; }
+.advanced-service-heading h3, .advanced-service-heading p { margin: 0; }
+.advanced-service-heading h3 { font-size: 18px; }
+.advanced-service-heading p, .advanced-service-help p { color: var(--muted); line-height: 1.65; max-width: 70ch; }
+.advanced-service-status { display: flex; align-items: flex-start; gap: 12px; padding: 16px 18px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+.advanced-service-status p { margin: 0; line-height: 1.6; }
+.advanced-service-indicator { flex: 0 0 8px; height: 8px; margin-top: 7px; border-radius: 50%; background: var(--muted); }
+.advanced-service-status[data-tone="success"] .advanced-service-indicator { background: light-dark(#218345, #6dd998); }
+.advanced-service-status[data-tone="error"] .advanced-service-indicator { background: light-dark(#b44727, #ff9b7f); }
+.advanced-service-actions { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+.advanced-service-actions .btn { min-height: 40px; }
+.advanced-service-confirm { display: grid; gap: 16px; padding: 18px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+.advanced-service-confirm p { margin: 0; line-height: 1.65; }
+.advanced-service-help { display: grid; gap: 12px; }
+.advanced-service-help p { margin: 0; }
+.advanced-service-diagnostics { border-top: 1px solid var(--border); padding-top: 20px; display: flex; flex-wrap: wrap; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; }
+.advanced-service-diagnostics code { padding: 6px 10px; background: var(--raised); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text); overflow-wrap: anywhere; }
+@media (max-width: 600px) { .advanced-settings { gap: 20px; padding-block: 16px; } .advanced-service-card { padding: 20px; gap: 20px; } .advanced-service-actions .btn-primary { width: 100%; } }

@@ -14,5 +14,6 @@ export function connectManagementRouteAllowed(path: string, method: string): boo
   if (path === "/api/android-remote" || path.startsWith("/api/android-remote/")) return true;
   if (path === "/api/storage" || path.startsWith("/api/storage/")) return true;
   if (path === "/api/stop") return method === "POST";
+  if (path === "/api/system/restart") return method === "POST";
   return method === "GET" && path.startsWith("/api/system/");
 }

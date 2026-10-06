@@ -15,6 +15,7 @@ import {
   buildWindowsTrayLauncherScript,
   buildWindowsTrayPowerShellCommand,
   buildWindowsTrayRunCommand,
+  currentWindowsTrayEntry,
   launchWindowsTrayHost,
   parseWindowsTrayRunValue,
   readWindowsTrayRunValueWithAsyncRunner,
@@ -51,6 +52,26 @@ const entry: WindowsTrayEntry = {
 };
 
 describe("Windows tray packaging and command safety", () => {
+  test("Connect keeps its entry point and restricted menu after Windows sign-in", () => {
+    const previous = process.env.REMODEX_CONNECT_ONLY;
+    try {
+      process.env.REMODEX_CONNECT_ONLY = "1";
+      const connect = currentWindowsTrayEntry();
+      expect(connect.cli).toEndWith(join("cli", "connect.ts"));
+      expect(connect.connectOnly).toBe(true);
+      expect(windowsTrayProcessArgs(connect)).toContain("-ConnectOnly");
+      expect(buildWindowsTrayLauncherScript(connect)).toContain("-ConnectOnly");
+      delete process.env.REMODEX_CONNECT_ONLY;
+      const legacy = currentWindowsTrayEntry();
+      expect(legacy.cli).toEndWith(join("cli", "index.ts"));
+      expect(windowsTrayProcessArgs(legacy)).not.toContain("-ConnectOnly");
+      expect(buildWindowsTrayLauncherScript(legacy)).not.toContain("-ConnectOnly");
+    } finally {
+      if (previous === undefined) delete process.env.REMODEX_CONNECT_ONLY;
+      else process.env.REMODEX_CONNECT_ONLY = previous;
+    }
+  });
+
   test("owned-file temp cleanup forgets successful ACL memos and retains failed removals", () => {
     const root = mkdtempSync(join(tmpdir(), "ocx-tray-acl-"));
     const target = join(root, "tray-state.json");

@@ -19,7 +19,7 @@ your work. An explicit `CODEX_CLI_PATH` setting must match the running desktop
 version; Remodex reports a mismatch instead of silently overriding that setting.
 
 If an older background server still occupies Remodex's default private Codex
-port, Remodex uses another local-only port for the matching version. It does not
+port, Remodex reports the port/version conflict and keeps its configured port. It does not
 terminate the older process. The phone address and saved pairing stay unchanged.
 
 ## Slow chat history

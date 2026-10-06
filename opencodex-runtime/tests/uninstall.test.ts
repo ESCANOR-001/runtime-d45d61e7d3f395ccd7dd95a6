@@ -46,7 +46,7 @@ describe("full uninstall command", () => {
       service.indexOf("export async function uninstallServiceIfInstalled()"),
       service.indexOf("export function isServiceInstalled()"),
     );
-    expect(helper).toContain("probeWindowsSchedulerTask(TASK)");
+    expect(helper).toContain("probeWindowsSchedulerTask(serviceTaskName())");
     expect(helper).toContain("Task Scheduler status could not be verified before uninstall");
     expect(helper).not.toContain("const q = schtasks");
     expect(helper).not.toContain("catch { /* task not found */ }");

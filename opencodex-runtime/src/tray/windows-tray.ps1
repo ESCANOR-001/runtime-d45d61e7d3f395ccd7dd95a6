@@ -7,7 +7,8 @@ param(
   # already-installed launcher command from an older version still starts.
   [ValidateSet("", "override", "bundled", "process")][string]$BunRuntimeSource = "",
   [ValidateSet("Run", "Stop")][string]$Mode = "Run",
-  [int]$HostPid = 0
+  [int]$HostPid = 0,
+  [switch]$ConnectOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -157,6 +158,14 @@ $restartDesktopItem = $menu.Items.Add("Restart desktop application (advanced)…
 $checkUpdateItem = $menu.Items.Add("Check package updates")
 [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 $exitItem = $menu.Items.Add("Quit desktop shell")
+
+# The Connect tray controls only Remodex. Keep Codex configuration and desktop
+# restart actions out of this menu, including after a fresh Windows sign-in.
+if ($ConnectOnly) {
+  foreach ($item in @($applyChangesItem, $restartCodexItem, $restartDesktopItem, $checkUpdateItem)) {
+    $item.Visible = $false
+  }
+}
 
 $actionItems = @(
   $proxyLifecycleItem,

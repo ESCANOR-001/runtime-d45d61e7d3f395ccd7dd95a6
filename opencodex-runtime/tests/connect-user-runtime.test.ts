@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createIsolatedTestEnvironment } from "../scripts/test";
 
-test.each([false, true])("the detached runtime preserves Codex and survives launcher exit with an occupied port: %s", async (occupied) => {
+test.each([false, true])("the detached runtime preserves Codex and its configured port when occupied: %s", async (occupied) => {
   const isolated = createIsolatedTestEnvironment();
   const configPath = join(isolated.env.CODEX_HOME!, "config.toml");
   const configText = 'model="native-test"\n';
@@ -24,12 +24,16 @@ test.each([false, true])("the detached runtime preserves Codex and survives laun
   let pid: number | undefined;
   try {
     const exit = await new Promise<number | null>((resolve, reject) => { child.once("exit", resolve); child.once("error", reject); });
-    expect(exit).toBe(0);
     const port = JSON.parse(readFileSync(runtimeConfigPath, "utf8")).port;
     if (occupied) {
-      expect(port).not.toBe(preferredPort);
+      expect(exit).not.toBe(0);
+      expect(port).toBe(preferredPort);
       expect(await (await fetch(`http://127.0.0.1:${preferredPort}`)).text()).toBe("foreign listener");
+      expect(readFileSync(configPath, "utf8")).toBe(configText);
+      expect(await Bun.file(join(isolated.env.OPENCODEX_HOME!, "ocx.pid")).exists()).toBe(false);
+      return;
     } else {
+      expect(exit).toBe(0);
       expect(port).toBe(preferredPort);
     }
     const base = `http://127.0.0.1:${port}`;

@@ -42,6 +42,13 @@ describe("isNewer — latest channel", () => {
     expect(isNewer("2.9.1", "2.8.2-preview.20260731", "latest")).toBe(true);
     expect(isNewer("2.9.1", "2.9.1-preview.20260731", "latest")).toBe(false);
   });
+  test("installed beta releases recognize newer stable versions without accepting prerelease targets", () => {
+    expect(isNewer("1.2.26", "1.2.25-beta.1", "latest")).toBe(true);
+    expect(isNewer("1.2.25", "1.2.25-beta.1", "latest")).toBe(false);
+    expect(isNewer("1.2.24", "1.2.25-beta.1", "latest")).toBe(false);
+    expect(isNewer("1.2.26-beta.1", "1.2.25", "latest")).toBe(false);
+    expect(isNewer("1.2.26", "1.2.25-beta.invalid", "latest")).toBe(false);
+  });
 });
 
 describe("isNewer — preview channel", () => {

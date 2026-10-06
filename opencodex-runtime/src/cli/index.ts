@@ -583,7 +583,7 @@ async function handleTrayProxyStart(existingIsSuccess = true): Promise<boolean> 
     // readiness state and run one serialized convergence pass here as well. This
     // makes Stop → Start deterministic and prevents a stale native-only
     // models.json from winning a startup race.
-    converge: async live => {
+    converge: isConnectRuntime() ? undefined : async live => {
       await runReady(
         { json: true, wait: true, timeoutSeconds: 45 },
         { stdout: { log: () => {} } },

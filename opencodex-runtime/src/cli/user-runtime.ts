@@ -1,7 +1,7 @@
 import { spawn, type SpawnOptions } from "node:child_process";
 import { closeSync, mkdirSync, openSync } from "node:fs";
 import { join } from "node:path";
-import { getConfigDir, loadConfig, saveConfig } from "../config";
+import { getConfigDir, loadConfig } from "../config";
 import { defaultProxyPort, isConnectRuntime } from "../connect/mode";
 import { findAvailablePort } from "../server/ports";
 
@@ -25,11 +25,9 @@ export async function startUserRuntime(): Promise<void> {
     if (isConnectRuntime()) {
       const reservedPort = config.unauthenticatedLoopbackListener?.enabled
         ? config.unauthenticatedLoopbackListener.port : undefined;
-      port = await findAvailablePort(port, config.hostname ?? "127.0.0.1", { reservedPort });
-      if (port !== config.port) {
-        config.port = port;
-        saveConfig(config);
-      }
+      port = await findAvailablePort(port, config.hostname ?? "127.0.0.1", {
+        reservedPort, preferRetryMs: 5_000, allowEphemeralFallback: false,
+      });
     }
     const launch = userRuntimeLaunch(process.env, cli, port, log);
     await new Promise<void>((resolve, reject) => {

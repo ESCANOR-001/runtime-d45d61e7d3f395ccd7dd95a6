@@ -888,7 +888,7 @@ describe("service lifecycle cleanup ordering", () => {
     expect(createAt).toBeLessThan(startAt);
     // startWindows clears service-stop-requested before running the task. A direct
     // schtasks /run here would strand the marker and make the wrapper exit at once.
-    expect(installWindows).not.toContain('schtasks(["/run", "/tn", TASK]);');
+    expect(installWindows).not.toContain('schtasks(["/run", "/tn", serviceTaskName()]);');
     expect(installWindows).not.toContain("writeFileSync(script");
     expect(assetsHelper).toContain("writeServiceAssetWithRetry(script");
     expect(assetsHelper).toContain("writeServiceAssetWithRetry(windowsTaskXmlPath()");
@@ -900,9 +900,9 @@ describe("service lifecycle cleanup ordering", () => {
     const service = await readText("src/service.ts");
     const uninstallWindows = service.slice(service.indexOf("function uninstallWindows()"), service.indexOf("function serviceDiagnosticsSummary()"));
 
-    expect(uninstallWindows).toContain("probeWindowsSchedulerTask(TASK)");
+    expect(uninstallWindows).toContain("probeWindowsSchedulerTask(serviceTaskName())");
     expect(uninstallWindows).toContain("await deleteWindowsSchedulerTaskWithElevation()");
-    expect(service).toContain('const deleteArgs = ["/delete", "/tn", TASK, "/f"]');
+    expect(service).toContain('const deleteArgs = ["/delete", "/tn", serviceTaskName(), "/f"]');
     expect(service).not.toContain("deleteWindowsSchedulerTaskWithElevation(\n  taskName");
     expect(uninstallWindows).toContain("windowsServiceScriptPath()");
     expect(uninstallWindows).toContain("windowsTaskXmlPath()");

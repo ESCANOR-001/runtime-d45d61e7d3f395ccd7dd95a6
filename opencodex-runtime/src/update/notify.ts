@@ -71,6 +71,11 @@ function parsePreview(v: string): [number, number, number, number] | null {
   return [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])];
 }
 
+function parseInstalledPrereleaseCore(v: string): [number, number, number] | null {
+  const m = /^(\d+)\.(\d+)\.(\d+)-(?:preview|beta)\.\d+$/.exec(v.trim());
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
 function gt(a: number[], b: number[]): boolean {
   for (let i = 0; i < Math.max(a.length, b.length); i++) {
     const av = a[i] ?? 0;
@@ -84,7 +89,7 @@ function gt(a: number[], b: number[]): boolean {
  * Channel-aware "is latest newer than current?".
  * - latest channel: compare maj.min.pat only; prerelease TARGETS are never
  *   "newer" (parity with codex-rs), so stable users are not pushed onto
- *   previews. An installed preview CURRENT compares by its maj.min.pat core,
+ *   previews. An installed preview or beta CURRENT compares by its maj.min.pat core,
  *   so a stable release with a strictly higher base is offered (same base is
  *   content-lateral promotion and stays not-newer, mirroring the preview
  *   channel's O3 rule).
@@ -95,7 +100,7 @@ function gt(a: number[], b: number[]): boolean {
 export function isNewer(latest: string, current: string, channel: Channel): boolean {
   if (channel === "latest") {
     const l = parseStable(latest);
-    const c = parseStable(current) ?? parsePreview(current)?.slice(0, 3);
+    const c = parseStable(current) ?? parseInstalledPrereleaseCore(current);
     if (!l || !c) return false;
     return gt(l, c);
   }

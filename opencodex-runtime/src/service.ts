@@ -71,7 +71,45 @@ import {
 } from "./lib/remodex-home";
 
 const LABEL = process.env.REMODEX_CONNECT_ONLY === "1" ? "com.remodex.connect" : "com.opencodex.proxy";
-const TASK = process.env.REMODEX_CONNECT_ONLY === "1" ? "remodex-connect" : "opencodex-proxy";
+const DEFAULT_TASK = process.env.REMODEX_CONNECT_ONLY === "1" ? "remodex-connect" : "opencodex-proxy";
+
+export function selectConnectSchedulerTask(
+  current: WindowsSchedulerTaskProbe,
+  legacy: WindowsSchedulerTaskProbe,
+  ownsTask: (name: string) => boolean,
+): string {
+  if (current.status === "unknown" || legacy.status === "unknown") {
+    throw new Error("Could not verify existing Remodex tasks. No new service was created.");
+  }
+  if (current.status === "present" && legacy.status === "present") {
+    throw new Error("Both Remodex startup tasks exist. Resolve the duplicate before changing either service.");
+  }
+  const name = legacy.status === "present" ? "opencodex-proxy" : "remodex-connect";
+  if ((current.status === "present" || legacy.status === "present") && !ownsTask(name)) {
+    throw new Error("The existing Remodex task belongs to another profile. No service was changed.");
+  }
+  return name;
+}
+
+let selectedWindowsScheduler: { home: string; name: string } | undefined;
+function serviceTaskName(): string {
+  if (process.platform !== "win32" || process.env.REMODEX_CONNECT_ONLY !== "1") return DEFAULT_TASK;
+  const home = getConfigDir();
+  if (selectedWindowsScheduler?.home === home) return selectedWindowsScheduler.name;
+  const name = selectConnectSchedulerTask(
+    probeWindowsSchedulerTask("remodex-connect"), probeWindowsSchedulerTask("opencodex-proxy"),
+    task => {
+      const xml = taskXmlWithoutCommentsAndCdata(querySchtasks(["/query", "/tn", task, "/xml"]));
+      if (taskXmlElementCount(xml, "Exec") !== 1 || taskXmlHasPrefixedTag(xml, "Exec")
+        || taskXmlElementCount(xml, "Data") > 0 || taskXmlHasPrefixedTag(xml, "Data")) return false;
+      const action = taskXmlSection(xml, "Exec");
+      return taskXmlDecodedValueEquals(action, "Command", windowsWscript())
+        && taskXmlDecodedValueEquals(action, "Arguments", `/b /nologo "${windowsLauncherVbsPath()}"`);
+    },
+  );
+  selectedWindowsScheduler = { home, name };
+  return name;
+}
 
 /**
  * The dashboard owns its own bounded elevation/reconciliation transaction. Its
@@ -1002,7 +1040,7 @@ export function windowsSchedulerCsvIncludesTask(csv: string, taskName: string): 
  * Query failures fall back to a CSV listing before concluding absence; if both
  * fail, returns `unknown` so callers can fail closed instead of releasing locks.
  */
-export function probeWindowsSchedulerTask(taskName = TASK): WindowsSchedulerTaskProbe {
+export function probeWindowsSchedulerTask(taskName = serviceTaskName()): WindowsSchedulerTaskProbe {
   if (process.platform !== "win32") return { status: "absent" };
 
   let queryFailure: string | null = null;
@@ -1027,7 +1065,7 @@ export function probeWindowsSchedulerTask(taskName = TASK): WindowsSchedulerTask
 }
 
 /** True when the Task Scheduler registration for the default proxy task is proven present. */
-export function windowsSchedulerTaskInstalled(taskName = TASK): boolean {
+export function windowsSchedulerTaskInstalled(taskName = serviceTaskName()): boolean {
   return probeWindowsSchedulerTask(taskName).status === "present";
 }
 
@@ -1096,7 +1134,7 @@ export function evaluateWindowsSchedulerInstallVerification(inputs: {
 }
 
 /** Conflict-free postcondition check for an elevated scheduler install. */
-export function verifyWindowsSchedulerInstall(taskName = TASK): WindowsSchedulerInstallVerification {
+export function verifyWindowsSchedulerInstall(taskName = serviceTaskName()): WindowsSchedulerInstallVerification {
   const taskInstalled = windowsSchedulerTaskInstalled(taskName);
   let xml = "";
   if (taskInstalled) {
@@ -1125,7 +1163,7 @@ async function elevateSchtasks(args: string[]): Promise<void> {
   }
 }
 
-async function rollbackElevatedSchedulerTask(taskName = TASK): Promise<string | null> {
+async function rollbackElevatedSchedulerTask(taskName = serviceTaskName()): Promise<string | null> {
   try {
     await elevateSchtasks(["/delete", "/tn", taskName, "/f"]);
   } catch (error) {
@@ -1170,7 +1208,7 @@ type FinalizeHooks = {
 
 let finalizeHooks: FinalizeHooks | null = null;
 
-function resolveWindowsSchedulerTaskProbe(taskName = TASK): WindowsSchedulerTaskProbe {
+function resolveWindowsSchedulerTaskProbe(taskName = serviceTaskName()): WindowsSchedulerTaskProbe {
   if (finalizeHooks?.probeTask) return finalizeHooks.probeTask();
   if (finalizeHooks?.taskInstalled) {
     return finalizeHooks.taskInstalled() ? { status: "present" } : { status: "absent" };
@@ -1212,7 +1250,7 @@ async function reconcileUnknownElevatedOutcome(exitCode: number): Promise<void> 
   const rollbackError = await rollbackElevatedSchedulerTask();
   if (rollbackError) {
     parts.push(`Cleanup also failed: ${rollbackError}`);
-    parts.push(`Remove the task manually with 'schtasks /delete /tn ${TASK} /f' if it remains.`);
+    parts.push(`Remove the task manually with 'schtasks /delete /tn ${serviceTaskName()} /f' if it remains.`);
   } else {
     parts.push("The elevated Task Scheduler task was removed.");
   }
@@ -1313,7 +1351,7 @@ async function applyElevatedSchedulerResult(
     throwPartialInstall([
       "Elevated schtasks /run failed after the task was registered, and elevated rollback also failed.",
       "A partial Task Scheduler backend may remain.",
-      `Remove the task manually with 'schtasks /delete /tn ${TASK} /f' if present.`,
+      `Remove the task manually with 'schtasks /delete /tn ${serviceTaskName()} /f' if present.`,
       "Installation state was not written.",
     ]);
   }
@@ -1350,7 +1388,7 @@ async function applyElevatedSchedulerResult(
     ];
     if (rollbackError) {
       parts.push(`Rollback also failed: ${rollbackError}`);
-      parts.push(`Remove the task manually with 'schtasks /delete /tn ${TASK} /f' and the native service with 'sc delete ${WINSW_SERVICE_ID}' if present.`);
+      parts.push(`Remove the task manually with 'schtasks /delete /tn ${serviceTaskName()} /f' and the native service with 'sc delete ${WINSW_SERVICE_ID}' if present.`);
     } else {
       parts.push("The elevated Task Scheduler task was rolled back.");
     }
@@ -1433,8 +1471,8 @@ export async function finalizeWindowsSchedulerServiceRegistration(
   const attemptId = options?.attemptId ?? randomUUID();
   const stillOwnsAttempt = options?.stillOwnsAttempt ?? finalizeHooks?.stillOwnsAttempt;
   const createArgs = buildWindowsSchtasksCreateArgs(script);
-  const runArgs = ["/run", "/tn", TASK];
-  const deleteArgs = ["/delete", "/tn", TASK, "/f"];
+  const runArgs = ["/run", "/tn", serviceTaskName()];
+  const deleteArgs = ["/delete", "/tn", serviceTaskName(), "/f"];
   // installWindows deliberately leaves the stop marker in place while its
   // non-elevated /create attempt fails. Remove it only when the caller is ready
   // to start the elevated create+run transaction; otherwise the new wrapper
@@ -1657,7 +1695,7 @@ export function buildWindowsServiceScript(entry = cliEntry(), port = resolveServ
 
 export function buildWindowsSchtasksCreateArgs(script = windowsServiceScriptPath()): string[] {
   const xml = script === windowsServiceScriptPath() ? windowsTaskXmlPath() : `${script}.xml`;
-  return ["/create", "/tn", TASK, "/xml", xml, "/f"];
+  return ["/create", "/tn", serviceTaskName(), "/xml", xml, "/f"];
 }
 
 /**
@@ -2164,7 +2202,7 @@ async function installWindowsNative(): Promise<void> {
   writeServiceApiTokenFile();
   let hadScheduler = false;
   try {
-    hadScheduler = schtasks(["/query", "/tn", TASK]).includes(TASK);
+    hadScheduler = schtasks(["/query", "/tn", serviceTaskName()]).includes(serviceTaskName());
   } catch { /* task absent */ }
   if (hadScheduler) {
     console.log("🔁 Removing the Task Scheduler backend before installing the native (WinSW) service...");
@@ -2176,7 +2214,7 @@ async function installWindowsNative(): Promise<void> {
     }
     // Verify removal — schtasks /delete can silently fail if UAC or policy blocks it.
     try {
-      if (schtasks(["/query", "/tn", TASK]).includes(TASK)) {
+      if (schtasks(["/query", "/tn", serviceTaskName()]).includes(serviceTaskName())) {
         throw new Error("Task Scheduler backend still present after removal — aborting switch.");
       }
     } catch (e) {
@@ -2194,7 +2232,7 @@ async function installWindowsNative(): Promise<void> {
 }
 function startWindows(): void {
   clearServiceStopRequest();
-  schtasks(["/run", "/tn", TASK]);
+  schtasks(["/run", "/tn", serviceTaskName()]);
 }
 
 export function isWindowsSchedulerEndBenign(error: unknown): boolean {
@@ -2218,14 +2256,14 @@ export function stopWindows(): void {
   // retry race on the fixed proxy port.
   requestServiceStop();
   try {
-    schtasks(["/end", "/tn", TASK]);
+    schtasks(["/end", "/tn", serviceTaskName()]);
   } catch (error) {
     if (isWindowsSchedulerEndBenign(error)) return;
     throw error;
   }
 }
-function statusWindows(): string { try { return schtasks(["/query", "/tn", TASK]); } catch { return ""; } }
-function statusWindowsXml(): string { try { return schtasks(["/query", "/tn", TASK, "/xml"]); } catch { return ""; } }
+function statusWindows(): string { try { return schtasks(["/query", "/tn", serviceTaskName()]); } catch { return ""; } }
+function statusWindowsXml(): string { try { return schtasks(["/query", "/tn", serviceTaskName(), "/xml"]); } catch { return ""; } }
 export interface WindowsSchedulerDeleteDeps {
   deleteTask?: () => void;
   elevateDelete?: () => Promise<number>;
@@ -2242,7 +2280,7 @@ export async function deleteWindowsSchedulerTaskWithElevation(
 ): Promise<void> {
   // Deliberately hardcoded: this elevated helper must never become a general
   // way for callers to delete an arbitrary Task Scheduler entry.
-  const deleteArgs = ["/delete", "/tn", TASK, "/f"];
+  const deleteArgs = ["/delete", "/tn", serviceTaskName(), "/f"];
   try {
     (deps.deleteTask ?? (() => { schtasks(deleteArgs); }))();
   } catch (directError) {
@@ -2256,22 +2294,22 @@ export async function deleteWindowsSchedulerTaskWithElevation(
     }
   }
 
-  const afterDelete = (deps.probeTask ?? (() => probeWindowsSchedulerTask(TASK)))();
+  const afterDelete = (deps.probeTask ?? (() => probeWindowsSchedulerTask(serviceTaskName())))();
   if (afterDelete.status === "present") {
-    throw new Error(`Task Scheduler task ${TASK} is still present after delete — refusing to remove service assets.`);
+    throw new Error(`Task Scheduler task ${serviceTaskName()} is still present after delete — refusing to remove service assets.`);
   }
   if (afterDelete.status === "unknown") {
-    throw new Error(`Task Scheduler task ${TASK} presence could not be verified after delete — refusing to remove service assets.`);
+    throw new Error(`Task Scheduler task ${serviceTaskName()} presence could not be verified after delete — refusing to remove service assets.`);
   }
 }
 
 async function uninstallWindows(): Promise<void> {
   requestServiceStop();
-  const probe = probeWindowsSchedulerTask(TASK);
+  const probe = probeWindowsSchedulerTask(serviceTaskName());
   if (probe.status === "present") {
     await deleteWindowsSchedulerTaskWithElevation();
   } else if (probe.status === "unknown") {
-    throw new Error(`Task Scheduler task ${TASK} presence could not be verified — refusing to remove service assets.`);
+    throw new Error(`Task Scheduler task ${serviceTaskName()} presence could not be verified — refusing to remove service assets.`);
   }
   if (existsSync(windowsServiceScriptPath())) unlinkSync(windowsServiceScriptPath());
   if (existsSync(windowsLauncherVbsPath())) unlinkSync(windowsLauncherVbsPath());
@@ -2305,7 +2343,7 @@ function unitDir(): string {
 }
 
 function unitPath(): string {
-  return join(unitDir(), `${TASK}.service`);
+  return join(unitDir(), `${serviceTaskName()}.service`);
 }
 
 export function buildUnit(): string {
@@ -2384,8 +2422,8 @@ function installSystemd(): void {
   writeServiceApiTokenFile();
   writeFileSync(unitPath(), buildUnit(), "utf8");
   sh("systemctl --user daemon-reload");
-  sh(`systemctl --user enable ${TASK}`);
-  sh(`systemctl --user restart ${TASK}`);
+  sh(`systemctl --user enable ${serviceTaskName()}`);
+  sh(`systemctl --user restart ${serviceTaskName()}`);
   writeServiceInstallState();
 }
 /**
@@ -2403,7 +2441,7 @@ function installSystemd(): void {
  */
 export function systemdNeedsDaemonReload(deps: { show?: () => string } = {}): boolean {
   try {
-    const out = (deps.show ?? (() => sh(`systemctl --user show -p NeedDaemonReload ${TASK}`)))();
+    const out = (deps.show ?? (() => sh(`systemctl --user show -p NeedDaemonReload ${serviceTaskName()}`)))();
     return /NeedDaemonReload\s*=\s*yes/i.test(out);
   } catch {
     return false;
@@ -2427,15 +2465,15 @@ function startSystemd(): void {
   if (systemdNeedsDaemonReload()) {
     console.log("ℹ️  unit file changed on disk; reloading systemd and restarting the service.");
     sh("systemctl --user daemon-reload");
-    sh(`systemctl --user restart ${TASK}`);
+    sh(`systemctl --user restart ${serviceTaskName()}`);
     return;
   }
-  sh(`systemctl --user start ${TASK}`);
+  sh(`systemctl --user start ${serviceTaskName()}`);
 }
-function stopSystemd(): void { try { sh(`systemctl --user stop ${TASK}`); } catch { /* not running */ } }
-function statusSystemd(): string { try { return sh(`systemctl --user status ${TASK}`); } catch { return ""; } }
+function stopSystemd(): void { try { sh(`systemctl --user stop ${serviceTaskName()}`); } catch { /* not running */ } }
+function statusSystemd(): string { try { return sh(`systemctl --user status ${serviceTaskName()}`); } catch { return ""; } }
 function uninstallSystemd(): void {
-  try { sh(`systemctl --user disable --now ${TASK}`); } catch { /* absent */ }
+  try { sh(`systemctl --user disable --now ${serviceTaskName()}`); } catch { /* absent */ }
   if (existsSync(unitPath())) unlinkSync(unitPath());
   try { sh("systemctl --user daemon-reload"); } catch { /* best-effort */ }
 }
@@ -2504,13 +2542,13 @@ function platformServiceInstallCleanupOps(backend: ServiceBackend): ServiceInsta
     }
     return {
       status: () => {
-        const probe = probeWindowsSchedulerTask(TASK);
+        const probe = probeWindowsSchedulerTask(serviceTaskName());
         if (probe.status === "unknown") throw new Error(`Task Scheduler status could not be verified: ${probe.detail}`);
         return probe.status === "present" ? "present" : null;
       },
       stop: () => {
         try {
-          schtasks(["/end", "/tn", TASK]);
+          schtasks(["/end", "/tn", serviceTaskName()]);
         } catch (error) {
           if (!isWindowsSchedulerEndBenign(error)) throw error;
         }
@@ -2526,11 +2564,11 @@ function platformServiceInstallCleanupOps(backend: ServiceBackend): ServiceInsta
         // healthy user manager returns `not-found` for a missing unit, while an
         // unreachable/permission-denied manager still makes `sh()` throw and the
         // caller therefore fails closed.
-        const loadState = sh(`systemctl --user show ${TASK} --property=LoadState --value`).trim().toLowerCase();
+        const loadState = sh(`systemctl --user show ${serviceTaskName()} --property=LoadState --value`).trim().toLowerCase();
         if (!loadState) throw new Error("systemd service status could not be verified.");
         return loadState === "not-found" ? null : loadState;
       },
-      stop: () => { sh(`systemctl --user stop ${TASK}`); },
+      stop: () => { sh(`systemctl --user stop ${serviceTaskName()}`); },
     };
   }
   return null;
@@ -2725,7 +2763,7 @@ export function stopServiceIfInstalled(): boolean {
     // two managers installed, and either one would respawn the proxy after `rmx stop`.
     let stopped = false;
     const failures: unknown[] = [];
-    const scheduler = probeWindowsSchedulerTask(TASK);
+    const scheduler = probeWindowsSchedulerTask(serviceTaskName());
     if (scheduler.status === "unknown") {
       failures.push(new Error(`Task Scheduler status could not be verified: ${scheduler.detail}`));
     } else if (scheduler.status === "present") {
@@ -2778,7 +2816,7 @@ export async function uninstallServiceIfInstalled(): Promise<boolean> {
     }
   } else if (process.platform === "win32") {
     let removed = false;
-    const scheduler = probeWindowsSchedulerTask(TASK);
+    const scheduler = probeWindowsSchedulerTask(serviceTaskName());
     if (scheduler.status === "unknown") {
       throw new Error(`Task Scheduler status could not be verified before uninstall: ${scheduler.detail}`);
     }
@@ -2942,8 +2980,8 @@ export function diagnoseService(): ServiceDiagnostic {
     if (existsSync("/.dockerenv")) return { supported: false, installed: false, enabled: false, running: false, viable: false, startable: false, stale: false, conflict: false, backend: null, summary: "unsupported in Docker" };
     if (!isSystemd()) return { supported: false, installed: false, enabled: false, running: false, viable: false, startable: false, stale: false, conflict: false, backend: null, summary: "unsupported: systemd not found" };
     const installed = existsSync(unitPath());
-    const enabled = installed && (() => { try { return sh(`systemctl --user is-enabled ${TASK}`) === "enabled"; } catch { return false; } })();
-    const running = installed && (() => { try { return sh(`systemctl --user is-active ${TASK}`) === "active"; } catch { return false; } })();
+    const enabled = installed && (() => { try { return sh(`systemctl --user is-enabled ${serviceTaskName()}`) === "enabled"; } catch { return false; } })();
+    const running = installed && (() => { try { return sh(`systemctl --user is-active ${serviceTaskName()}`) === "active"; } catch { return false; } })();
     const stale = installed && bakedServicePathsDiagnostic() !== null;
     const viable = installed && enabled && running && !stale;
     const summary = !installed ? `not installed (${diagnostics})`
@@ -3147,6 +3185,14 @@ export async function serviceCommand(...args: (string | undefined)[]): Promise<v
       assertServiceEnvironmentMatchesInstall();
       assertServiceAuthEnvironment();
       prepareServiceProviderEnvironment();
+      if (process.platform === "win32" && process.env.REMODEX_CONNECT_ONLY === "1") {
+        const existing = diagnoseService();
+        if (existing.installed && !existing.conflict && existing.backend === backend) {
+          await repairService();
+          await reportServiceServing("repaired");
+          break;
+        }
+      }
       // A manually started proxy can still own the configured port while the service
       // registration is absent or unloaded. Stop both the registered manager and any
       // tracked standalone listener before loading the freshly written service assets.
