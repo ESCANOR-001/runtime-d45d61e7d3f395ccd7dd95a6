@@ -162,11 +162,27 @@ function timelineBlocks(thread: JsonRecord): TimelineBlock[] {
 
 /** Page by visible prompts, never by the number of tool events. */
 function selectionStart(blocks: TimelineBlock[], end: number, limit: number): number {
+  // Recovered/compacted history can retain a turn's answer without its prompt.
+  // Count that turn once so missing user rows cannot make a page unbounded.
+  const isPrompt = (block: TimelineBlock) => block.kind === "message" && block.value.role === "user"
+    && block.value.phase !== "queued"
+    && !String(block.value.text).trimStart().startsWith("<send_user_message_question_reply>");
+  const userTurns = new Set(blocks.filter(isPrompt)
+    .map(block => block.turnId).filter(Boolean));
+  const seenTurns = new Set<string>();
+  const starts = new Set<number>();
+  for (let index = 0; index < end; index += 1) {
+    const block = blocks[index]!;
+    if (isPrompt(block)) {
+      starts.add(index);
+    } else if (block.value.phase !== "queued" && block.turnId && !userTurns.has(block.turnId) && !seenTurns.has(block.turnId)) {
+      starts.add(index);
+    }
+    if (block.turnId) seenTurns.add(block.turnId);
+  }
   let prompts = 0;
   for (let index = end - 1; index >= 0; index -= 1) {
-    const block = blocks[index]!;
-    if (block.kind !== "message" || block.value.role !== "user") continue;
-    if (String(block.value.text).trimStart().startsWith("<send_user_message_question_reply>")) continue;
+    if (!starts.has(index)) continue;
     prompts += 1;
     if (prompts >= limit) return index;
   }
@@ -192,8 +208,10 @@ function pageFromRange(
   blocks: TimelineBlock[],
   start: number,
   end: number,
+  includeQueued = false,
 ): ProjectedThreadHistoryPage {
-  const selected = blocks.slice(start, end);
+  const selected = blocks.filter((block, index) => block.kind === "message" && block.value.phase === "queued"
+    ? includeQueued : index >= start && index < end);
   const messages: JsonRecord[] = [];
   const activities: JsonRecord[] = [];
   const proposedPlans: JsonRecord[] = [];
@@ -203,14 +221,15 @@ function pageFromRange(
     else proposedPlans.push(block.value);
   }
   const sourceCursor = stringValue(record(thread.historyPage)?.olderCursor) || null;
+  const hasOlderBlocks = blocks.slice(0, start).some(block => block.value.phase !== "queued");
   return compactProjectedWork({
     threadId: stringValue(thread.id),
     messages,
     activities,
     proposedPlans,
     pageInfo: {
-      hasOlder: start > 0 || sourceCursor !== null,
-      olderCursor: start > 0 && blocks[start] ? cursorFor(blocks[start]!) : sourceCursor,
+      hasOlder: hasOlderBlocks || sourceCursor !== null,
+      olderCursor: hasOlderBlocks && blocks[start] ? cursorFor(blocks[start]!) : sourceCursor,
     },
   }, stringValue(record(thread.session)?.activeTurnId) || null);
 }
@@ -221,8 +240,13 @@ export function projectedThreadRecentPage(
 ): ProjectedThreadHistoryPage {
   const thread = threadOf(detail);
   const blocks = timelineBlocks(thread);
-  const start = selectionStart(blocks, blocks.length, limit);
-  const page = pageFromRange(thread, blocks, start, blocks.length);
+  let start = selectionStart(blocks, blocks.length, limit);
+  const activeTurnId = stringValue(record(thread.session)?.activeTurnId);
+  const activeStart = activeTurnId ? blocks.findIndex(block => block.turnId === activeTurnId) : -1;
+  // The one-turn live bootstrap must include its original prompt and steering
+  // messages. Queued follow-ups remain visible without consuming that window.
+  if (activeStart >= 0) start = Math.min(start, activeStart);
+  const page = pageFromRange(thread, blocks, start, blocks.length, true);
   // Status describes the current task/account, not the selected history range.
   // Always include it in reconnect snapshots, even when only one prompt loads.
   return { ...page, activities: [...page.activities, ...currentStatusActivities(thread)] };

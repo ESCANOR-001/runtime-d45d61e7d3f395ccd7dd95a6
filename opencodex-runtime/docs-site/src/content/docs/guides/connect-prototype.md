@@ -86,7 +86,10 @@ On Windows, service setup checks both the current and legacy task names. It repa
 
 Completed chats initially show the latest ten prompts with their replies and
 collapsed Work sections. A running chat prioritizes its current response and
-live activity, then fills in the remaining recent prompts in the background.
+live activity, including steering messages, then fills in the remaining recent
+prompts in the background. Queued follow-ups stay visible while you steer the
+current response. Recovered responses whose original prompt is missing still
+load in bounded pages. Incomplete-history warnings remain visible during work.
 Scrolling toward older history prefetches the next ten prompts near the oldest
 two loaded prompts. Already loaded messages are reused when scrolling back.
 Network delays keep the existing conversation visible with a loading indicator.

@@ -9726,7 +9726,9 @@ export class AndroidRemoteGatewayController {
     const nativeThreadId = stringValue(params.threadId, 128);
     if (!nativeThreadId) return false;
     if (source === "app-server"
-      && (method === "thread/status/changed" || method === "turn/started" || method === "turn/completed")
+      && (method === "thread/status/changed" || method === "turn/started" || method === "turn/completed"
+        || ((method === "item/started" || method === "item/completed")
+          && record(params.item)?.type === "contextCompaction"))
       && desktopOwnershipIsAuthoritative(fallbackOwnershipState(this.desktopIpc, nativeThreadId))) {
       // A secondary reader cannot stop or revive a Desktop-owned execution.
       // Reconcile through the owner/session stream instead.

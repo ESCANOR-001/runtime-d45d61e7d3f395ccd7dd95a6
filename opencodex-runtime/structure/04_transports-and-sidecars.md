@@ -29,7 +29,8 @@ the beginning of compaction. Private handoff text is never part of this metadata
 Native `item/started` events do not need an item-level status field: the event
 method establishes live compaction. Retain that evidence across quiet polls until
 the matching item completes or its owning turn terminates. A secondary reader's
-terminal event cannot close a compaction observed from the Desktop owner.
+lifecycle or compaction events cannot start or close a Desktop-owned execution.
+App-server compaction events remain authoritative for locally owned tasks.
 Bounded saved-history fallbacks carry `androidRemoteHistoryOnly`; they cannot
 verify live activity or overwrite a known unfinished compaction. Installed
 Desktop versions without bounded live-state support may expose only the saved
@@ -359,7 +360,10 @@ The selected transcript opens completed history with ten user prompts and
 prioritizes one newest turn while running. Android fills the remaining recent
 prompt window independently of live updates. Question replies remain with their originating prompt; ordinary steering
 messages count as prompts. Tool counts do not determine the
-outer history boundary. Older history uses ten-prompt pages and is prefetched
+outer history boundary. A recovered turn without a retained user prompt counts
+as one history entry, so incomplete saved transcripts remain bounded. Live
+bootstrap includes the whole active turn, including its steering messages; queued
+follow-ups remain visible independently of the history window. Older history uses ten-prompt pages and is prefetched
 when the reader approaches the oldest two loaded prompts; only one history
 request is in flight. Native stable row keys preserve the reader's current
 position; request-time scroll anchors must never be restored after a response.
@@ -426,7 +430,8 @@ branch; timestamps cannot choose between siblings. Each parent is read through t
 physical-parent lookup can reach ancestors outside the 16-file discovery window or under a
 different logical thread id, while retaining canonical path containment and metadata checks.
 Missing/ambiguous parents, cycles, invalid cutoffs, oversized records, and concurrent rewrites
-keep the native snapshot with a visible incomplete-history warning. No saved history is rewritten.
+keep the native snapshot with a visible incomplete-history warning, including
+while a task is running. No saved history is rewritten.
 Bounded metadata caches and a single composed-history cache avoid repeated whole-file replay
 while source identity, size, and modification time are unchanged.
 

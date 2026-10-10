@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { AndroidCodexClient } from "../src/android-remote/codex-app-server";
 import { decodeNativeHistoryCursor, nativeHistoryCursor, nativeHistoryIsUnsupported, nativeHistoryNeedsSessionRecovery, readNativeTurnsPage, windowsNativeHistoryNeedsSessionRecovery } from "../src/android-remote/native-turn-history";
+import { projectedTurnWorkPage } from "../src/android-remote/thread-work-page";
 import { projectCodexThreadDetail } from "../src/android-remote/projection";
 import { createProjectedThreadStreamState, projectedThreadBoundedSnapshot, projectedThreadOlderPage, projectedThreadRecentPage } from "../src/android-remote/thread-stream";
 
@@ -50,8 +51,13 @@ describe("complete bounded Android history", () => {
       historyPage: { olderCursor: nativeHistoryCursor("task", page.nextCursor) },
     }, 1, { compactCompletedWork: true });
     const snapshot = projectedThreadBoundedSnapshot(createProjectedThreadStreamState(detail)) as any;
-    expect(calls).toEqual([{ threadId: "task", limit: 1, sortDirection: "desc", itemsView: "full" }]);
-    expect(snapshot.snapshot.thread.activities.map((item: any) => item.id)).toEqual(["reasoning", "command", "search", "patch"]);
+    expect(calls).toEqual([{ threadId: "task", limit: 10, sortDirection: "desc", itemsView: "full" }]);
+    expect(snapshot.snapshot.thread.activities).toEqual([expect.objectContaining({
+      id: "deferred-work:recent", kind: "work.deferred", payload: expect.objectContaining({ remaining: 4 }),
+    })]);
+    const work = projectedTurnWorkPage(detail.thread as Record<string, unknown>, "recent");
+    expect(work.activities.filter(item => item.kind !== "work.deferred").map(item => item.id)).toEqual(["reasoning", "command", "search", "patch"]);
+    expect(work.nextCursor).toBeNull();
     expect(snapshot.snapshot.thread.messages.map((item: any) => item.id)).toEqual(["user", "answer"]);
     expect(JSON.stringify(snapshot)).not.toContain("private");
     expect(JSON.stringify(snapshot).length).toBeLessThan(10_000);
@@ -71,17 +77,23 @@ describe("complete bounded Android history", () => {
     };
     const state = createProjectedThreadStreamState({ thread });
     const recent = projectedThreadRecentPage(state.detail);
-    expect(recent.messages).toHaveLength(96);
-    const older = projectedThreadOlderPage(state, recent.pageInfo.olderCursor!);
-    expect(older.messages).toHaveLength(24);
-    expect(older.pageInfo).toEqual({ hasOlder: true, olderCursor: sourceCursor });
+    expect(recent.messages).toHaveLength(10);
+    let page = recent;
+    const ids = page.messages.map(message => message.id);
+    for (let index = 0; index < 11; index += 1) {
+      page = projectedThreadOlderPage(state, page.pageInfo.olderCursor!);
+      expect(page.messages).toHaveLength(10);
+      ids.unshift(...page.messages.map(message => message.id));
+    }
+    expect(ids).toEqual(thread.messages.map(message => message.id));
+    expect(page.pageInfo).toEqual({ hasOlder: true, olderCursor: sourceCursor });
     expect(state.sequence).toBe(1);
     expect(state.replay).toEqual([]);
   });
 
   test("passes the native continuation and preserves its oldest-first order", async () => {
     const client = { request: async (_method: string, params: unknown) => {
-      expect(params).toMatchObject({ cursor: "next-page", itemsView: "full", limit: 1 });
+      expect(params).toMatchObject({ cursor: "next-page", itemsView: "full", limit: 10 });
       return { data: [{ id: "newer" }, { id: "older" }], nextCursor: null };
     } } as unknown as AndroidCodexClient;
     expect(await readNativeTurnsPage(client, "task", "next-page")).toEqual({ turns: [{ id: "older" }, { id: "newer" }], nextCursor: null });

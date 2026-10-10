@@ -130,6 +130,49 @@ function detail(input: {
 }
 
 describe("Android Remote projected task stream", () => {
+  test("keeps the whole active turn and every queued follow-up in the one-turn bootstrap", () => {
+    const messages = [
+      { ...message("older", "Previous prompt", 0), turnId: "old" },
+      { ...message("prompt", "Current prompt", 1), role: "user", turnId: "turn-0" },
+      { ...message("steer", "Steering prompt", 2), role: "user", turnId: "turn-0" },
+      { ...message("answer", "Working", 3, true), turnId: "turn-0" },
+      ...Array.from({ length: 12 }, (_, index) => ({ ...message(`queue-${index}`, "Follow up", index + 4),
+        role: "user", phase: "queued", turnId: null, queuePosition: index })),
+    ];
+    const state = createProjectedThreadStreamState(detail({ messages, sessionStatus: "running" }));
+    const snapshot = projectedThreadBoundedSnapshot(state, 1) as any;
+    expect(snapshot.snapshot.thread.messages.map((row: JsonRecord) => row.id)).toEqual(messages.slice(1).map(row => row.id));
+    expect(projectedThreadOlderPage(state, snapshot.snapshot.historyPage.olderCursor).messages.map(row => row.id)).toEqual(["older"]);
+  });
+
+  test("queued messages older than a newly delivered steer remain visible", () => {
+    const messages = [
+      { ...message("queued", "Next task", 1), role: "user", phase: "queued", turnId: null, queuePosition: 0 },
+      { ...message("steer", "Change direction", 2), role: "user", turnId: "turn-0" },
+    ];
+    const state = createProjectedThreadStreamState(detail({ messages, sessionStatus: "running" }));
+    const snapshot = projectedThreadBoundedSnapshot(state, 1) as any;
+    expect(snapshot.snapshot.thread.messages.map((row: JsonRecord) => row.id)).toEqual(["queued", "steer"]);
+    expect(snapshot.snapshot.historyPage).toEqual({ hasOlder: false, olderCursor: null });
+  });
+
+  test("pages orphaned turns without splitting a large work log or counting question replies", () => {
+    const messages = Array.from({ length: 15 }, (_, index) => ({
+      ...message(`orphan-${index}`, "Recovered answer", index), role: "assistant", turnId: `orphan-${index}`,
+    }));
+    messages.push(...Array.from({ length: 150 }, (_, index) => ({
+      ...message(`work-${index}`, "Work", index + 15), role: "assistant", turnId: "live",
+    })));
+    messages.push({ ...message("reply", "<send_user_message_question_reply>[]</send_user_message_question_reply>", 165), role: "user", turnId: "live" });
+    const state = createProjectedThreadStreamState(detail({ messages }));
+    const first = projectedThreadBoundedSnapshot(state) as any;
+    expect(first.snapshot.thread.messages.some((row: JsonRecord) => row.id === "orphan-0")).toBe(false);
+    const older = projectedThreadOlderPage(state, first.snapshot.historyPage.olderCursor);
+    expect(older.messages.some(row => row.id === "orphan-0")).toBe(true);
+    expect(older.messages.some(row => row.turnId === "live")).toBe(false);
+    expect(older.pageInfo.hasOlder).toBe(false);
+  });
+
   test("retains current limits and context outside the recent prompt window", () => {
     const messages = Array.from({ length: 12 }, (_, index) => ({
       ...message(`prompt-${index}`, `Prompt ${index}`, index + 1), role: "user",

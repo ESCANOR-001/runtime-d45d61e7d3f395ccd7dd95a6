@@ -813,7 +813,7 @@ function sessionOf(thread: JsonRecord, updatedAt: string): JsonRecord {
       : canonicalRunning
         ? activity.activeTurnId || null
         : null,
-    lastError: !unverified && (projectedRunning || canonicalRunning) ? null : unverified
+    lastError: !unverified && (projectedRunning || canonicalRunning) ? historyWarning || null : unverified
       ? "Task status is unavailable. Reconnect to check whether it is still running."
       : projectedError
       ? projectedErrorMessage || canonicalErrorMessage || null

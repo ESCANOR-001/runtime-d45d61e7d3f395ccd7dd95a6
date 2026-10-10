@@ -1534,22 +1534,33 @@ describe("Android Remote attachments", () => {
       const historyEvent = historyMessage.event as {
         snapshot?: { historyPage?: { olderCursor?: unknown } };
       };
-      const olderCursor = historyEvent.snapshot?.historyPage?.olderCursor;
+      let olderCursor = historyEvent.snapshot?.historyPage?.olderCursor;
       expect(typeof olderCursor).toBe("string");
-      const olderPagePending = socketMessage(socket, 3_000, "older image history page");
-      socket.send(JSON.stringify({
-        id: "older-image-history",
-        method: "orchestration.getThreadPage",
-        params: { threadId: "native-image-thread", cursor: olderCursor },
-      }));
-      const olderPageMessage = await olderPagePending;
-      // JSON.stringify escapes Windows backslashes. Compare the encoded path
-      // so this assertion checks the actual payload instead of depending on
-      // the platform's path spelling.
-      const olderPageJson = JSON.stringify(olderPageMessage.result);
+      const historyPages: unknown[] = [];
+      const seenCursors = new Set<unknown>();
+      while (olderCursor) {
+        expect(seenCursors.has(olderCursor)).toBe(false);
+        seenCursors.add(olderCursor);
+        const olderPagePending = socketMessageMatching(socket, message => message.id === "older-image-history");
+        socket.send(JSON.stringify({
+          id: "older-image-history", method: "orchestration.getThreadPage",
+          params: { threadId: "native-image-thread", cursor: olderCursor },
+        }));
+        const olderPageMessage = await olderPagePending as any;
+        expect(olderPageMessage.error).toBeUndefined();
+        historyPages.push(olderPageMessage.result);
+        olderCursor = olderPageMessage.result.pageInfo.olderCursor;
+      }
+      const workPending = socketMessageMatching(socket, message => message.id === "image-work");
+      socket.send(JSON.stringify({ id: "image-work", method: "orchestration.getTurnWork",
+        params: { threadId: "native-image-thread", turnId: "image-turn" } }));
+      const work = await workPending;
+      expect(work.error).toBeUndefined();
+      // Work contains generated images; message images remain in the paged transcript.
+      const olderPageJson = JSON.stringify(historyPages);
       expect(olderPageJson).toContain(JSON.stringify(externalImagePath).slice(1, -1));
       expect(olderPageJson).toContain(JSON.stringify(userImagePath).slice(1, -1));
-      expect(olderPageJson).toContain(JSON.stringify(generatedImagePath).slice(1, -1));
+      expect(JSON.stringify(work.result)).toContain(JSON.stringify(generatedImagePath).slice(1, -1));
       codex.threads[0]!.turns = [{
         id: "newer-turn",
         status: "completed",
@@ -1794,6 +1805,7 @@ describe("Android Remote Codex projection", () => {
       createdAt: 1_786_320_000,
       updatedAt: 1_786_320_012,
       status: { type: "active" },
+      androidRemoteHistoryOnly: true,
       androidRemoteLatestTurnState: "running",
       androidRemoteLatestTurnId: "turn-completed",
       androidRemoteLatestTurnAt: "2026-08-08T00:00:09.000Z",
@@ -1829,6 +1841,7 @@ describe("Android Remote Codex projection", () => {
       createdAt: 1_786_320_000,
       updatedAt: 1_786_320_012,
       status: { type: "active" },
+      androidRemoteHistoryOnly: true,
       androidRemoteLatestTurnState: "error",
       androidRemoteLatestTurnId: "turn-failed",
       androidRemoteLatestTurnAt: "2026-08-08T00:00:12.000Z",
@@ -1907,6 +1920,7 @@ describe("Android Remote Codex projection", () => {
       updatedAt: 1_786_320_010,
       // Desktop uses `active` for an open conversation even with no live turn.
       status: { type: "active" },
+      androidRemoteHistoryOnly: true,
       androidRemoteLatestTurnState: "completed",
       androidRemoteLatestTurnId: "turn-completed",
       androidRemoteLatestTurnAt: "2026-08-08T00:00:10.000Z",
@@ -3484,7 +3498,7 @@ describe("Android Remote Codex projection", () => {
     const codex = new FakeCodexClient();
     codex.threads.push({ id: "compacting-task", cwd: process.cwd(), modelProvider: "openai", status: { type: "idle" }, turns: [] });
     const desktopIpc = new FakeDesktopIpcSync();
-    desktopIpc.markDesktopOwned("compacting-task");
+    if (source === "desktop-session") desktopIpc.markDesktopOwned("compacting-task");
     desktopIpc.followerStateAction = async () => ({
       id: "compacting-task", androidRemoteHistoryOnly: true,
       turns: [{ id: "compacting-turn", status: "interrupted", items: [] }],
@@ -6941,7 +6955,8 @@ describe("Android Remote Codex connection", () => {
       const approvalRequestId = (approvalActivity?.payload as { requestId?: unknown } | undefined)?.requestId;
       expect(typeof approvalRequestId).toBe("string");
 
-      const approvalResolvedSnapshot = socketMessage(socket, 3_000, "approval answered");
+      const approvalResolvedSnapshot = socketMessageMatching(socket, message =>
+        snapshotActivities(message).some(activity => activity.id === approvalActivity?.id && activity.kind === "activity.removed"));
       expect((await dispatch({
         type: "thread.approval.respond",
         threadId: "remote-1",
@@ -6952,12 +6967,12 @@ describe("Android Remote Codex connection", () => {
         id: 701,
         result: { decision: "acceptForSession" },
       });
-      expect(await approvalResolvedSnapshot).toMatchObject({
-        id: "thread",
-        event: { kind: "snapshot" },
-      });
+      expect(snapshotActivities(await approvalResolvedSnapshot)).toContainEqual(expect.objectContaining({
+        id: approvalActivity?.id, kind: "activity.removed",
+      }));
 
-      const questionSnapshotMessage = socketMessage(socket, 3_000, "question request");
+      const questionSnapshotMessage = socketMessageMatching(socket, message =>
+        snapshotActivities(message).some(activity => activity.kind === "user-input.requested"));
       codex.emit({
         id: 702,
         method: "item/tool/requestUserInput",
@@ -6999,7 +7014,8 @@ describe("Android Remote Codex connection", () => {
       expect(codex.requests.filter(request => request.method === "thread/read").length)
         .toBe(readsBeforeDraft);
 
-      const questionResolvedSnapshot = socketMessage(socket, 3_000, "question answered");
+      const questionResolvedSnapshot = socketMessageMatching(socket, message =>
+        snapshotActivities(message).some(activity => activity.id === questionActivity?.id && activity.kind === "activity.removed"));
       expect((await dispatch({
         type: "thread.user-input.respond",
         threadId: "remote-1",
@@ -7012,12 +7028,11 @@ describe("Android Remote Codex connection", () => {
         id: 702,
         result: { answers: { continue: { answers: ["Yes"] } } },
       });
-      expect(await questionResolvedSnapshot).toMatchObject({
-        id: "thread",
-        event: { kind: "snapshot" },
-      });
+      expect(snapshotActivities(await questionResolvedSnapshot)).toContainEqual(expect.objectContaining({
+        id: questionActivity?.id, kind: "activity.removed",
+      }));
 
-      const nextThreadMessage = socketMessage(socket, 3_000, "turn completion");
+      const nextThreadMessage = socketMessageMatching(socket, message => (snapshotSession(message) as { status?: string } | null)?.status === "ready");
       const nativeThread = codex.threads[0]!;
       nativeThread.status = { type: "idle" };
       nativeThread.updatedAt = Date.now() / 1000 + 1;
@@ -12171,12 +12186,23 @@ describe("Android bounded first-open history", () => {
       const cursor = first.event.snapshot.historyPage.olderCursor;
       expect(typeof cursor).toBe("string");
       expect(cursor).not.toStartWith("native-turns:");
-      const olderPending = socketMessageMatching(socket, message => message.id === "older-recovered");
-      socket.send(JSON.stringify({ id: "older-recovered", method: "orchestration.getThreadPage", params: { threadId, cursor } }));
-      const older = await olderPending as any;
-      expect(older.result.messages.length).toBeGreaterThan(0);
-      expect(older.result.messages.some((message: any) => message.text === "Request 0")).toBe(true);
-      expect(JSON.stringify(older)).not.toContain("Another task's private answer");
+      let olderCursor = cursor;
+      const recoveredMessages = [...first.event.snapshot.thread.messages];
+      const seenCursors = new Set<string>();
+      while (olderCursor) {
+        expect(seenCursors.has(olderCursor)).toBe(false);
+        seenCursors.add(olderCursor);
+        const olderPending = socketMessageMatching(socket, message => message.id === "older-recovered");
+        socket.send(JSON.stringify({ id: "older-recovered", method: "orchestration.getThreadPage", params: { threadId, cursor: olderCursor } }));
+        const older = await olderPending as any;
+        expect(older.result.messages.length).toBeGreaterThan(0);
+        expect(older.result.messages.filter((message: any) => message.role === "user").length).toBeLessThanOrEqual(10);
+        expect(JSON.stringify(older)).not.toContain("Another task's private answer");
+        recoveredMessages.push(...older.result.messages);
+        olderCursor = older.result.pageInfo.olderCursor;
+      }
+      expect(recoveredMessages.filter((message: any) => message.role === "user").map((message: any) => message.text).sort())
+        .toEqual(Array.from({ length: 60 }, (_, index) => `Request ${index}`).sort());
       if (scenario === "oversized") {
         const refreshed = await (controller as any).readFullThreadDetail(threadId, { boundedInitial: true });
         expect(refreshed.thread.messages.some((message: any) => message.text === "Answer 59")).toBe(true);
@@ -12276,8 +12302,8 @@ describe("Android bounded first-open history", () => {
       expect(older.result.messages.map((message: any) => message.id)).toEqual(["bounded-user-0", "bounded-answer-0", "bounded-user-1", "bounded-answer-1"]);
       expect(older.result.pageInfo).toEqual({ hasOlder: false, olderCursor: null });
       expect(pageRequests).toEqual([
-        { threadId: "bounded-task", limit: 1, sortDirection: "desc", itemsView: "full" },
-        { threadId: "bounded-task", limit: 1, sortDirection: "desc", itemsView: "full", cursor: "native-older" },
+        { threadId: "bounded-task", limit: 10, sortDirection: "desc", itemsView: "full" },
+        { threadId: "bounded-task", limit: 10, sortDirection: "desc", itemsView: "full", cursor: "native-older" },
       ]);
       expect(fullReads).toBe(0);
       expect(recoveryReads).toBe(0);
@@ -12342,5 +12368,37 @@ describe("answered question status publication", () => {
       internal.applyLiveThreadLifecycleToShell(snapshot);
       expect(snapshot.threads[0]).toMatchObject({ hasPendingUserInput: true, hasPendingApprovals: true });
     } finally { await controller.stop(); }
+  });
+});
+
+// App-server activity and a saved/mounted Desktop view are distinct authorities.
+describe("runtime status authority", () => {
+  test("public active status keeps a new task running even if only an older completed turn is loaded", () => {
+    const detail = projectCodexThreadDetail({ id: "active-metadata", status: { type: "active", activeFlags: [] },
+      androidRemoteHistoryRecoveryError: "Some saved history could not be verified.",
+      turns: [{ id: "previous", status: "completed", items: [] }] }, 1) as any;
+    expect(detail.thread.session).toMatchObject({ status: "running", activeTurnId: null,
+      lastError: "Some saved history could not be verified." });
+    expect(detail.thread.latestTurn).toBeNull();
+  });
+
+  test("a secondary compaction event cannot start or close a Desktop-owned task", () => {
+    const desktopIpc = new FakeDesktopIpcSync();
+    desktopIpc.markDesktopOwned("owned");
+    const controller = new AndroidRemoteGatewayController(memoryStore(), { desktopIpcSync: desktopIpc });
+    const internal = controller as any;
+    const detail = projectCodexThreadDetail({ id: "owned", status: { type: "idle" }, turns: [] }, 1);
+    internal.threadStreams.set("owned", createProjectedThreadStreamState(detail));
+    const emit = (method: string, source: string) => internal.applyLiveCodexNotification({ method,
+      params: { threadId: "owned", turnId: "turn", item: { id: "compaction", type: "contextCompaction" } } }, false, source);
+    emit("item/started", "app-server");
+    expect(internal.liveCompactionSources.has("owned")).toBe(false);
+    expect(internal.threadStreams.get("owned").detail.thread.session.status).toBe("idle");
+    emit("item/started", "desktop-session");
+    expect(internal.threadStreams.get("owned").detail.thread.session.status).toBe("running");
+    emit("item/completed", "app-server");
+    expect(internal.desktopInteractions.get("owned").compaction.active).toBe(true);
+    emit("item/completed", "desktop-session");
+    expect(internal.desktopInteractions.get("owned").compaction.active).toBe(false);
   });
 });
