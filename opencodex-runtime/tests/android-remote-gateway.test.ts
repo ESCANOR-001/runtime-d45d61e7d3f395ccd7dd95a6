@@ -3732,9 +3732,20 @@ describe("Android Remote Codex connection", () => {
       const questionIds = pending()[0]!.questions.map((question: any) => question.id);
       const command = { threadId: "thread-async", requestId, answers: { [questionIds[0]]: "Local", [questionIds[1]]: "Keep it small" } };
       let items: unknown[] = [call];
-      desktopIpc.followerStateAction = async () => ({ turns: [{ turnId: "turn-async", status: "in_progress", items }] });
+      desktopIpc.followerStateAction = async () => ({
+        threadRuntimeStatus: { type: "active", activeFlags: ["waitingOnUserInput"] },
+        turns: [{ turnId: "turn-async", status: "in_progress", items }],
+      });
       await expect(internal.respondToUserInput("phone", { ...command, threadId: "other" })).rejects.toThrow("does not belong");
       await expect(internal.respondToUserInput("phone", { ...command, answers: {} })).rejects.toThrow("Every question");
+      internal.shellCache = { threads: [{ ...current() }], snapshotSequence: 1 };
+      desktopIpc.followerAction = async () => { throw new Error("temporary delivery failure"); };
+      await expect(internal.respondToUserInput("phone", command)).rejects.toThrow();
+      expect(current().hasPendingUserInput).toBe(true);
+      expect(internal.shellCache.threads[0].hasPendingUserInput).toBe(true);
+      expect(pending()).toHaveLength(1);
+      deliver.mockClear();
+      desktopIpc.followerAction = async () => ({ turnId: "turn-async" });
       internal.pendingRequests.set("sync-request", { method: "item/tool/requestUserInput", remoteThreadId: "thread-async" });
       await internal.respondToUserInput("phone", command);
       expect(deliver).toHaveBeenCalledTimes(1);
@@ -3748,11 +3759,21 @@ describe("Android Remote Codex connection", () => {
         { questionItemId: '["request_user_input_async","call-async",1]', question: "Notes?", answer: "Keep it small" },
       ])}\n</send_user_message_question_reply>`);
       expect(pending()).toHaveLength(0);
+      expect(current().hasPendingUserInput).toBe(true); // A separate native question is still pending.
       internal.pendingRequests.clear();
+      internal.publishResolvedUserInput("thread-async", internal.supplementalActivities.get("thread-async").find((row: any) => row.kind === "user-input.resolved"));
+      expect(current().hasPendingUserInput).toBe(false); // No Desktop reply echo is needed.
+      expect(internal.shellCache.threads[0].hasPendingUserInput).toBe(false);
       await expect(internal.respondToUserInput("phone", command)).rejects.toThrow("no longer waiting");
       const answer = { type: "userMessage", id: "answer", content: [{ type: "text", text: message }] };
+      internal.setLiveNotificationFallback("thread-async", "turn-async", "Requires your input");
       notify("item/completed", answer);
       expect(current().hasPendingUserInput).toBe(false);
+      expect(internal.shellCache.threads[0].currentActivity).not.toBe("Requires your input");
+      items = [call, answer];
+      await internal.refreshDesktopInteractions("thread-async");
+      expect(current().hasPendingUserInput).toBe(false);
+      expect(internal.shellCache.threads[0].hasPendingUserInput).toBe(false);
       notify("item/completed", call);
       expect(pending()).toHaveLength(0);
       internal.answeredDesktopQuestions.clear();
@@ -6172,7 +6193,9 @@ describe("Android Remote Codex connection", () => {
       // therefore has no remote-to-native alias. When the same task is open in
       // Desktop, Android must still send through that Desktop owner instead of
       // trying a second thread/resume writer on the private app-server.
-      desktopIpc.followerAction = async () => ({ result: { turn: { id: "desktop-native-turn" } } });
+      desktopIpc.followerAction = async method => method === "thread-follower-interrupt-turn"
+        ? { result: { ok: true, interruptedTurnId: "desktop-native-turn" } }
+        : { result: { turn: { id: "desktop-native-turn" } } };
       expect((await dispatch({
         type: "thread.turn.start",
         commandId: "desktop-native-command",
@@ -6203,20 +6226,28 @@ describe("Android Remote Codex connection", () => {
       expect((await dispatch({
         type: "thread.turn.interrupt",
         threadId: "desktop-native-task",
-        turnId: "desktop-native-turn",
+        turnId: "outdated-before-compaction",
       })).status).toBe(200);
       expect(desktopIpc.followerActions.at(-1)).toMatchObject({
         method: "thread-follower-interrupt-turn",
         params: {
           conversationId: "desktop-native-task",
           mode: "user-stop",
-          expectedTurnId: "desktop-native-turn",
         },
       });
       expect(codex.requests.some(request =>
         request.method === "turn/interrupt"
         && (request.params as { threadId?: unknown }).threadId === "desktop-native-task"
       )).toBe(false);
+      expect(desktopIpc.followerActions.at(-1)?.params).not.toHaveProperty("expectedTurnId");
+      desktopIpc.followerAction = async () => ({ result: { ok: true, interruptedTurnId: null } });
+      const unconfirmedStop = await dispatch({
+        type: "thread.turn.interrupt",
+        commandId: "unconfirmed-stop",
+        threadId: "desktop-native-task",
+      });
+      expect(unconfirmedStop.status).not.toBe(200);
+      expect(await unconfirmedStop.text()).toContain("did not confirm an active turn was stopped");
       desktopIpc.followerAction = null;
 
       expect((await dispatch({
@@ -6301,7 +6332,9 @@ describe("Android Remote Codex connection", () => {
       firstNativeTurn.status = "completed";
       firstNativeTurn.completedAt = Date.now() / 1000;
       desktopIpc.releaseThread("native-1");
-      desktopIpc.followerAction = async () => ({ result: { turn: { id: "desktop-turn-2" } } });
+      desktopIpc.followerAction = async method => method === "thread-follower-interrupt-turn"
+        ? { result: { ok: true, interruptedTurnId: "desktop-turn-2" } }
+        : { result: { turn: { id: "desktop-turn-2" } } };
       expect((await dispatch({
         type: "thread.turn.start",
         commandId: "desktop-second-command",
@@ -6336,7 +6369,6 @@ describe("Android Remote Codex connection", () => {
         params: {
           conversationId: "native-1",
           mode: "user-stop",
-          expectedTurnId: "desktop-turn-2",
         },
       });
       expect(codex.requests.filter(request => request.method === "turn/interrupt")).toHaveLength(0);
@@ -12253,5 +12285,62 @@ describe("Android bounded first-open history", () => {
       socket?.close();
       await controller.stop();
     }
+  });
+});
+
+describe("answered question status publication", () => {
+  test.each([true, false])("publishes acknowledgements with selected transcript=%s", async selected => {
+    const controller = new AndroidRemoteGatewayController(memoryStore(), { desktopIpcSync: new FakeDesktopIpcSync() });
+    const internal = controller as any;
+    const requested = (id: string) => ({ id, kind: "user-input.requested", payload: { requestId: id, questions: [{ id: `question-${id}`, question: "Choose" }] }, turnId: "turn-input" });
+    const resolved = (id: string) => ({ id: `resolved-${id}`, kind: "user-input.resolved", payload: { requestId: id, answers: { [`question-${id}`]: "Yes" } }, turnId: "turn-input" });
+    const detail = projectCodexThreadDetail({ id: "thread-input", status: { type: "active", activeFlags: ["waitingOnUserInput"] },
+      turns: [{ id: "turn-input", status: "inProgress", items: [] }] }, 1);
+    const thread = detail.thread as any;
+    thread.hasPendingUserInput = true;
+    thread.activities = [requested("first"), requested("second")];
+    internal.shellCache = { threads: [{ ...thread }], snapshotSequence: 1 };
+    internal.rememberShellLifecycle("thread-input", thread);
+    if (selected) internal.threadStreams.set("thread-input", createProjectedThreadStreamState(detail, Date.now()));
+    internal.pendingDesktopUserInputs.set("first", { remoteThreadId: "thread-input", activity: requested("first") });
+    internal.pendingDesktopUserInputs.set("second", { remoteThreadId: "thread-input", activity: requested("second") });
+    internal.supplementalActivities.set("thread-input", [requested("first"), requested("second")]);
+    const snapshots: any[] = [];
+    internal.sockets.add({ data: { subscription: "shell", requestId: "shell" }, send: (body: string) => { snapshots.push(JSON.parse(body)); return body.length; }, close() {} });
+    try {
+      internal.pendingDesktopUserInputs.delete("first");
+      internal.rememberSupplementalActivity("thread-input", resolved("first"));
+      expect(internal.shellCache.threads[0].hasPendingUserInput).toBe(true);
+      internal.pendingDesktopUserInputs.delete("second");
+      internal.rememberSupplementalActivity("thread-input", resolved("second"));
+      expect(internal.shellCache.threads[0].hasPendingUserInput).toBe(false);
+      expect(internal.shellCache.threads[0].currentActivity).not.toBe("Requires your input");
+      expect(snapshots.length).toBeGreaterThan(0);
+      expect(internal.shellLifecycles.get("thread-input").hasPendingUserInput).toBe(false);
+      if (selected) expect(internal.threadStreams.get("thread-input").detail.thread.hasPendingUserInput).toBe(false);
+      expect(internal.hasUnresolvedUserInput([requested("first"), resolved("first")])).toBe(false);
+      expect(internal.hasUnresolvedUserInput([requested("first"), resolved("first"), requested("new")])).toBe(true);
+      const stale = { id: "thread-input", androidRemotePendingUserInput: { itemId: "old-call", callId: "old-call", questions: [{ id: "scope", question: "Choose" }] } };
+      const recovered = internal.rememberDesktopPendingUserInputFromThread(stale, "thread-input");
+      internal.forgetDesktopPendingUserInput(recovered.publicRequestId);
+      internal.rememberSupplementalActivity("thread-input", resolved(recovered.publicRequestId));
+      expect(internal.rememberDesktopPendingUserInputFromThread(stale, "thread-input")).toBeNull();
+      expect(internal.rememberDesktopPendingUserInputFromThread({ ...stale, androidRemotePendingUserInput: { ...stale.androidRemotePendingUserInput, itemId: "new-call", callId: "new-call" } }, "thread-input")).not.toBeNull();
+    } finally { await controller.stop(); }
+  });
+
+  test("shell accepts flag-only lifecycle changes in the same turn and session", async () => {
+    const controller = new AndroidRemoteGatewayController(memoryStore(), { desktopIpcSync: new FakeDesktopIpcSync() });
+    const internal = controller as any;
+    const thread = { id: "thread-flags", session: { status: "running", activeTurnId: "turn-flags", updatedAt: "2026-10-09T00:00:00.000Z" }, latestTurn: { turnId: "turn-flags", state: "running" }, hasPendingUserInput: true, hasPendingApprovals: false };
+    try {
+      const snapshot = { threads: [{ ...thread }] };
+      internal.rememberShellLifecycle(thread.id, { ...thread, hasPendingUserInput: false });
+      internal.applyLiveThreadLifecycleToShell(snapshot);
+      expect(snapshot.threads[0]!.hasPendingUserInput).toBe(false);
+      internal.rememberShellLifecycle(thread.id, { ...thread, hasPendingUserInput: true, hasPendingApprovals: true });
+      internal.applyLiveThreadLifecycleToShell(snapshot);
+      expect(snapshot.threads[0]).toMatchObject({ hasPendingUserInput: true, hasPendingApprovals: true });
+    } finally { await controller.stop(); }
   });
 });

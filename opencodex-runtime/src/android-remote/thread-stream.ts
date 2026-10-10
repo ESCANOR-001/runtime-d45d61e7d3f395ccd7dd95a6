@@ -1,8 +1,11 @@
+import { compactProjectedWork } from "./thread-work-page";
 type JsonRecord = Record<string, unknown>;
 
 export class ProjectedHistoryCursorExpiredError extends Error {}
 
-export const PROJECTED_THREAD_RECENT_BLOCK_LIMIT = 96;
+export const PROJECTED_THREAD_RECENT_PROMPT_LIMIT = 10;
+// Retain the export for callers compiled against the earlier page helper.
+export const PROJECTED_THREAD_RECENT_BLOCK_LIMIT = PROJECTED_THREAD_RECENT_PROMPT_LIMIT;
 export const PROJECTED_THREAD_REPLAY_LIMIT = 256;
 
 export type ProjectedThreadHistoryPage = {
@@ -123,6 +126,22 @@ function compareBlocks(left: TimelineBlock, right: TimelineBlock): number {
   return left.key.localeCompare(right.key);
 }
 
+function isThreadStatusActivity(value: JsonRecord): boolean {
+  return value.kind === "context-window.updated" || value.kind === "provider.usage.updated";
+}
+
+function currentStatusActivities(thread: JsonRecord): JsonRecord[] {
+  const latest = new Map<unknown, JsonRecord>();
+  for (const activity of rows(thread.activities)) {
+    if (!isThreadStatusActivity(activity)) continue;
+    const previous = latest.get(activity.kind);
+    if (!previous || stringValue(activity.createdAt) >= stringValue(previous.createdAt)) {
+      latest.set(activity.kind, activity);
+    }
+  }
+  return [...latest.values()];
+}
+
 function timelineBlocks(thread: JsonRecord): TimelineBlock[] {
   return [
     ...rows(thread.messages).flatMap(value => {
@@ -130,6 +149,7 @@ function timelineBlocks(thread: JsonRecord): TimelineBlock[] {
       return block ? [block] : [];
     }),
     ...rows(thread.activities).flatMap(value => {
+      if (isThreadStatusActivity(value)) return [];
       const block = blockFor("activity", value, 2);
       return block ? [block] : [];
     }),
@@ -140,12 +160,17 @@ function timelineBlocks(thread: JsonRecord): TimelineBlock[] {
   ].sort(compareBlocks);
 }
 
+/** Page by visible prompts, never by the number of tool events. */
 function selectionStart(blocks: TimelineBlock[], end: number, limit: number): number {
-  let start = Math.max(0, end - limit);
-  const first = blocks[start];
-  if (!first?.turnId) return start;
-  while (start > 0 && blocks[start - 1]?.turnId === first.turnId) start -= 1;
-  return start;
+  let prompts = 0;
+  for (let index = end - 1; index >= 0; index -= 1) {
+    const block = blocks[index]!;
+    if (block.kind !== "message" || block.value.role !== "user") continue;
+    if (String(block.value.text).trimStart().startsWith("<send_user_message_question_reply>")) continue;
+    prompts += 1;
+    if (prompts >= limit) return index;
+  }
+  return 0;
 }
 
 function cursorFor(block: TimelineBlock): string {
@@ -178,7 +203,7 @@ function pageFromRange(
     else proposedPlans.push(block.value);
   }
   const sourceCursor = stringValue(record(thread.historyPage)?.olderCursor) || null;
-  return {
+  return compactProjectedWork({
     threadId: stringValue(thread.id),
     messages,
     activities,
@@ -187,7 +212,7 @@ function pageFromRange(
       hasOlder: start > 0 || sourceCursor !== null,
       olderCursor: start > 0 && blocks[start] ? cursorFor(blocks[start]!) : sourceCursor,
     },
-  };
+  }, stringValue(record(thread.session)?.activeTurnId) || null);
 }
 
 export function projectedThreadRecentPage(
@@ -197,7 +222,10 @@ export function projectedThreadRecentPage(
   const thread = threadOf(detail);
   const blocks = timelineBlocks(thread);
   const start = selectionStart(blocks, blocks.length, limit);
-  return pageFromRange(thread, blocks, start, blocks.length);
+  const page = pageFromRange(thread, blocks, start, blocks.length);
+  // Status describes the current task/account, not the selected history range.
+  // Always include it in reconnect snapshots, even when only one prompt loads.
+  return { ...page, activities: [...page.activities, ...currentStatusActivities(thread)] };
 }
 
 export function projectedThreadOlderPage(
@@ -219,14 +247,15 @@ export async function readProjectedOlderPage(
   state: ProjectedThreadStreamState,
   cursor: string,
   recoverDetail: () => Promise<JsonRecord>,
+  limit = PROJECTED_THREAD_RECENT_PROMPT_LIMIT,
 ): Promise<ProjectedThreadHistoryPage> {
   try {
-    return projectedThreadOlderPage(state, cursor);
+    return projectedThreadOlderPage(state, cursor, limit);
   } catch (error) {
     if (!(error instanceof ProjectedHistoryCursorExpiredError)) throw error;
     const detail = await recoverDetail();
     if (threadOf(detail).id !== threadOf(state.detail).id) throw new Error("History belongs to a different task");
-    return projectedThreadOlderPage(createProjectedThreadStreamState(detail), cursor);
+    return projectedThreadOlderPage(createProjectedThreadStreamState(detail), cursor, limit);
   }
 }
 
@@ -236,8 +265,8 @@ export function projectedThreadStartCursor(detail: JsonRecord): string | null {
   return first ? cursorFor(first) : null;
 }
 
-export function projectedThreadBoundedSnapshot(state: ProjectedThreadStreamState): JsonRecord {
-  const page = projectedThreadRecentPage(state.detail);
+export function projectedThreadBoundedSnapshot(state: ProjectedThreadStreamState, promptLimit = PROJECTED_THREAD_RECENT_PROMPT_LIMIT): JsonRecord {
+  const page = projectedThreadRecentPage(state.detail, promptLimit);
   const thread = threadOf(state.detail);
   return {
     kind: "snapshot",
@@ -358,26 +387,22 @@ function changedAppendOnlyDrafts(
   return drafts;
 }
 
-function isStatusActivity(value: JsonRecord): boolean {
-  const kind = stringValue(value.kind);
-  return kind === "context-window.updated" || kind === "provider.usage.updated";
-}
-
 function changedActivityDrafts(
   threadId: string,
   occurredAt: string,
   previous: JsonRecord[],
   next: JsonRecord[],
 ): EventDraft[] | null {
-  const previousVisible = previous.filter(value => !isStatusActivity(value));
-  const nextVisible = next.filter(value => !isStatusActivity(value));
-  if (!idsArePrefix(previousVisible, nextVisible)) return null;
+  // Question resolution removes transient request rows. Send keyed removals,
+  // not a truncated replacement snapshot that can discard loaded conversation.
   const nextIds = new Set(next.map(value => stringValue(value.id)));
-  if (previous.some(value => isStatusActivity(value) && !nextIds.has(stringValue(value.id)))) {
-    return null;
-  }
   const previousById = new Map(previous.map(value => [stringValue(value.id), value]));
-  const drafts: EventDraft[] = [];
+  const drafts: EventDraft[] = previous.filter(value => !nextIds.has(stringValue(value.id))).map(value => ({
+    order: numberValue(value.sequence) ?? 0,
+    event: baseEvent(threadId, occurredAt, "thread.activity-appended", {
+      threadId, activity: { ...value, kind: "activity.removed", summary: "", payload: {} },
+    }),
+  }));
   for (let index = 0; index < next.length; index += 1) {
     const value = next[index]!;
     const before = previousById.get(stringValue(value.id));
@@ -505,6 +530,38 @@ function sequenceItems(
     return { kind: "event", event };
   });
   return { items, sequence };
+}
+
+/** Preserve fetched prefixes and in-flight messages across a bounded owner read. */
+export function mergeBoundedThreadDetail(previousDetail: JsonRecord, nextDetail: JsonRecord): JsonRecord {
+  const previous = threadOf(previousDetail);
+  const next = threadOf(nextDetail);
+  if (previous.id !== next.id) return nextDetail;
+  const incoming = timelineBlocks(next);
+  const first = incoming[0];
+  if (!first) return nextDetail;
+  const turns = new Set(incoming.flatMap(block => block.turnId ? [block.turnId] : []));
+  const hasOlder = Boolean(record(next.historyPage)?.olderCursor);
+  const activeTurn = stringValue(record(next.session)?.activeTurnId);
+  const merge = (field: "messages" | "activities" | "proposedPlans") => {
+    const fresh = rows(next[field]);
+    const ids = new Set(fresh.map(row => row.id));
+    const retained = rows(previous[field]).filter(row => !ids.has(row.id) && row.phase !== "queued"
+      && !(field === "activities" && isThreadStatusActivity(row)) && (
+      (hasOlder && !turns.has(stringValue(row.turnId)) && stringValue(row.createdAt) <= first.createdAt)
+      || (field === "messages" && activeTurn && row.turnId === activeTurn)
+    ));
+    const kind = field === "messages" ? "message" : field === "activities" ? "activity" : "plan";
+    return [...retained, ...fresh].flatMap(row => {
+      const block = blockFor(kind, row, 0);
+      return block ? [block] : [];
+    }).sort(compareBlocks).map(block => block.value);
+  };
+  const messages = merge("messages");
+  const retainedPrefix = messages.some(row => !turns.has(stringValue(row.turnId)));
+  return { ...nextDetail, thread: { ...next, messages,
+    ...(retainedPrefix ? { historyPage: previous.historyPage } : {}),
+    activities: merge("activities"), proposedPlans: merge("proposedPlans") } };
 }
 
 export function createProjectedThreadStreamState(

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   advanceProjectedThreadStream,
   createProjectedThreadStreamState,
+  mergeBoundedThreadDetail,
   projectedThreadBoundedSnapshot,
   projectedThreadOlderPage,
   readProjectedOlderPage,
@@ -129,6 +130,40 @@ function detail(input: {
 }
 
 describe("Android Remote projected task stream", () => {
+  test("retains current limits and context outside the recent prompt window", () => {
+    const messages = Array.from({ length: 12 }, (_, index) => ({
+      ...message(`prompt-${index}`, `Prompt ${index}`, index + 1), role: "user",
+    }));
+    const status = [statusActivity(), providerUsageActivity()];
+    const state = createProjectedThreadStreamState(detail({ messages, activities: status }));
+    for (const limit of [1, 10]) {
+      const snapshot = projectedThreadBoundedSnapshot(state, limit) as any;
+      expect(snapshot.snapshot.thread.messages).toHaveLength(limit);
+      expect(snapshot.snapshot.thread.activities).toEqual(status);
+      const older = projectedThreadOlderPage(state, snapshot.snapshot.historyPage.olderCursor);
+      expect(older.activities).toEqual([]);
+    }
+  });
+
+  test("status alone never creates older chat history and latest clearing wins", () => {
+    const previous = providerUsageActivity();
+    const cleared = { ...previous, id: "latest-status", createdAt: "2026-08-11T00:05:00.000Z",
+      payload: { providerLabel: "OpenAI", windows: [] } };
+    const state = createProjectedThreadStreamState(detail({ activities: [cleared, previous] }));
+    const snapshot = projectedThreadBoundedSnapshot(state, 1) as any;
+    expect(snapshot.snapshot.thread.activities).toEqual([cleared]);
+    expect(snapshot.snapshot.historyPage).toEqual({ hasOlder: false, olderCursor: null });
+  });
+
+  test("history retention does not revive status missing from the authoritative read", () => {
+    const previous = detail({ messages: [message("old", "Earlier", 1)], activities: [providerUsageActivity()] });
+    const next = detail({ messages: [message("new", "Latest", 20)] });
+    (next.thread as JsonRecord).historyPage = { olderCursor: "older-history" };
+    const merged = mergeBoundedThreadDetail(previous, next);
+    expect((merged.thread as JsonRecord).messages).toHaveLength(2);
+    expect((merged.thread as JsonRecord).activities).toEqual([]);
+  });
+
   test("suppresses a read-counter-only refresh", () => {
     const state = createProjectedThreadStreamState(detail({ readSequence: 4 }));
     const advanced = advanceProjectedThreadStream(state, detail({ readSequence: 99 }));

@@ -512,6 +512,9 @@ export class AndroidCodexRuntime {
       close: () => {
         if (this.facade === facade) void this.stop();
       },
+      get directModelProvider() {
+        return facade === thisRuntime.facade ? thisRuntime.socket?.directModelProvider : undefined;
+      },
       get connected() {
         return facade === thisRuntime.facade && thisRuntime.status().connected;
       },

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { generatedImagePaths } from "./generated-images";
 import { normalizedCompletedItem } from "./desktop-thread-item";
+import { codexRuntimeStatus } from "./thread-runtime-status";
 import { Buffer } from "node:buffer";
 import { basename } from "node:path";
 import {
@@ -700,6 +701,8 @@ function turnState(turn: JsonRecord): "running" | "interrupted" | "completed" | 
 }
 
 function latestTurn(thread: JsonRecord): JsonRecord | null {
+  const runtimeActive = thread.androidRemoteHistoryOnly !== true
+    && codexRuntimeStatus(thread.status)?.type === "active";
   const projectedState = text(thread.androidRemoteLatestTurnState);
   const hasProjectedLifecycle =
     projectedState === "running" ||
@@ -708,7 +711,7 @@ function latestTurn(thread: JsonRecord): JsonRecord | null {
     projectedState === "error";
   const turns = turnRows(thread);
   if (
-    hasProjectedLifecycle
+    hasProjectedLifecycle && (!runtimeActive || projectedState === "running")
     && projectedTurnLifecycleWins(turns, {
       state: projectedState,
       turnId: thread.androidRemoteLatestTurnId,
@@ -720,7 +723,7 @@ function latestTurn(thread: JsonRecord): JsonRecord | null {
     // Keep the internal running marker for ownership safety, but avoid telling
     // the phone that unverified work is still progressing. The session carries
     // a visible, retryable connection error instead of a fabricated completion.
-    if (thread.androidRemoteActivityUnverified === true) return null;
+    if (thread.androidRemoteActivityUnverified === true && !runtimeActive) return null;
     const occurredAt = text(thread.androidRemoteLatestTurnAt)
       || isoFromSeconds(thread.updatedAt);
     return {
@@ -738,6 +741,9 @@ function latestTurn(thread: JsonRecord): JsonRecord | null {
   const turn = canonicalTurnsNewestFirst(turns)[0];
   if (!turn) return null;
   const state = turnState(turn);
+  // A metadata-only active snapshot can precede its new turn details. Do not
+  // expose the previous interrupted turn as the currently resumable task.
+  if (runtimeActive && state !== "running") return null;
   return {
     turnId: text(turn.id, stableId("turn", `${text(thread.id)}:${turns.length}`)),
     state,
@@ -758,16 +764,19 @@ function lastAssistantMessageId(turn: JsonRecord): string | null {
 }
 
 function sessionOf(thread: JsonRecord, updatedAt: string): JsonRecord {
+  const runtimeActive = thread.androidRemoteHistoryOnly !== true
+    && codexRuntimeStatus(thread.status)?.type === "active";
   const status = record(thread.status);
   const type = text(status?.type);
   const turns = turnRows(thread);
   const activity = canonicalTurnActivitySnapshot(turns);
-  const failed = [...turns].reverse().find(turn => turn.status === "failed");
+  const newestTurn = canonicalTurnsNewestFirst(turns)[0];
+  const failed = newestTurn?.status === "failed" ? newestTurn : null;
   const error = failed ? record(failed.error) : null;
   const canonicalErrorMessage = boundedTurnErrorMessage(error);
   const projectedState = text(thread.androidRemoteLatestTurnState);
   const projectedTurnId = text(thread.androidRemoteLatestTurnId) || null;
-  const projectedLifecycleWins = projectedTurnLifecycleWins(turns, {
+  const projectedLifecycleWins = (!runtimeActive || projectedState === "running") && projectedTurnLifecycleWins(turns, {
     state: projectedState,
     turnId: projectedTurnId,
     occurredAt: thread.androidRemoteLatestTurnAt,
@@ -776,23 +785,22 @@ function sessionOf(thread: JsonRecord, updatedAt: string): JsonRecord {
   });
   const projectedRunning = projectedLifecycleWins && projectedState === "running";
   const projectedError = projectedLifecycleWins && projectedState === "error";
-  const unverified = projectedLifecycleWins && thread.androidRemoteActivityUnverified === true;
+  const unverified = !runtimeActive && projectedLifecycleWins && thread.androidRemoteActivityUnverified === true;
   const historyWarning = boundedTurnErrorMessage(thread.androidRemoteHistoryRecoveryError);
   const projectedErrorMessage = projectedError
     ? boundedTurnErrorMessage(thread.androidRemoteLatestTurnError)
     : "";
-  const canonicalRunning = !projectedLifecycleWins && activity.active;
+  const canonicalRunning = runtimeActive || (!projectedLifecycleWins && activity.active);
   return {
     threadId: text(thread.id),
-    // Codex also reports an open/mounted Desktop conversation as `active`
-    // after its turn has completed. Only an explicit running task marker or
-    // an in-progress canonical turn proves that Android should keep showing
-    // Thinking and the Stop action after a reconnect.
+    // Public active runtime status is authoritative even without turn history
+    // or waiting flags. Private mounted-view labels are not this protocol.
     status: unverified ? "error" : projectedRunning || canonicalRunning
       ? "running"
       : projectedError || type === "systemError"
         ? "error"
         : "idle",
+    statusConfidence: unverified ? "unknown" : "confirmed",
     // Remodex uses providerName as the driver-kind lock and
     // providerInstanceId as the exact routing key. Every Android Remote task
     // is driven by the Codex bridge even when Remodex routes its selected
@@ -805,7 +813,7 @@ function sessionOf(thread: JsonRecord, updatedAt: string): JsonRecord {
       : canonicalRunning
         ? activity.activeTurnId || null
         : null,
-    lastError: unverified
+    lastError: !unverified && (projectedRunning || canonicalRunning) ? null : unverified
       ? "Task status is unavailable. Reconnect to check whether it is still running."
       : projectedError
       ? projectedErrorMessage || canonicalErrorMessage || null
@@ -1528,8 +1536,9 @@ function shellThread(thread: JsonRecord): JsonRecord {
     archivedAt: text(thread.androidRemoteArchivedAt).trim() || null,
     session,
     latestUserMessageAt: recencyAt,
-    hasPendingApprovals: false,
-    hasPendingUserInput: thread.androidRemoteWaitingOnUserInput === true,
+    hasPendingApprovals: codexRuntimeStatus(thread.status)?.waitingOnApproval === true,
+    hasPendingUserInput: thread.androidRemoteWaitingOnUserInput === true
+      || codexRuntimeStatus(thread.status)?.waitingOnUserInput === true,
     hasActionableProposedPlan: false,
     source: { kind: "remodex-projected" },
   };

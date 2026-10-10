@@ -15,6 +15,11 @@ Unverifiable saved history fails closed without sending or resolving the answer.
 Accepted steering replies and ordinary user replies resolve the same questions.
 Android displays a question sheet with options and an optional custom answer,
 then compact question/answer bubbles instead of transport JSON.
+Successful input delivery publishes request-scoped resolution to both the thread
+stream and shell immediately; notification and sidebar share that shell state.
+Historical requested rows do not keep resolved questions pending. Flag-only
+lifecycle changes must publish even when the session and turn are unchanged,
+and other unanswered requests must survive an acknowledgement.
 
 A current, explicitly unfinished `contextCompaction` item keeps the task running
 even if the secondary app-server says idle. Completed or historical compaction
@@ -49,6 +54,33 @@ when a bounded SHA-256 reread proves the scanned prefix unchanged; replacements,
 truncations, and rewritten prefixes invalidate recovery. No rollout is modified.
 
 ## Android sidebar updates
+
+Thread context and provider-usage activities are current status metadata, not
+paginated conversation blocks. Recent snapshots include the latest row of each
+kind independently of its timestamp or prompt limit. Older pages exclude those
+rows so they cannot overwrite a newer reading or create a status-only cursor.
+
+Public `thread/status/changed` events update the selected task and sidebar
+immediately, including `active` with no waiting flags. Desktop's private
+mounted-conversation status is normalized against its bounded turn evidence
+separately. Secondary-reader lifecycle events cannot override a Desktop owner.
+Session `statusConfidence` distinguishes confirmed execution from unknown
+activity; unknown work retains a server-validated Stop action and does not
+silently become completed or permit a competing Send. An idle status alone
+does not invent an interrupted/completed outcome. Only a matching turn outcome
+enables Continue after interruption. Ordinary Continue starts a new turn;
+it is not the optional Codex goal pause/resume API.
+
+Manual Stop routes to the Desktop owner before reading status or saved history.
+It omits `expectedTurnId`: Desktop's normal user-stop resolves its current turn,
+handles turn-id changes, pauses an active goal and cleans up running work. A stale
+expected id can acknowledge a no-op and skip goal pausing. Only a nonempty
+`interruptedTurnId` confirms interruption; `ok:true` alone is insufficient.
+Confirmed owner results publish the matching interrupted lifecycle immediately;
+newer observed turns remain protected. A null result, unreachable owner or goal
+pause failure is surfaced to Android and triggers a fresh status read. Android
+keeps Stop pending until the request settles and never invents a paused state
+from a button tap. Stop does not fall back to a secondary writer or kill Desktop.
 
 An uncached shell subscription waits for a real lightweight first-page snapshot;
 an invented empty bootstrap must not mark a newly paired phone ready. Explicit
@@ -320,6 +352,25 @@ the text as an ordinary draft.
 - 선택한 방식: Keep one logical client per runtime lifecycle, replace only its private raw socket through a concurrency-safe connection flight, and preserve subscribers across replacements.
 - 다른 대안 대신 이 방식을 선택한 이유: Phone credentials and public transport were healthy, so restarting them expanded the failure surface. A stable client fixes every gateway caller at one lifecycle boundary and avoids duplicate listener registration.
 - 장점, 단점 및 영향: Existing phones recover without user action and concurrent config/shell reads create only one app-server process. A mutating request whose delivery became uncertain still fails visibly instead of being replayed, requiring the user to retry after state refresh.
+
+## Android prompt paging and Work details
+
+The selected transcript opens completed history with ten user prompts and
+prioritizes one newest turn while running. Android fills the remaining recent
+prompt window independently of live updates. Question replies remain with their originating prompt; ordinary steering
+messages count as prompts. Tool counts do not determine the
+outer history boundary. Older history uses ten-prompt pages and is prefetched
+when the reader approaches the oldest two loaded prompts; only one history
+request is in flight. Native stable row keys preserve the reader's current
+position; request-time scroll anchors must never be restored after a response.
+
+Completed Work bodies are represented by revisioned disclosures in snapshots
+and older pages. Expansion reads up to 100 work entries (512 KiB target) through
+`orchestration.getTurnWork`; further entries use a turn/revision-bound cursor.
+Live work continues through ordinary events. Hydrated Work survives a matching
+compact snapshot. Question activity removals use keyed tombstones instead of
+replacing the transcript, and bounded owner reads retain fetched prefixes and
+missing in-flight messages. Explicit history rewrites remain authoritative.
 
 ## Android Remote thread reconciliation and live convergence
 

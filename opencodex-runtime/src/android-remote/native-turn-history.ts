@@ -2,7 +2,7 @@ import type { AndroidCodexClient } from "./codex-app-server";
 
 type JsonRecord = Record<string, unknown>;
 const CURSOR_PREFIX = "native-turns:";
-export const NATIVE_HISTORY_TURN_LIMIT = 1;
+export const NATIVE_HISTORY_TURN_LIMIT = 10;
 
 export function nativeHistoryCursor(threadId: string, cursor: string | null): string | null {
   return cursor ? CURSOR_PREFIX + Buffer.from(JSON.stringify({ threadId, cursor })).toString("base64url") : null;
@@ -48,10 +48,11 @@ export async function readNativeTurnsPage(
   client: AndroidCodexClient,
   threadId: string,
   cursor?: string,
+  limit = NATIVE_HISTORY_TURN_LIMIT,
 ): Promise<{ turns: JsonRecord[]; nextCursor: string | null }> {
   const result = await client.request<{ data?: unknown; nextCursor?: unknown }>("thread/turns/list", {
     threadId,
-    limit: NATIVE_HISTORY_TURN_LIMIT,
+    limit: Math.max(1, Math.min(NATIVE_HISTORY_TURN_LIMIT, Math.floor(limit))),
     sortDirection: "desc",
     itemsView: "full",
     ...(cursor ? { cursor } : {}),
