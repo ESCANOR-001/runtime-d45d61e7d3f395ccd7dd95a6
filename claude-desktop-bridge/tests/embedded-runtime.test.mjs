@@ -41,6 +41,7 @@ test('direct model selection applies on send; stale sends never reach the in-app
     if (input.op === 'models') return { models };
     if (input.op === 'read') return { conversation: c };
     if (input.op === 'send') return { submitted: true };
+    if (input.op === 'stop') return { stopped: true };
     throw new Error('Unexpected mutation');
   } });
   let state = await adapter({ op: 'snapshot' });
@@ -55,6 +56,9 @@ test('direct model selection applies on send; stale sends never reach the in-app
   assert.equal(calls.find(c => c.op === 'send').model, 'sonnet');
   assert.equal(calls.find(c => c.op === 'send').parentId, answer);
   assert.equal(calls.filter(c => c.op === 'model').length, 0);
+  c.chat_messages[1].content.push({ type: 'text', text: 'stream advanced' });
+  await adapter({ op: 'stop', sessionId: id, revision: state.revision });
+  assert.equal(calls.find(c => c.op === 'stop').commandId, calls.find(c => c.op === 'send').commandId);
 });
 
 test('truncated catalogs and unsupported image sends cannot silently succeed', async () => {

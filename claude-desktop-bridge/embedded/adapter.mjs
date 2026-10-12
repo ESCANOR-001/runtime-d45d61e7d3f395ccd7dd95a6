@@ -94,7 +94,7 @@ export function createEmbeddedAdapter({ request = embeddedRequest } = {}) {
       return { sessionId: input.sessionId, revision: state.revision, messages: state.allMessages.slice(start, end), start, end, hasMore: start > 0 };
     }
     const state = await snapshot();
-    if (input.sessionId !== state.sessionId || input.revision !== state.revision) throw new Error('Claude chat changed. Refresh before trying again.');
+    if (input.sessionId !== state.sessionId || (!['open', 'stop'].includes(input.op) && input.revision !== state.revision)) throw new Error('Claude chat changed. Refresh before trying again.');
     if (input.op === 'open') {
       const next = await snapshot(input.targetSessionId); selected = input.targetSessionId;
       return publicSnapshot(next);
