@@ -251,4 +251,11 @@ export class NativeDesktop {
     return this[method](request);
   }
 }
-export const nativeDesktop = request => new NativeDesktop().execute(request);
+export const nativeDesktop = request => {
+  const deadline = Date.now() + 45000;
+  return new NativeDesktop(input => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error('Desktop action timed out. Inspect Desktop before retrying.');
+    return nativeCall(input, { timeout: Math.min(15000, remaining) });
+  }).execute(request);
+};
