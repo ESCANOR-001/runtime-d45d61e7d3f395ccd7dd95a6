@@ -79,6 +79,7 @@ test('in-app requests keep account credentials inside the renderer and reject ac
     fetch: async (url, options) => {
       requests.push({ url, options });
       assert.equal(options.credentials, 'same-origin');
+      if (url.endsWith('/model_selector/chat')) return new Response(JSON.stringify({ model_selector_config: [{ id: 'chat', models: [{ id: 'haiku', name: 'Haiku' }] }] }));
       return new Response(JSON.stringify({ memberships: [{ organization: { uuid: id, claude_ai_bootstrap_models_config: [{ model: 'haiku', name: 'Haiku' }] } }] }));
     } };
   vm.createContext(sandbox);
@@ -88,7 +89,7 @@ test('in-app requests keep account credentials inside the renderer and reject ac
   await assert.rejects(sandbox.__remodexChatBridge.request({ op: 'executeJavaScript', code: 'bad' }), /Unsupported/);
   document.cookie = `lastActiveOrg=${human}`;
   await assert.rejects(sandbox.__remodexChatBridge.request({ op: 'models' }), /account changed/);
-  assert.equal(requests.length, 1);
+  assert.equal(requests.length, 2);
 });
 
 test('embedded listener authenticates before renderer access and rejects browser origins and oversized bodies', async t => {
@@ -127,4 +128,99 @@ test('embedded listener authenticates before renderer access and rejects browser
   assert.equal(evaluations, 0);
   assert.equal((await request()).status, 200);
   assert.equal(evaluations, 2);
+});
+
+test('access reads only the named conversation serving metadata without exposing account or device identifiers', async () => {
+  const requests = [];
+  const sandbox = { document: { cookie: `lastActiveOrg=${id}` }, AbortSignal, URL, setTimeout, clearTimeout,
+    fetch: async (url, options) => {
+      requests.push({ url, options });
+      if (url === '/api/account') return new Response(JSON.stringify({ memberships: [{ organization: { uuid: id } }] }));
+      assert.equal(url, `/api/organizations/${id}/chat_conversations/${human}/serving`);
+      assert.equal(options.method, 'GET');
+      return new Response(JSON.stringify({ workspace_served: false, permission_mode: 'acceptEdits', device_bound: true, bound_device_id: 'private-device' }));
+    } };
+  vm.createContext(sandbox);
+  await vm.runInContext(`(${install.toString()})()`, sandbox);
+  const result = await sandbox.__remodexChatBridge.request({ op: 'access', sessionId: human });
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), { workspaceServed: false, permissionMode: 'acceptEdits', deviceBound: true });
+  await assert.rejects(sandbox.__remodexChatBridge.request({ op: 'access', sessionId: '../another' }), /Invalid/);
+  assert.equal(requests.length, 2);
+});
+
+test('Desktop model metadata supplies effort and thinking choices without upgrade-only models', async () => {
+  const sandbox = { document: { cookie: `lastActiveOrg=${id}` }, AbortSignal, URL, setTimeout, clearTimeout,
+    fetch: async url => new Response(JSON.stringify(url === '/api/account' ? { memberships: [{ organization: { uuid: id } }] } : {
+      model_selector_config: [{ id: 'chat', models: [
+        { id: 'haiku', name: 'Haiku', thinking: { always_on: true, effort_options: [{ id: 'medium', name: 'Medium', recommended: true }, { id: 'high', name: 'High' }], mode_options: [{ id: 'auto', name: 'Thinking' }] } },
+        { id: 'locked', name: 'Locked', disabled_reason: { type: 'upgrade_required' } },
+        { id: 'retired', name: 'Retired', section: 'deprecated' },
+      ] }], model_selector_state: [{ id: 'chat', model: 'haiku', thinking: { effort: 'medium', mode: 'auto' } }],
+    })) };
+  vm.createContext(sandbox); await vm.runInContext(`(${install.toString()})()`, sandbox);
+  const result = await sandbox.__remodexChatBridge.request({ op: 'models' });
+  assert.deepEqual(Array.from(result.models, model => model.id), ['haiku']);
+  assert.equal(result.models[0].thinking.always_on, true);
+  const adapter = createEmbeddedAdapter({ request: async input => input.op === 'models' ? result : { conversation: { ...conversation(), settings: { effort_level: 'high', thinking_mode: 'auto' } } } });
+  const catalog = await adapter({ op: 'models' });
+  assert.deepEqual(Array.from(catalog.models[0].capabilities.optionDescriptors[0].options, option => option.id), ['medium', 'high']);
+  let state = await adapter({ op: 'snapshot' });
+  state = await adapter({ op: 'open', sessionId: state.sessionId, revision: state.revision, targetSessionId: id });
+  assert.equal(state.modelOptions.find(option => option.id === 'reasoningEffort').value, 'high');
+  assert.equal(state.modelOptions.find(option => option.id === 'thinking').value, 'auto');
+  await assert.rejects(adapter({ op: 'settings', sessionId: id, revision: state.revision, runtimeMode: 'full-access' }), /not available/);
+});
+
+test('settings validate model support and confirm server persistence instead of accepting ignored writes', async () => {
+  const calls = []; let saved = {}, ignore = false;
+  const sandbox = { document: { cookie: `lastActiveOrg=${id}` }, AbortSignal, URL, setTimeout, clearTimeout,
+    fetch: async (url, options) => {
+      calls.push({ url, method: options.method });
+      let data;
+      if (url === '/api/account') data = { memberships: [{ organization: { uuid: id } }] };
+      else if (url.endsWith('/model_selector/chat')) data = { model_selector_config: [{ id: 'chat', models: [{ id: 'haiku', name: 'Haiku', thinking: { effort_options: [{ id: 'low', name: 'Low' }], mode_options: [{ id: 'auto', name: 'Thinking' }] } }] }] };
+      else if (url.includes('completion_status')) data = { is_pending: false };
+      else if (options.method === 'PUT') { if (!ignore) saved = JSON.parse(options.body).settings; data = {}; }
+      else data = { ...conversation(), settings: saved };
+      return new Response(JSON.stringify(data));
+    } };
+  vm.createContext(sandbox); await vm.runInContext(`(${install.toString()})()`, sandbox);
+  const request = settings => sandbox.__remodexChatBridge.request({ op: 'settings', sessionId: id, model: 'haiku', parentId: answer, settings });
+  await assert.rejects(request({ thinking_mode: 'off' }), /unavailable/);
+  await assert.rejects(request({ effort_level: 'max' }), /unavailable/);
+  await assert.rejects(request({ permission_mode: 'bypassPermissions' }), /not supported/);
+  assert.equal(calls.filter(call => call.method === 'PUT').length, 0);
+  assert.equal((await request({ effort_level: 'low' })).applied, true);
+  ignore = true;
+  await assert.rejects(request({ thinking_mode: 'auto' }), /did not confirm/);
+});
+
+test('saved reasoning survives adapter reconnect and is forwarded on completion without changing access', async () => {
+  let settings = { effort_level: 'low', thinking_mode: 'auto' };
+  const calls = [];
+  const request = async input => {
+    calls.push(input);
+    if (input.op === 'models') return { models: [{ id: 'haiku', name: 'Haiku', thinking: {
+      effort_options: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }], mode_options: [{ id: 'auto', name: 'Thinking' }],
+    } }] };
+    if (input.op === 'read') return { conversation: { ...conversation(), settings } };
+    if (input.op === 'access') return { permissionMode: 'auto', workspaceServed: false };
+    if (input.op === 'settings') { settings = { ...settings, ...input.settings }; return { applied: true }; }
+    if (input.op === 'send') return { submitted: true };
+    throw Error('Unexpected operation');
+  };
+  async function open(adapter) { const s = await adapter({ op: 'snapshot' }); return adapter({ op: 'open', sessionId: s.sessionId, revision: s.revision, targetSessionId: id }); }
+  const first = createEmbeddedAdapter({ request });
+  let state = await open(first);
+  state = await first({ op: 'settings', sessionId: id, revision: state.revision, options: [{ id: 'reasoningEffort', value: 'high' }] });
+  const reconnected = createEmbeddedAdapter({ request });
+  state = await open(reconnected);
+  assert.equal(state.modelOptions.find(option => option.id === 'reasoningEffort').value, 'high');
+  assert.equal(state.runtimeMode, 'auto-accept-edits');
+  assert.equal(state.accessSupported, false);
+  await reconnected({ op: 'send', sessionId: id, revision: state.revision, text: 'Test' });
+  const sent = calls.find(call => call.op === 'send');
+  assert.equal(sent.effort, 'high'); assert.equal(sent.thinkingMode, 'auto');
+  assert.equal(calls.filter(call => call.op === 'settings').length, 1);
+  assert.equal(calls.find(call => call.op === 'settings').settings.permission_mode, undefined);
 });

@@ -10,6 +10,7 @@ module.exports = async function installRemodexChat() {
   let boundOrg = null;
   const runs = new Map();
   const sentCommands = new Set();
+  let configurationCache = null, configurationAt = 0;
   async function context() {
     const active = document.cookie.match(/(?:^|;\s*)lastActiveOrg=([^;]*)/)?.[1];
     if (!uuid.test(active || '')) throw new Error('Select a Claude account in Desktop.');
@@ -37,8 +38,42 @@ module.exports = async function installRemodexChat() {
     return input.sessionId;
   }
   const read = (org, id) => api(org, `chat_conversations/${id}?tree=True&rendering_mode=messages`);
-  const modelList = org => (org.claude_ai_bootstrap_models_config || [])
-    .filter(model => !model.inactive).map(model => ({ id: model.model, name: model.name, legacy: model.overflow === true }));
+  async function configuration(org) {
+    if (!configurationCache || Date.now() - configurationAt > 30000) {
+      const data = await api(org, 'model_selector/chat');
+      const config = data.model_selector_config?.find(item => item.id === 'chat');
+      const selected = data.model_selector_state?.find(item => item.id === 'chat');
+      if (!Array.isArray(config?.models)) throw new Error('Claude model settings are unavailable.');
+      const options = rows => (rows || []).filter(row => typeof row.id === 'string' && typeof row.name === 'string')
+        .map(row => ({ id: row.id, name: row.name, recommended: row.recommended === true,
+          description: [row.description, row.tooltip?.content].filter(v => typeof v === 'string').join(' ') }));
+      configurationCache = { models: config.models.filter(model => !model.disabled_reason && !['deprecated', 'legacy'].includes(model.section))
+        .map(model => ({ id: model.id, name: model.name, legacy: model.section === 'overflow',
+          thinking: { effort_options: options(model.thinking?.effort_options), mode_options: options(model.thinking?.mode_options),
+            always_on: model.thinking?.always_on === true, description: typeof model.thinking?.description === 'string' ? model.thinking.description : undefined } })),
+        selected: selected ? { model: selected.model, thinking: selected.thinking } : null };
+      configurationAt = Date.now();
+    }
+    return configurationCache;
+  }
+  async function applySettings(org, input) {
+    const id = session(input), settings = input.settings;
+    if (!settings || typeof settings !== 'object' || Array.isArray(settings) || !Object.keys(settings).length ||
+      Object.keys(settings).some(key => !['permission_mode', 'effort_level', 'thinking_mode'].includes(key))) throw new Error('Unsupported Claude setting.');
+    if ('permission_mode' in settings) throw new Error('Access changes are not supported by this Claude Desktop bridge. Manage access in Claude Desktop.');
+    const model = (await configuration(org)).models.find(model => model.id === input.model);
+    if (!model) throw new Error('Model is not available in Claude Desktop.');
+    for (const [key, options] of [['effort_level', model.thinking.effort_options], ['thinking_mode', model.thinking.mode_options]]) {
+      if (key in settings && !options.some(option => option.id === settings[key])) throw new Error('This setting is unavailable for the selected Claude model.');
+    }
+    const before = await read(org, id);
+    if ((before.current_leaf_message_uuid || '00000000-0000-4000-8000-000000000000') !== input.parentId) throw new Error('Claude chat changed. Refresh before changing settings.');
+    if (runs.get(id)?.busy || (await api(org, `chat_conversations/${id}/completion_status?poll=false`)).is_pending) throw new Error('Wait for Claude to finish before changing settings.');
+    await api(org, `chat_conversations/${id}?rendering_mode=raw`, 'PUT', { settings });
+    const after = await read(org, id);
+    if (Object.entries(settings).some(([key, value]) => after.settings?.[key] !== value)) throw new Error('Claude did not confirm the setting. Refresh before trying again.');
+    return { applied: true };
+  }
   async function stream(org, id, input, run) {
     try {
       const response = await fetch(`/api/organizations/${org.uuid}/chat_conversations/${id}/completion`, {
@@ -46,6 +81,8 @@ module.exports = async function installRemodexChat() {
         body: JSON.stringify({ prompt: input.text, parent_message_uuid: input.parentId,
           model: input.model, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: 'en-US',
           attachments: [], files: [], sync_sources: [], rendering_mode: 'messages',
+          ...(input.effort ? { effort: input.effort } : {}),
+          ...(input.thinkingMode ? { thinking_mode: input.thinkingMode } : {}),
           completion_request_id: run.id }), signal: run.controller.signal,
       });
       if (!response.ok || !response.headers.get('content-type')?.includes('text/event-stream')) {
@@ -82,7 +119,16 @@ module.exports = async function installRemodexChat() {
     if (!input || typeof input !== 'object') throw new Error('Invalid bridge request.');
     const org = await context();
     switch (input.op) {
-      case 'models': return { models: modelList(org) };
+      case 'models': case 'configuration': return configuration(org);
+      case 'settings': return applySettings(org, input);
+      case 'access': {
+        const id = session(input);
+        const serving = await api(org, `chat_conversations/${id}/serving`);
+        if (typeof serving.workspace_served !== 'boolean') throw new Error('Claude did not identify this conversation runtime.');
+        return { workspaceServed: serving.workspace_served,
+          permissionMode: ['default', 'acceptEdits', 'auto', 'bypassPermissions'].includes(serving.permission_mode) ? serving.permission_mode : null,
+          deviceBound: serving.device_bound === true };
+      }
       case 'catalog': {
         const rows = await api(org, 'chat_conversations?limit=1000');
         if (!Array.isArray(rows)) throw new Error('Claude returned an unsupported chat catalog.');
@@ -92,6 +138,8 @@ module.exports = async function installRemodexChat() {
       case 'read': {
         const id = session(input), conversation = await read(org, id), run = runs.get(id);
         return { conversation: { uuid: conversation.uuid, name: conversation.name, model: conversation.model,
+          settings: { permission_mode: conversation.settings?.permission_mode,
+            effort_level: conversation.settings?.effort_level, thinking_mode: conversation.settings?.thinking_mode },
           created_at: conversation.created_at, updated_at: conversation.updated_at,
           current_leaf_message_uuid: conversation.current_leaf_message_uuid,
           chat_messages: conversation.chat_messages?.map(message => ({ uuid: message.uuid, sender: message.sender,
@@ -116,7 +164,10 @@ module.exports = async function installRemodexChat() {
         const id = session(input);
         if (typeof input.text !== 'string' || !input.text.trim() || input.text.length > 8000) throw new Error('Invalid prompt.');
         if (!uuid.test(input.parentId || '') || !uuid.test(input.commandId || '')) throw new Error('Invalid turn identity.');
-        if (!modelList(org).some(model => model.id === input.model)) throw new Error('Model is not in this account catalog.');
+        const model = (await configuration(org)).models.find(model => model.id === input.model);
+        if (!model) throw new Error('Model is not in this account catalog.');
+        if (input.effort !== undefined && !model.thinking.effort_options.some(option => option.id === input.effort)) throw new Error('Invalid Claude effort.');
+        if (input.thinkingMode !== undefined && !model.thinking.mode_options.some(option => option.id === input.thinkingMode)) throw new Error('Invalid Claude thinking mode.');
         if (runs.get(id)?.busy) throw new Error('Claude is already replying in this chat.');
         if (sentCommands.has(input.commandId)) throw new Error('This command has already been submitted; it will not be replayed.');
         if (sentCommands.size >= 1000) throw new Error('Restart the bridge before sending more commands.');

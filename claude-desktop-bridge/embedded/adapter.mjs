@@ -42,19 +42,37 @@ export function visibleMessages(conversation) {
 }
 
 export function createEmbeddedAdapter({ request = embeddedRequest } = {}) {
-  let selected = null, knownModels = [], modelsAt = 0;
+  let selected = null, knownModels = [], modelsAt = 0, desktopSelection = null;
   const runIds = new Map();
   const selectedModels = new Map();
+  const accessCache = new Map();
+  async function access(id) {
+    const cached = accessCache.get(id);
+    if (cached && Date.now() - cached.at < 30000) return cached.value;
+    const value = await request({ op: 'access', sessionId: id }).catch(() => null);
+    accessCache.set(id, { at: Date.now(), value });
+    return value;
+  }
   async function models() {
     if (!knownModels.length || Date.now() - modelsAt > 30000) {
-      knownModels = (await request({ op: 'models' })).models; modelsAt = Date.now();
+      const data = await request({ op: 'models' });
+      knownModels = data.models; desktopSelection = data.selected; modelsAt = Date.now();
     }
-    return knownModels.map(model => ({ id: hash(model.id), label: label(model.name), value: model.id }));
+    return knownModels.map(model => ({ id: hash(model.id), label: label(model.name), value: model.id,
+      capabilities: { optionDescriptors: [
+        ['reasoningEffort', 'Effort', model.thinking?.effort_options],
+        ['thinking', 'Thinking', model.thinking?.mode_options],
+      ].filter(([, , choices]) => choices?.length).map(([id, title, choices]) => ({
+        id, label: title, type: 'select', ...(model.thinking?.description ? { description: model.thinking.description } : {}),
+        options: choices.map(option => ({ id: option.id, label: option.name,
+          ...(option.description ? { description: option.description } : {}),
+          isDefault: option.recommended === true || choices.length === 1 })),
+      })) } }));
   }
   async function snapshot(id = selected) {
-    if (!id) return { sessionId: 'new', revision: hash('new'), title: 'New chat', model: (await models())[0]?.label,
+    if (!id) return { sessionId: 'new', revision: hash('new'), title: 'New chat', model: label(knownModels.find(m => m.id === desktopSelection?.model)?.name) || (await models())[0]?.label,
       busy: false, draftPresent: false, messages: [], chats: [], capabilities: ['direct'], history: { start: 0, end: 0, total: 0, hasMore: false } };
-    const { conversation, run } = await request({ op: 'read', sessionId: id });
+    const [{ conversation, run }, nativeAccess] = await Promise.all([request({ op: 'read', sessionId: id }), access(id)]);
     if (conversation.uuid !== id) throw new Error('Claude returned a different chat.');
     const messages = visibleMessages(conversation);
     // Persisted messages remain authoritative. The stream supplements only
@@ -65,10 +83,22 @@ export function createEmbeddedAdapter({ request = embeddedRequest } = {}) {
       else if (last?.role === 'user' && last.id !== run.parentId) messages.push({ role: 'assistant', text: run.text });
     }
     const modelId = selectedModels.get(id) || conversation.model;
-    const revision = hash({ id, leaf: conversation.current_leaf_message_uuid, messages, model: modelId });
+    const model = knownModels.find(model => model.id === modelId);
+    const settings = conversation.settings || {};
+    const modelOptions = [['reasoningEffort', settings.effort_level, model?.thinking?.effort_options, desktopSelection?.thinking?.effort],
+      ['thinking', settings.thinking_mode, model?.thinking?.mode_options, desktopSelection?.thinking?.mode]]
+      .flatMap(([id, stored, choices, desktopDefault]) => {
+        const value = choices?.find(option => option.id === stored)?.id ||
+          (modelId === desktopSelection?.model ? choices?.find(option => option.id === desktopDefault)?.id : undefined) ||
+          choices?.find(option => option.recommended)?.id || choices?.[0]?.id;
+        return value ? [{ id, value }] : [];
+      });
+    const revision = hash({ id, leaf: conversation.current_leaf_message_uuid, messages, model: modelId, settings });
     const start = Math.max(0, messages.length - 60);
     return { sessionId: id, revision, title: conversation.name || 'New chat',
       model: label(knownModels.find(model => model.id === modelId)?.name || modelId),
+      modelOptions, runtimeMode: nativeAccess?.permissionMode === 'auto' ? 'auto-accept-edits' : 'approval-required',
+      accessSupported: false,
       createdAt: conversation.created_at, updatedAt: conversation.updated_at,
       busy: run?.busy === true, lastError: run?.error || null, draftPresent: false, draftHash: null,
       messages: messages.slice(start), chats: [], capabilities: ['direct', 'model', 'stop'],
@@ -112,13 +142,36 @@ export function createEmbeddedAdapter({ request = embeddedRequest } = {}) {
       selectedModels.set(selected, model.value);
       return publicSnapshot(await snapshot());
     }
+    if (input.op === 'settings') {
+      if (!selected || state.busy) throw new Error('Open an idle Claude chat before changing settings.');
+      const settings = {};
+      if (input.runtimeMode !== undefined) {
+        if (!['approval-required', 'auto-accept-edits'].includes(input.runtimeMode)) throw new Error('Claude supports Manual and Auto access; unrestricted Full access is not available.');
+        throw new Error('Manage access in Claude Desktop. This bridge cannot change it yet.');
+      }
+      if (input.options !== undefined) {
+        if (!Array.isArray(input.options) || input.options.length > 2 || new Set(input.options.map(option => option.id)).size !== input.options.length) throw new Error('Invalid Claude model settings.');
+        for (const option of input.options) {
+          const key = { reasoningEffort: 'effort_level', thinking: 'thinking_mode' }[option.id];
+          if (!key || typeof option.value !== 'string') throw new Error('Unsupported Claude model setting.');
+          settings[key] = option.value;
+        }
+      }
+      if (Object.keys(settings).length) {
+        const model = (await models()).find(model => model.label === state.model);
+        await request({ op: 'settings', sessionId: selected, model: model?.value, parentId: state.parentId, settings });
+      }
+      return publicSnapshot(await snapshot());
+    }
     if (input.op === 'send') {
       if (input.image) throw new Error('Image sending is not implemented by the direct Claude bridge yet.');
       if (state.busy) throw new Error('Claude is already replying.');
       const model = (await models()).find(model => model.label === state.model);
       if (!selected || !model) throw new Error('Choose an available Claude model before sending.');
       const commandId = randomUUID();
-      await request({ op: 'send', sessionId: selected, parentId: state.parentId, commandId, model: model.value, text: input.text });
+      await request({ op: 'send', sessionId: selected, parentId: state.parentId, commandId, model: model.value, text: input.text,
+        ...(state.modelOptions?.find(option => option.id === 'reasoningEffort') ? { effort: state.modelOptions.find(option => option.id === 'reasoningEffort').value } : {}),
+        ...(state.modelOptions?.find(option => option.id === 'thinking') ? { thinkingMode: state.modelOptions.find(option => option.id === 'thinking').value } : {}) });
       runIds.set(selected, commandId);
       return { submitted: true, state: publicSnapshot(await snapshot()) };
     }
