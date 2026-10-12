@@ -1,0 +1,31 @@
+name: Claude embedded bridge compatibility
+on:
+  push:
+    paths:
+      - 'claude-desktop-bridge/embedded/**'
+      - 'claude-desktop-bridge/tests/embedded-runtime.test.mjs'
+      - '.github/workflows/claude-embedded.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: claude-embedded-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  runtime:
+    name: Direct bridge contracts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - name: Contract and authenticated transport tests (synthetic fixtures)
+        run: node --test claude-desktop-bridge/tests/embedded-runtime.test.mjs
