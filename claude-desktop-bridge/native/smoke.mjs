@@ -1,0 +1,10 @@
+import assert from 'node:assert/strict';
+import { nativeCall } from '../chat/native-helper.mjs';
+const info = await nativeCall({op:'info'});
+assert.equal(info.protocolVersion,1);
+assert.equal(info.platform,process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'macos' : process.platform);
+assert.equal(info.available,process.platform === 'linux');
+await assert.rejects(nativeCall({op:'not-an-operation'}),/Invalid native helper request/);
+await assert.rejects(nativeCall({op:'info',unexpected:true}),/Invalid native helper request/);
+if (!info.available) await assert.rejects(nativeCall({op:'scan'}),/not implemented/);
+console.log(JSON.stringify({protocolVersion:info.protocolVersion,platform:info.platform,nativeDriverAvailable:info.available,smoke:'passed'}));
