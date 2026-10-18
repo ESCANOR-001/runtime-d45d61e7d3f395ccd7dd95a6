@@ -1,6 +1,7 @@
 import { ClaudeAutoConnect } from '../src/claude-code/auto-connect';
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, readdirSync, writeFileSync, readFileSync, existsSync, statSync, realpathSync } from 'node:fs';
+import { mkdtempSync, rmSync, readdirSync, writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
+import { realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { getEventListeners } from 'node:events';
 import { join } from 'node:path';
@@ -8,13 +9,16 @@ import { ManagedClaudeCode } from '../src/claude-code/managed';
 import type { query, ModelInfo } from '@anthropic-ai/claude-agent-sdk';
 
 const roots: string[] = [];
+// Match the async filesystem API used by the runtime. On Windows, Bun's sync
+// realpath can retain an 8.3 TEMP alias while the async API expands it.
+const temporaryRoot = await realpath(tmpdir());
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function fixture(modelCatalog?: ModelInfo[]) {
   let rejectSync = false;
   let failFork = false;
   let failBranchRead = false;
   const forks: any[] = [];
-  const root = realpathSync(mkdtempSync(join(tmpdir(), 'remodex-managed-'))); roots.push(root);
+  const root = mkdtempSync(join(temporaryRoot, 'remodex-managed-')); roots.push(root);
   const runs: any[] = [];
   const remoteCalls: any[] = [];
   const fake = ((input: any) => {

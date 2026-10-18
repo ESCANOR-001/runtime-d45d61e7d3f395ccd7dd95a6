@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
+import { realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { claudeGit } from '../src/claude-code/session-files';
@@ -12,8 +13,8 @@ afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: 
 test('Claude files use its project and worktree roots without borrowing Codex access', async () => {
   const root = fixture(), worktree = fixture(), outside = fixture();
   const shell = { projects: [{ workspaceRoot: root }], threads: [{ worktreePath: worktree }] };
-  expect(await claudeProjectRoot(root, shell)).toBe(realpathSync(root));
-  expect(await claudeProjectRoot(worktree, shell)).toBe(realpathSync(worktree));
+  expect(await claudeProjectRoot(root, shell)).toBe(await realpath(root));
+  expect(await claudeProjectRoot(worktree, shell)).toBe(await realpath(worktree));
   await expect(claudeProjectRoot(outside, shell)).rejects.toThrow('not part of a Claude task');
   writeFileSync(join(outside, 'private.txt'), 'outside');
   await expect(claudeProjectFile(root, join(outside, 'private.txt'))).rejects.toThrow('project folder');
@@ -75,7 +76,7 @@ test('Claude file listing and new-file changes accept a project reached through 
   await claudeGit(root, ['init']);
   writeFileSync(join(root, 'new.txt'), 'new through alias\n');
   const shell = { projects: [{ workspaceRoot: alias }], threads: [] };
-  expect(await claudeProjectRoot(alias, shell)).toBe(realpathSync(root));
+  expect(await claudeProjectRoot(alias, shell)).toBe(await realpath(root));
   expect((await claudeProjectEntries(alias)).entries).toEqual([{ path: 'new.txt', kind: 'file' }]);
   const diff = (await claudeProjectDiff(alias, false)).sources[0]!.diff;
   expect(diff).toContain('+new through alias');
