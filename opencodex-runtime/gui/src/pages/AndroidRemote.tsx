@@ -1126,6 +1126,7 @@ export default function AndroidRemote({ apiBase }: { apiBase: string }) {
             headingRef={connectionHeadingRef}
           />
 
+          <a className="btn btn-ghost" href="#agents">{t("agents.manageAgents")}</a>
           <section className="android-remote-section" aria-labelledby="android-remote-clients-heading">
             <div className="android-remote-section-heading">
               <IconKey aria-hidden="true" />

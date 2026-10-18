@@ -40,14 +40,6 @@ test("service setup is detached and hidden, survives server replacement, and rej
   await expect(startServiceSetup("install")).rejects.toThrow("pending");
 });
 
-test("a completed attempt stays completed even when its PID is still alive or reused", () => {
-  const path = prepare();
-  for (const [status, expected] of [["succeeded", "idle"], ["failed", "failed"]]) {
-    writeFileSync(path, JSON.stringify({ id: "finished", pid: process.pid, startedAt: Date.now(), status }));
-    expect(serviceSetupState()).toBe(expected);
-  }
-});
-
 test("a failed worker spawn releases the attempt and malformed state fails closed", async () => {
   const path = prepare();
   await expect(startServiceSetup("install", (() => {
@@ -59,4 +51,12 @@ test("a failed worker spawn releases the attempt and malformed state fails close
   writeFileSync(path, "invalid");
   expect(serviceSetupState()).toBe("blocked");
   await expect(startServiceSetup("install")).rejects.toThrow("pending");
+});
+
+test("a completed attempt stays completed even when its PID is still alive or reused", () => {
+  const path = prepare();
+  for (const [status, expected] of [["succeeded", "idle"], ["failed", "failed"]]) {
+    writeFileSync(path, JSON.stringify({ id: "finished", pid: process.pid, startedAt: Date.now(), status }));
+    expect(serviceSetupState()).toBe(expected);
+  }
 });

@@ -1,10 +1,14 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import { handleManagementAPI } from "../src/server/management-api";
 import type { ManagementApiDeps } from "../src/server/management/context";
 import type { OcxConfig } from "../src/types";
 
+const previousService = process.env.OCX_SERVICE;
+beforeEach(() => { delete process.env.OCX_SERVICE; });
 const previous = process.env.REMODEX_CONNECT_ONLY;
 afterEach(() => {
+  if (previousService === undefined) delete process.env.OCX_SERVICE;
+  else process.env.OCX_SERVICE = previousService;
   if (previous === undefined) delete process.env.REMODEX_CONNECT_ONLY;
   else process.env.REMODEX_CONNECT_ONLY = previous;
 });

@@ -10,6 +10,20 @@ const rows = (value: unknown): Row[] => Array.isArray(value) ? value as Row[] : 
 const record = (value: unknown): Row => value && typeof value === "object" ? value as Row : {};
 const workId = (turnId: string) => `deferred-work:${turnId}`;
 
+function workTiming(entries: Array<{ kind: string; row: Row }>): Row {
+  for (const entry of entries) {
+    if (entry.kind !== "activity") continue;
+    const payload = record(entry.row.payload);
+    if (typeof payload.turnDurationMs !== "number" || !Number.isFinite(payload.turnDurationMs) || payload.turnDurationMs < 0) continue;
+    return {
+      turnDurationMs: payload.turnDurationMs,
+      ...(typeof payload.turnStartedAt === "string" ? { turnStartedAt: payload.turnStartedAt } : {}),
+      ...(typeof payload.turnCompletedAt === "string" ? { turnCompletedAt: payload.turnCompletedAt } : {}),
+    };
+  }
+  return {};
+}
+
 function workForTurn(thread: Row, turnId: string) {
   const messages = rows(thread.messages).filter(row => row.turnId === turnId);
   const lastAssistant = messages.filter(row => row.role === "assistant").at(-1);
@@ -44,7 +58,7 @@ export function compactProjectedWork<T extends { messages: Row[]; activities: Ro
     placeholders.push({
       id: workId(turnId), kind: "work.deferred", tone: "info", summary: "Load work details",
       turnId, sequence: first.sequence, createdAt: first.createdAt,
-      payload: { revision: work.revision, cursor: null, remaining: work.entries.length },
+      payload: { revision: work.revision, cursor: null, remaining: work.entries.length, ...workTiming(work.entries) },
     });
   }
   return { ...page,
@@ -86,7 +100,7 @@ export function projectedTurnWorkPage(thread: Row, turnId: string, cursor?: stri
       id: workId(turnId), kind: "work.deferred", tone: "info", turnId,
       sequence: last.sequence, createdAt: last.createdAt,
       summary: nextCursor ? "Load more work" : "Work loaded",
-      payload: { revision: work.revision, cursor: nextCursor, remaining: work.entries.length - end, loaded: true },
+      payload: { revision: work.revision, cursor: nextCursor, remaining: work.entries.length - end, loaded: true, ...workTiming(work.entries) },
     }],
     proposedPlans: [], nextCursor,
   };

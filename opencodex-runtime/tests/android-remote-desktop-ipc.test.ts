@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
+import { createDesktopFollowUpStore } from "../src/android-remote/desktop-follow-up-queue";
 import type { Socket } from "node:net";
 import {
   AndroidDesktopIpcLiveSync,
@@ -128,6 +129,59 @@ async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void>
 }
 
 describe("Android Remote Codex Desktop IPC", () => {
+  test("accepts Desktop's locally admitted follow-up, waits for idle, and delivers it once", async () => {
+    const transport = new FakeLiveTransport();
+    const threadId = "019fff9d-2b6b-7282-9c2e-cc519d73135d";
+    const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
+    const sync = new AndroidDesktopIpcLiveSync({
+      transport, snapshotDebounceMs: 0, openUrl: async () => undefined,
+      readThread: async () => ({ id: threadId, turns: [] }),
+      sendCodexRequest: async (method, params) => { requests.push({ method, params }); return { turn: { id: "next-turn" } }; },
+      respondToCodexRequest: () => undefined,
+    });
+    try {
+      sync.claimThread({ threadId, turnStartParams: { input: [], model: "gpt-6-astra", approvalPolicy: "never", sandboxPolicy: { type: "dangerFullAccess" } } });
+      sync.observeCodexMessage({ method: "turn/started", params: { threadId, turn: { id: "first-turn", status: "inProgress", items: [] } } });
+      await waitFor(() => transport.broadcasts.some(row => row.method === "thread-stream-state-changed"));
+      const params = { conversationId: threadId, state: { [threadId]: [{
+        id: "desktop-message", text: "Follow up from desktop", cwd: "/workspace", createdAt: 123,
+        context: { prompt: "Follow up from desktop", addedFiles: [], fileAttachments: [], imageAttachments: [], ideContext: null, workspaceRoots: ["/workspace"] },
+        submission: { hostId: "local", status: "pending" },
+      }] }, discardedMessageIds: [] };
+      expect(await transport.request("thread-follower-set-queued-follow-ups-state", params)).toEqual({ ok: true });
+      expect(requests).toEqual([]);
+      sync.observeCodexMessage({ method: "turn/completed", params: { threadId, turn: { id: "first-turn", status: "completed", items: [] } } });
+      await waitFor(() => requests.length === 1);
+      expect(requests[0]).toMatchObject({ method: "turn/start", params: {
+        threadId, clientUserMessageId: "desktop-message", model: "gpt-6-astra", approvalPolicy: "never",
+        sandboxPolicy: { type: "dangerFullAccess" }, input: [{ type: "text", text: "Follow up from desktop" }],
+      } });
+      await waitFor(() => transport.broadcasts.some(row => row.method === "thread-queued-followups-changed" && (row.params.messages as unknown[]).length === 0));
+      await transport.request("thread-follower-set-queued-follow-ups-state", params);
+      expect(requests).toHaveLength(1);
+      expect(transport.handlers!.canHandleRequest({ type: "request", sourceClientId: "desktop", method: "thread-follower-set-queued-follow-ups-state", params: { ...params, conversationId: "unowned-thread" } })).toBe(false);
+      await expect(transport.request("thread-follower-set-queued-follow-ups-state", { ...params, conversationId: "unowned-thread" })).rejects.toThrow("conversation-not-owned");
+    } finally { sync.stop(); }
+  });
+  test("reconciles a persisted uncertain desktop submission from exact history evidence", async () => {
+    const threadId = "019fff9d-2b6b-7282-9c2e-cc519d73135d";
+    const transport = new FakeLiveTransport();
+    const store = createDesktopFollowUpStore();
+    store.write({ entries: [{ threadId, attempted: true, message: { id: "accepted-before-restart", text: "Check" } }], receipts: [] });
+    let sends = 0;
+    const sync = new AndroidDesktopIpcLiveSync({ transport, followUpStore: store, openUrl: async () => undefined,
+      readThread: async () => ({ id: threadId, turns: [{ id: "done", status: "completed", items: [
+        { type: "userMessage", id: "user-row", clientId: "accepted-before-restart", content: [{ type: "text", text: "Check" }] },
+      ] }] }),
+      sendCodexRequest: async () => { sends++; return {}; }, respondToCodexRequest: () => undefined,
+    });
+    try {
+      sync.claimThread({ threadId, turnStartParams: { input: [] } });
+      await waitFor(() => store.read().entries.length === 0);
+      expect(sends).toBe(0);
+      expect(transport.broadcasts.some(event => event.method === "thread-queued-followups-changed" && (event.params.messages as unknown[]).length === 0)).toBe(true);
+    } finally { sync.stop(); }
+  });
   test("uses the installed Desktop v2/v4 envelopes and preserves the target id", async () => {
     expect(DESKTOP_IPC_METHOD_VERSIONS.get("thread-follower-start-turn")).toBe(2);
     expect(DESKTOP_IPC_METHOD_VERSIONS.get("thread-follower-update-thread-settings")).toBe(2);
@@ -2188,6 +2242,7 @@ describe("Android Remote Codex Desktop IPC", () => {
       }),
       sendCodexRequest: async (method, params) => {
         requests.push({ method, params });
+        if (method === "thread/read") return { thread: { id: "controls-1", turns: [{ id: "turn-live", status: "interrupted" }] } };
         return {};
       },
       respondToCodexRequest: (id, result) => responses.push({ id, result }),
@@ -2267,4 +2322,189 @@ describe("Android Remote Codex Desktop IPC", () => {
     });
     expect(calls[0]!.args.at(-1)).toBe("codex://threads/abc-123?opencodex-follow=test%20token");
   });
+});
+
+test("Stop verifies native terminal history before releasing the next Send when completion notification is lost", async () => {
+  const transport = new FakeLiveTransport();
+  const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
+  const sync = new AndroidDesktopIpcLiveSync({
+    transport, followConfirmMs: 60_000,
+    readThread: async id => ({ id, turns: [] }),
+    sendCodexRequest: async (method, params) => {
+      requests.push({ method, params });
+      if (method === "thread/read") return { thread: { id: "stop-contract", turns: [{ id: "first-turn", status: "interrupted" }] } };
+      return {};
+    },
+    respondToCodexRequest: () => {}, openUrl: async () => {},
+  });
+  sync.claimThread({ threadId: "stop-contract", turnStartParams: { input: [{ type: "text", text: "First" }] } });
+  sync.observeCodexMessage({ method: "turn/started", params: {
+    threadId: "stop-contract", turn: { id: "first-turn", status: "inProgress" },
+  } });
+  try {
+    await expect(transport.request("thread-follower-interrupt-turn", {
+      conversationId: "stop-contract", mode: "user-stop", expectedTurnId: "outdated-turn",
+    })).resolves.toEqual({ ok: true, interruptedTurnId: null });
+    expect(requests).toHaveLength(0);
+    await expect(transport.request("thread-follower-interrupt-turn", {
+      conversationId: "stop-contract", mode: "user-stop",
+    })).resolves.toEqual({ ok: true, interruptedTurnId: "first-turn" });
+    await expect(transport.request("thread-follower-interrupt-turn", {
+      conversationId: "stop-contract", mode: "user-stop",
+    })).resolves.toEqual({ ok: true, interruptedTurnId: null });
+    expect(requests.filter(request => request.method === "turn/interrupt")).toHaveLength(1);
+    const page = await transport.request("thread-follower-load-history-page", {
+      conversationId: "stop-contract", direction: "recent",
+    }) as any;
+    expect(page.conversationState.turns.at(-1).status).toBe("interrupted");
+    await transport.request("thread-follower-start-turn", {
+      conversationId: "stop-contract", turnStart: { request: { threadId: "stop-contract",
+        input: [{ type: "text", text: "Next" }] } },
+    });
+    expect(requests.filter(request => request.method === "turn/start")).toHaveLength(1);
+  } finally { sync.stop(); }
+});
+
+describe("native lifecycle compatibility", () => {
+  test("failed initial history retains ownership and later native events remain usable", async () => {
+    const transport = new FakeLiveTransport();
+    const sync = new AndroidDesktopIpcLiveSync({ transport, initialHistoryMaxAttempts: 1, snapshotDebounceMs: 0,
+      readThread: async () => { throw new Error("temporarily unavailable"); },
+      sendCodexRequest: async () => ({}), respondToCodexRequest: () => {}, openUrl: async () => {},
+    });
+    try {
+      sync.claimThread({ threadId: "history-failure", turnStartParams: { input: [] } });
+      await settle();
+      expect(sync.isThreadOwned("history-failure")).toBe(true);
+      sync.observeCodexMessage({ method: "turn/completed", params: { threadId: "history-failure", turn: { id: "real-turn", status: "interrupted" } } });
+      const page = await transport.request("thread-follower-load-history-page", { conversationId: "history-failure" }) as any;
+      expect(page.conversationState.turns.at(-1).status).toBe("interrupted");
+    } finally { sync.stop(); }
+  });
+
+  test.each(["legacy", "paginated"])("Desktop can edit the last prompt, read settings, and update metadata on a Remodex-owned chat: %s", async historyMode => {
+    const transport = new FakeLiveTransport();
+    const calls: Array<{ method: string; params: any }> = [];
+    let turns: any[] = [{ id: "original", status: "completed", items: [
+      { type: "userMessage", id: "prompt", content: [{ type: "text", text: "Old prompt" }, { type: "localImage", path: "/tmp/photo.jpg" }] },
+    ] }];
+    const sync = new AndroidDesktopIpcLiveSync({ transport, snapshotDebounceMs: 0,
+      readThread: async id => ({ id, turns, historyMode }),
+      sendCodexRequest: async (method, params) => {
+        calls.push({ method, params });
+        if (method === "thread/rollback" || method === "thread/revert") { turns = []; return { thread: { id: "edit-chat", turns } }; }
+        if (method === "thread/metadata/update") return { thread: { id: "edit-chat", daybreakEnabled: params.daybreakEnabled } };
+        if (method === "turn/start") return { turn: { id: "edited-turn", status: "inProgress" } };
+        return {};
+      }, respondToCodexRequest: () => {}, openUrl: async () => {},
+    });
+    try {
+      sync.adoptLocalThread("edit-chat");
+      await transport.request("thread-follower-load-complete-history", { conversationId: "edit-chat" });
+      await transport.request("thread-follower-update-thread-settings", { conversationId: "edit-chat", threadSettings: { model: "gpt-6-astra", effort: "high" } });
+      expect(await transport.request("thread-follower-read-model-settings", { conversationId: "edit-chat" })).toMatchObject({ settings: { reasoningEffort: "high" } });
+      expect(await transport.request("thread-follower-update-daybreak", { conversationId: "edit-chat", daybreakEnabled: true })).toEqual({ ok: true });
+      expect(await transport.request("thread-follower-edit-last-user-turn", { conversationId: "edit-chat", turnId: "original", message: "Corrected prompt" })).toEqual({ ok: true });
+      expect(calls.find(call => call.method === (historyMode === "paginated" ? "thread/revert" : "thread/rollback"))?.params)
+        .toEqual(historyMode === "paginated" ? { threadId: "edit-chat", beforeTurnId: "original" } : { threadId: "edit-chat", numTurns: 1 });
+      expect(calls.find(call => call.method === "turn/start")?.params).toMatchObject({ threadId: "edit-chat", turnTrigger: "edit_user_message",
+        input: [{ type: "text", text: "Corrected prompt" }, { type: "localImage", path: "/tmp/photo.jpg" }] });
+      const page = await transport.request("thread-follower-load-history-page", { conversationId: "edit-chat" }) as any;
+      expect(page.conversationState.turns.map((turn: any) => turn.turnId)).toEqual(["edited-turn"]);
+      await expect(transport.request("thread-follower-edit-last-user-turn", { conversationId: "edit-chat", turnId: "edited-turn", message: "Too early" })).rejects.toThrow("running");
+    } finally { sync.stop(); }
+  });
+
+  test("a rejected settings update does not overwrite the displayed model", async () => {
+    const transport = new FakeLiveTransport();
+    const sync = new AndroidDesktopIpcLiveSync({ transport, readThread: async () => null,
+      sendCodexRequest: async () => { throw new Error("model is not permitted"); }, respondToCodexRequest: () => {}, openUrl: async () => {},
+    });
+    try {
+      sync.adoptLocalThread("settings-chat");
+      const before = await transport.request("thread-follower-read-model-settings", { conversationId: "settings-chat" });
+      await expect(transport.request("thread-follower-update-thread-settings", { conversationId: "settings-chat", threadSettings: { model: "rejected" } })).rejects.toThrow("not permitted");
+      expect(await transport.request("thread-follower-read-model-settings", { conversationId: "settings-chat" })).toEqual(before);
+    } finally { sync.stop(); }
+  });
+
+  test("uncertain starts reconcile only an exact native client message receipt", async () => {
+    const transport = new FakeLiveTransport();
+    const sync = new AndroidDesktopIpcLiveSync({ transport,
+      readThread: async id => ({ id, turns: [{ id: "native-turn", status: "completed", items: [
+        { type: "userMessage", id: "server-message", clientId: "client-message", content: [{ type: "text", text: "Prompt" }] },
+      ] }] }), sendCodexRequest: async () => ({}), respondToCodexRequest: () => {}, openUrl: async () => {},
+    });
+    try {
+      sync.claimThread({ threadId: "uncertain-chat", turnStartParams: { clientUserMessageId: "client-message", input: [{ type: "text", text: "Prompt" }] } });
+      await settle();
+      sync.rejectTurnStart("uncertain-chat", false);
+      await settle();
+      expect(sync.isThreadOwned("uncertain-chat")).toBe(true);
+      const page = await transport.request("thread-follower-load-history-page", { conversationId: "uncertain-chat" }) as any;
+      expect(page.conversationState.turns.map((turn: any) => turn.turnId)).toEqual(["native-turn"]);
+    } finally { sync.stop(); }
+  });
+});
+
+test("a timed-out Desktop start keeps ownership and reconciles a late native message instead of permitting replay", async () => {
+  const transport = new FakeLiveTransport();
+  let durableTurns: unknown[] = [];
+  const sync = new AndroidDesktopIpcLiveSync({ transport,
+    readThread: async id => ({ id, turns: durableTurns }),
+    sendCodexRequest: async () => { throw new Error("Codex request timed out: turn/start"); },
+    respondToCodexRequest: () => {}, openUrl: async () => {},
+  });
+  try {
+    sync.adoptLocalThread("late-start");
+    await expect(transport.request("thread-follower-start-turn", { conversationId: "late-start", turnStart: {
+      request: { clientUserMessageId: "late-message", input: [{ type: "text", text: "Late" }] },
+    } })).rejects.toThrow("timed out");
+    expect(sync.isThreadOwned("late-start")).toBe(true);
+    await expect(transport.request("thread-follower-steer-turn", { conversationId: "late-start", input: [] })).rejects.toThrow("not confirmed");
+    durableTurns = [{ id: "late-turn", status: "completed", items: [
+      { type: "userMessage", id: "server-id", clientId: "late-message", content: [{ type: "text", text: "Late" }] },
+    ] }];
+    const page = await transport.request("thread-follower-load-complete-history", { conversationId: "late-start" }) as any;
+    expect(page.conversationState.turns.map((turn: any) => turn.turnId)).toEqual(["late-turn"]);
+    expect(page.conversationState.turns[0].status).toBe("completed");
+  } finally { sync.stop(); }
+});
+
+test("native validation rejection clears the pending prompt without abandoning the loaded writer", async () => {
+  const transport = new FakeLiveTransport();
+  const sync = new AndroidDesktopIpcLiveSync({ transport,
+    readThread: async id => ({ id, turns: [] }),
+    sendCodexRequest: async () => { throw Object.assign(new Error("Invalid model"), { code: -32602 }); },
+    respondToCodexRequest: () => {}, openUrl: async () => {},
+  });
+  try {
+    sync.adoptLocalThread("rejected-start");
+    await expect(transport.request("thread-follower-start-turn", { conversationId: "rejected-start", input: [] })).rejects.toThrow("Invalid model");
+    const page = await transport.request("thread-follower-load-history-page", { conversationId: "rejected-start" }) as any;
+    expect(page.conversationState.turns).toEqual([]);
+    expect(sync.isThreadOwned("rejected-start")).toBe(true);
+  } finally { sync.stop(); }
+});
+
+test("unavailable history cannot silently drain queued prompts on a retained native writer", async () => {
+  const transport = new FakeLiveTransport();
+  const requests: string[] = [];
+  const sync = new AndroidDesktopIpcLiveSync({ transport, initialHistoryMaxAttempts: 1,
+    readThread: async () => { throw new Error("unavailable"); },
+    sendCodexRequest: async method => { requests.push(method); return {}; }, respondToCodexRequest: () => {}, openUrl: async () => {},
+  });
+  try {
+    sync.claimThread({ threadId: "unknown-writer", turnStartParams: { input: [] } });
+    await settle();
+    sync.rejectTurnStart("unknown-writer", true);
+    await transport.request("thread-follower-set-queued-follow-ups-state", { conversationId: "unknown-writer", state: {
+      "unknown-writer": [{ id: "waiting-message", text: "Wait for confirmed idle" }],
+    } });
+    await settle();
+    expect(sync.isThreadOwned("unknown-writer")).toBe(true);
+    expect(requests).not.toContain("turn/start");
+    expect(await transport.request("thread-follower-remove-queued-message", { conversationId: "unknown-writer", messageId: "waiting-message" })).toEqual({ removed: true });
+    expect(await transport.request("thread-follower-clear-queued-messages", { conversationId: "unknown-writer" })).toEqual({ messages: [] });
+  } finally { sync.stop(); }
 });

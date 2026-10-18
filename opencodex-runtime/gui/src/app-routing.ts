@@ -1,5 +1,6 @@
 /** Pure hash → page resolution used by App route state. */
 
+import { AGENT_HASHES } from "./agent-catalog";
 import { normalizeHashPath } from "./hash-routing";
 
 export type Page =
@@ -16,7 +17,8 @@ export type Page =
   | "integrations"
   | "android-remote"
   | "guide"
-  | "advanced";
+  | "advanced"
+  | "agents";
 
 export const VALID_PAGES = new Set<Page>([
   "dashboard",
@@ -33,6 +35,7 @@ export const VALID_PAGES = new Set<Page>([
   "android-remote",
   "guide",
   "advanced",
+  "agents",
 ]);
 
 /** First-run deep link that opens Android Remote's one-time pairing dialog. */
@@ -101,6 +104,7 @@ export const INTEGRATION_TAB_HASHES = [
 
 export function hashBelongsToPage(rawHash: string, page: Page): boolean {
   return rawHash === page
+    || (page === "agents" && AGENT_HASHES.includes(rawHash))
     || (page === "android-remote" && rawHash === ANDROID_REMOTE_PAIR_HASH)
     || (page === "logs" && rawHash === "logs/debug")
     || (page === "models" && (MODELS_TAB_HASHES as readonly string[]).includes(rawHash))

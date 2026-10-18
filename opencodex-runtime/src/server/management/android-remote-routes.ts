@@ -211,6 +211,18 @@ export async function handleAndroidRemoteRoutes(ctx: ManagementContext): Promise
     return jsonResponse(await statusDTO(ctx, routeStore(ctx).read()), 200, req, config);
   }
 
+  if (url.pathname === "/api/android-remote/claude-code") {
+    const controller = routeController(ctx);
+    if (!controller) return jsonResponse({ error: "Remodex connection is unavailable" }, 503, req, config);
+    if (req.method === "GET") return jsonResponse(await controller.claudeCode().status(url.searchParams.get("refresh") === "1"), 200, req, config);
+    if (req.method === "PUT") {
+      try {
+        const input = await readManagementJsonBodyOr(req, {});
+        return jsonResponse(await controller.claudeCode().configure(isPlainRecord(input) ? input : {}), 200, req, config);
+      } catch (error) { return jsonResponse({ error: error instanceof Error ? error.message : "Claude Code setup failed" }, 400, req, config); }
+    }
+  }
+
   if (url.pathname === "/api/android-remote/pairing" && req.method === "POST") {
     const replaceClientId = url.searchParams.get("replaceClientId") ?? undefined;
     if (replaceClientId !== undefined && !routeStore(ctx).read().clients.some(client => client.id === replaceClientId)) {

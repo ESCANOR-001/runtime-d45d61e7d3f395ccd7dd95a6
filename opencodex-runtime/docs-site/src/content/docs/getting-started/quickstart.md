@@ -22,11 +22,11 @@ foreground.
 
 ### Pairing troubleshooting (next release)
 
-Updated Android builds distinguish missing pairing tokens, unsupported QR versions, malformed QR codes, and invalid server addresses before attempting a connection. Scan the QR from **Android Remote**, not a plain dashboard URL.
+Updated Android builds distinguish missing pairing tokens, unsupported QR versions, malformed QR codes, and invalid server addresses before attempting a connection. Scan the QR from **Android Remote**, not a plain dashboard URL. App pairing links are unpacked before validation; missing credentials are never guessed. The server refuses to generate a QR until it has an enabled, usable LAN address or a verified remote address. A PC-only loopback address cannot enable pairing.
 
-With both the updated app and server, retrying the same QR in the running app can recover a lost pairing response for up to two minutes without creating another authorization. After an app/server restart or an expired retry window, generate a fresh QR. Older versions remain compatible but do not support this recovery.
+With both the updated app and server, retrying the same QR in the running app can recover a lost pairing response for up to two minutes without creating another authorization. After an app/server restart or an expired retry window, generate a fresh QR. Older versions remain compatible but do not support this recovery. The updated app tries advertised alternative routes first, then retries at most one temporary network/server failure after a short delay, using the same recovery proof. Invalid credentials and malformed QR codes are not automatically retried. Confirmation retries reuse the issued phone credential rather than spending the QR again.
 
-A connection error does not prove that a Cloudflare address changed. Check that the PC is awake and Remodex is running; try the same trusted Wi-Fi or a fresh QR. Quick Tunnel addresses can change, while a custom domain is intended to remain stable. Diagnostics record only fixed failure categories, route types, and HTTP status codes—not QR content, credentials, or addresses.
+A connection error does not prove that a Cloudflare address changed. Check that the PC is awake and Remodex is running; try the same trusted Wi-Fi or a fresh QR. Quick Tunnel addresses can change, while a custom domain is intended to remain stable. Diagnostics record only fixed failure categories, route types, and HTTP status codes—not QR content, credentials, or addresses. Recovered route and storage attempts do not create terminal pairing failures; the app records the final pairing outcome separately.
 
 ## Add a provider (optional)
 

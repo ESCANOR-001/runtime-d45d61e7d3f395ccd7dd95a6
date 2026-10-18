@@ -218,6 +218,7 @@ function frameText(data: unknown): string | null {
 class CodexAppServerSocket implements AndroidCodexClient {
   private nextId = 1;
   private readonly pending = new Map<number, {
+    method: string;
     resolve: (value: unknown) => void;
     reject: (error: Error) => void;
     timer: ReturnType<typeof setTimeout>;
@@ -292,6 +293,7 @@ class CodexAppServerSocket implements AndroidCodexClient {
         reject(new Error(`Codex request timed out: ${method}`));
       }, timeoutMs);
       this.pending.set(id, {
+        method,
         resolve: value => resolve(value as T),
         reject,
         timer,
@@ -357,7 +359,11 @@ class CodexAppServerSocket implements AndroidCodexClient {
       this.pending.delete(message.id);
       clearTimeout(pending.timer);
       if (message.error) {
-        pending.reject(new Error(message.error.message || "Codex task request failed"));
+        pending.reject(Object.assign(new Error(message.error.message || "Codex task request failed"), {
+          code: message.error.code,
+          codexRequestRejected: true,
+          requestMethod: pending.method,
+        }));
       } else {
         pending.resolve(message.result);
       }

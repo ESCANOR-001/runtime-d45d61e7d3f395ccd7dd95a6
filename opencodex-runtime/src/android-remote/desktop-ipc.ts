@@ -1,3 +1,5 @@
+import { desktopFollowUpTurnParams } from "./desktop-follow-up-queue";
+import { confirmNativeTurnStopped, readNativeStopState, pauseNativeGoal, nativeStartDefinitelyRejected } from "./native-turn-lifecycle";
 import { randomUUID } from "node:crypto";
 import { createConnection, type Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
@@ -5,6 +7,7 @@ import { posix, win32 } from "node:path";
 import { execFile } from "node:child_process";
 import type { CodexJsonRpcMessage } from "./codex-app-server";
 import { desktopConversationModelSelectors, remodexRuntimeModelSelectors } from "./desktop-model-route";
+import { DesktopFollowUpQueue, createDesktopFollowUpStore, type DesktopFollowUpStore } from "./desktop-follow-up-queue";
 import {
   createAndroidDesktopOwnershipStore,
   type AndroidDesktopOwnershipStore,
@@ -125,6 +128,10 @@ export const DESKTOP_IPC_METHOD_VERSIONS = new Map<string, number>([
   ["thread-follower-submit-user-input", 1],
   ["thread-follower-submit-mcp-server-elicitation-response", 1],
   ["thread-follower-set-queued-follow-ups-state", 1],
+  ["thread-follower-read-model-settings", 1],
+  ["thread-follower-remove-queued-message", 1],
+  ["thread-follower-clear-queued-messages", 1],
+  ["thread-follower-update-daybreak", 1],
 ]);
 
 /** Compatibility rule retained deliberately for old stop buttons. */
@@ -139,6 +146,11 @@ export function desktopIpcRequestVersion(method: string, params: unknown = {}): 
 }
 
 const FOLLOWER_METHODS = new Set([
+  "thread-follower-edit-last-user-turn",
+  "thread-follower-read-model-settings",
+  "thread-follower-remove-queued-message",
+  "thread-follower-clear-queued-messages",
+  "thread-follower-update-daybreak",
   "thread-follower-start-turn",
   "thread-follower-load-complete-history",
   THREAD_FOLLOWER_LOAD_HISTORY_PAGE,
@@ -170,11 +182,15 @@ const SERVER_REQUEST_METHODS = new Set([
 const ALLOWED_TURN_START_KEYS = new Set([
   "threadId",
   "clientUserMessageId",
+  "turnTrigger",
+  "additionalContext",
   "input",
   "cwd",
   "approvalPolicy",
   "approvalsReviewer",
   "sandboxPolicy",
+  "runtimeWorkspaceRoots",
+  "permissions",
   "model",
   "serviceTier",
   "effort",
@@ -238,6 +254,7 @@ export interface AndroidDesktopIpcSync {
     title?: string;
   }): void;
   releaseThread(threadId: string): void;
+  rejectTurnStart?(threadId: string, definitelyNotDelivered: boolean): void;
   observeCodexMessage(message: CodexJsonRpcMessage): void;
   isThreadOwned(threadId: string): boolean;
   /**
@@ -330,6 +347,7 @@ export type DesktopIpcSyncOptions = {
   followerStateTimeoutMs?: number;
   ownerReacquireTimeoutMs?: number;
   ownershipStore?: AndroidDesktopOwnershipStore;
+  followUpStore?: DesktopFollowUpStore;
   historyPageStore?: DesktopHistoryPageStore;
   transport?: DesktopIpcTransportLike;
 };
@@ -1494,6 +1512,7 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
   private readonly revisions = new Map<string, number>();
   /** Last bounded wire state, never the unbounded in-memory conversation. */
   private readonly lastBroadcastStates = new Map<string, JsonRecord>();
+  private readonly unverifiedHistory = new Set<string>();
   private readonly pendingTurnStarts = new Map<string, PendingTurnStart[]>();
   private readonly dirtyThreadIds = new Set<string>();
   private readonly followerClientIds = new Map<string, Set<string>>();
@@ -1524,6 +1543,7 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
   /** Capability is scoped to the current IPC connection generation. */
   private boundedHistoryUnsupportedGeneration: number | null = null;
   private snapshotTimer: Timer | null = null;
+  private readonly followUpQueue: DesktopFollowUpQueue;
 
   constructor(options: DesktopIpcSyncOptions) {
     this.platform = options.platform ?? process.platform;
@@ -1577,6 +1597,40 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
         );
       },
     });
+    this.followUpQueue = new DesktopFollowUpQueue({
+      store: options.followUpStore ?? createDesktopFollowUpStore(),
+      isReady: threadId => this.ownedThreadIds.has(threadId)
+        && !this.shouldDelayInitialSnapshot(threadId)
+        && !this.hasActiveLocalTurn(threadId),
+      send: async (threadId, params) => {
+        const conversation = this.ensureConversation(threadId);
+        const lastParams = conversation.turns.at(-1)?.params ?? defaultTurnParams(conversation);
+        const startParams = sanitizeTurnStartParams(remodexRuntimeModelSelectors({
+          ...defaultTurnParams(conversation),
+          ...Object.fromEntries(["approvalPolicy", "approvalsReviewer", "sandboxPolicy", "permissions"].map(key => [key, lastParams[key]])),
+          ...params,
+          threadId,
+          modelProvider: conversation.modelProvider,
+        }));
+        // Permission profiles and legacy sandbox policy are mutually exclusive.
+        if (params.permissions != null) delete startParams.sandboxPolicy;
+        else if (params.sandboxPolicy != null) delete startParams.permissions;
+        this.rememberFollowerTurnStart(threadId, startParams);
+        try {
+          const started = await this.sendCodexRequest("turn/start", startParams);
+          this.confirmStartedTurn(threadId, started);
+        } catch (error) {
+          this.rejectTurnStart(threadId, nativeStartDefinitelyRejected(error));
+          throw error;
+        }
+      },
+      publish: (conversationId, messages) => {
+        if (this.ownedThreadIds.has(conversationId)) this.transport.sendBroadcast("thread-queued-followups-changed", {
+          hostId: HOST_ID, conversationId, messages,
+        });
+      },
+      warn: this.warn,
+    });
     this.transport.setHandlers({
       onConnected: () => this.onConnected(),
       onDisconnected: () => this.onDisconnected(),
@@ -1587,10 +1641,12 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
   }
 
   start(): void {
+    this.followUpQueue.start();
     this.transport.start();
   }
 
   stop(): void {
+    this.followUpQueue.stop();
     this.ownerRecoveryGeneration += 1;
     this.ownerReactivations.clear();
     if (this.snapshotTimer) clearTimeout(this.snapshotTimer);
@@ -1641,6 +1697,7 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
     // an old Desktop renderer from replaying content after a new connection.
     for (const threadId of ownedBeforeStop) this.historyPages.clearThread(threadId);
     this.pendingTurnStarts.clear();
+    this.unverifiedHistory.clear();
     this.dirtyThreadIds.clear();
     this.followerClientIds.clear();
     this.followAttempts.clear();
@@ -2212,6 +2269,7 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
     this.lastBroadcastStates.delete(id);
     this.historyPages.clearThread(id);
     this.pendingTurnStarts.delete(id);
+    this.unverifiedHistory.delete(id);
     this.dirtyThreadIds.delete(id);
     this.followerClientIds.delete(id);
     this.followedDesktopThreadIds.delete(id);
@@ -2235,6 +2293,13 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
     // `releaseThread` releases only this bridge's local mirror.  Do not erase
     // the monotonic Desktop-ownership fact: a transient handoff/reconnect must
     // not make a later Android prompt call private thread/resume.
+  }
+
+  rejectTurnStart(threadId: string, definitelyNotDelivered: boolean): void {
+    if (definitelyNotDelivered) this.removeLatestPendingTurn(threadId);
+    // A failed submission does not unload the native session. Retain the owner
+    // and reconcile uncertain submissions by their durable client message ID.
+    void this.hydrateThread(threadId);
   }
 
   claimThread(input: {
@@ -2322,8 +2387,11 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
     } else if (method === "turn/started" || method === "turn/completed") {
       const rawTurn = record(params.turn);
       const explicitTurnId = turnIdFromParams(params) || stringValue(rawTurn?.id);
+      if (method === "turn/started" && explicitTurnId) this.unverifiedHistory.delete(threadId);
+      const existingTurn = explicitTurnId ? findTurn(conversation, explicitTurnId) : null;
+      if (method === "turn/started" && existingTurn && ["completed", "interrupted", "failed"].includes(normalizeToken(existingTurn.status))) return;
       const pending = method === "turn/started"
-        ? this.shiftPendingTurn(threadId)
+        ? (existingTurn ? null : this.shiftPendingTurn(threadId))
         : explicitTurnId && !findTurn(conversation, explicitTurnId)
           ? this.shiftPendingTurn(threadId)
           : null;
@@ -2374,6 +2442,7 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
         changed = true;
         if (method === "item/completed") requiresAuthoritativeSnapshot = true;
         if (item.type === "userMessage" && method === "item/completed") {
+          this.followUpQueue.accepted(threadId, item.clientId ?? item.clientUserMessageId);
           this.announceSidebarThread(threadId, true);
         }
       }
@@ -2427,6 +2496,9 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
       this.markDirty(threadId);
       if (requiresAuthoritativeSnapshot) this.forceSnapshot(threadId);
     }
+    if (method === "turn/completed" && normalizeToken(record(params.turn)?.status) === "interrupted") {
+      this.followUpQueue.pause(threadId);
+    } else if (method === "turn/completed" || method === "thread/status/changed") this.followUpQueue.wake(threadId);
   }
 
   private onConnected(): void {
@@ -2457,6 +2529,7 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
       void this.discoverDesktopOwner(threadId).catch(() => undefined);
     }
     for (const threadId of this.ownedThreadIds) {
+      this.followUpQueue.publish(threadId);
       this.transport.sendBroadcast("thread-stream-following-status-requested", {
         hostId: HOST_ID,
         conversationId: threadId,
@@ -2748,6 +2821,7 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
   }
 
   private hasActiveLocalTurn(threadId: string): boolean {
+    if (this.unverifiedHistory.has(threadId)) return true;
     if ((this.pendingTurnStarts.get(threadId)?.length ?? 0) > 0) return true;
     return (this.conversations.get(threadId)?.turns ?? []).some(turn => {
       const status = normalizeToken(turn.status);
@@ -2786,6 +2860,40 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
       // object is intentional: no turns, items, requests, or content cross
       // the IPC boundary during route discovery.
       return {};
+    }
+    if (method === "thread-follower-read-model-settings") {
+      await this.settingsUpdates.get(threadId);
+      const conversation = this.ensureConversation(threadId);
+      const settings = desktopConversationModelSelectors(conversation);
+      return { settings: {
+        model: record(record(settings.latestCollaborationMode)?.settings)?.model || settings.latestModel,
+        reasoningEffort: settings.latestReasoningEffort,
+        daybreakEnabled: settings.daybreakEnabled ?? null,
+        resumeState: settings.resumeState, mode: settings.mode ?? null,
+        threadSource: settings.threadSource ?? null, modelProvider: settings.modelProvider ?? null,
+      } };
+    }
+    if (method === "thread-follower-remove-queued-message") {
+      return { removed: this.followUpQueue.remove(threadId, params.messageId) };
+    }
+    if (method === "thread-follower-clear-queued-messages") {
+      return { messages: this.followUpQueue.clear(threadId) };
+    }
+    if (method === "thread-follower-update-daybreak") {
+      if (typeof params.daybreakEnabled !== "boolean") throw new Error("daybreakEnabled must be a boolean");
+      const response = record(await this.sendCodexRequest("thread/metadata/update", { threadId, daybreakEnabled: params.daybreakEnabled }));
+      const thread = record(response?.thread);
+      if (!thread || thread.id !== threadId || typeof thread.daybreakEnabled !== "boolean") throw new Error("Codex did not confirm the metadata update");
+      this.ensureConversation(threadId).daybreakEnabled = thread.daybreakEnabled;
+      this.markDirty(threadId);
+      return { ok: true };
+    }
+    if (method === "thread-follower-edit-last-user-turn") {
+      return await this.editLastUserTurn(threadId, params);
+    }
+    if (method === "thread-follower-set-queued-follow-ups-state") {
+      this.followUpQueue.accept(threadId, params.state, params.discardedMessageIds);
+      return { ok: true };
     }
     if (method === THREAD_FOLLOWER_LOAD_HISTORY_PAGE) {
       const directionToken = normalizeToken(params.direction);
@@ -2845,6 +2953,7 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
       };
     }
     if (method === "thread-follower-start-turn") {
+      await this.settingsUpdates.get(threadId);
       const turnStart = record(params.turnStart);
       const raw = record(turnStart?.request)
         ?? record(params.turnStartParams)
@@ -2855,12 +2964,14 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
         ...this.withRuntimeOverrides(threadId, raw),
         threadId,
       }));
+      if (this.editsInFlight.has(threadId)) throw new Error("An edit is being applied to this chat");
       this.rememberFollowerTurnStart(threadId, startParams);
       try {
         const result = await this.sendCodexRequest("turn/start", startParams);
+        this.confirmStartedTurn(threadId, result);
         return { result: result ?? null };
       } catch (error) {
-        this.removeLatestPendingTurn(threadId);
+        this.rejectTurnStart(threadId, nativeStartDefinitelyRejected(error));
         throw error;
       }
     }
@@ -2869,7 +2980,7 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
       const expectedTurnId = stringValue(raw.expectedTurnId)
         || stringValue(raw.expected_turn_id)
         || this.activeTurnId(this.ensureConversation(threadId));
-      if (!expectedTurnId) throw new Error("The active Codex turn could not be found");
+      if (!expectedTurnId || expectedTurnId.startsWith("opencodex-pending-")) throw new Error("The native turn is not confirmed yet; refresh before steering.");
       return await this.sendCodexRequest("turn/steer", {
         threadId,
         ...(stringValue(raw.clientUserMessageId ?? raw.client_user_message_id)
@@ -2880,16 +2991,45 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
       });
     }
     if (method === "thread-follower-interrupt-turn") {
-      const turnId = stringValue(params.expectedTurnId)
-        || stringValue(params.expected_turn_id)
-        || stringValue(params.turnId)
-        || stringValue(params.turn_id)
-        || this.activeTurnId(this.ensureConversation(threadId));
-      if (!turnId) throw new Error("The active Codex turn could not be found");
-      return await this.sendCodexRequest("turn/interrupt", {
-        threadId,
-        turnId,
+      const conversation = this.ensureConversation(threadId);
+      const expectedTurnId = stringValue(params.expectedTurnId) || stringValue(params.expected_turn_id);
+      const requestedTurnId = stringValue(params.turnId) || stringValue(params.turn_id);
+      let active = [...conversation.turns].reverse().find(turn =>
+        ["inprogress", "running", "active"].includes(normalizeToken(turn.status)) && !turn.turnId.startsWith("opencodex-pending-"));
+      if (!active && !requestedTurnId && (this.unverifiedHistory.has(threadId) || this.pendingTurnStarts.has(threadId))) {
+        const state = record(await readNativeStopState(threadId, (method, params) => this.sendCodexRequest(method, params)));
+        const native = record(state?.thread) ?? state;
+        const nativeActive = native?.id === threadId && Array.isArray(native.turns)
+          ? native.turns.map(record).find(turn => turn?.status === "inProgress") : null;
+        if (nativeActive) {
+          this.observeCodexMessage({ method: "turn/started", params: { threadId, turn: nativeActive } });
+          active = findTurn(conversation, stringValue(nativeActive.id)) ?? undefined;
+        }
+        if (!active && this.hasActiveLocalTurn(threadId)) throw new Error("The native task status is still unconfirmed; refresh and retry Stop.");
+      }
+      const turnId = requestedTurnId || active?.turnId;
+      if (!turnId || expectedTurnId && active?.turnId !== expectedTurnId) {
+        return { ok: true, interruptedTurnId: null };
+      }
+      if (turnId.startsWith("opencodex-pending-")) throw new Error("The task is still starting; refresh its status before stopping.");
+      this.followUpQueue.pause(threadId);
+      try {
+        await this.sendCodexRequest("turn/interrupt", { threadId, turnId });
+      } catch (error) {
+        if (!(error instanceof Error) || !/^no active turn to interrupt$/iu.test(error.message.trim())) throw error;
+      }
+      const status = await confirmNativeTurnStopped({ threadId, turnId,
+        read: () => readNativeStopState(threadId, (method, params) => this.sendCodexRequest(method, params)),
       });
+      this.observeCodexMessage({ method: "turn/completed", params: {
+        threadId, turn: { id: turnId, status },
+      } });
+      if (params.mode === "user-stop") {
+        try { await pauseNativeGoal(threadId, (method, params) => this.sendCodexRequest(method, params)); }
+        catch (error) { return { ok: true, interruptedTurnId: status === "interrupted" ? turnId : null,
+          goalPauseError: error instanceof Error ? error.message : "Could not pause the task goal" }; }
+      }
+      return { ok: true, interruptedTurnId: status === "interrupted" ? turnId : null };
     }
     if (method === "thread-follower-rollback-thread") {
       const numTurns = numberValue(params.numTurns ?? params.num_turns);
@@ -2929,7 +3069,7 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
     }
     if (method === "thread-follower-update-thread-settings") {
       await this.applyFollowerRuntimeSettings(threadId, record(params.threadSettings) ?? {});
-      return { ok: true };
+      return { applied: true };
     }
     const requestId = params.requestId ?? params.request_id;
     if (method === "thread-follower-command-approval-decision") {
@@ -2946,6 +3086,77 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
       return this.respondToPendingRequest(threadId, requestId, record(params.response) ?? {});
     }
     throw new Error(`Unsupported Codex Desktop follower action: ${method}`);
+  }
+
+  private readonly editsInFlight = new Set<string>();
+
+  private async editLastUserTurn(threadId: string, params: JsonRecord): Promise<JsonRecord> {
+    if (this.editsInFlight.has(threadId)) throw new Error("An edit is already being applied to this chat");
+    this.editsInFlight.add(threadId);
+    try {
+      if (typeof params.message !== "string" || !params.message.trim()) throw new Error("An edited message is required");
+      if (this.hasActiveLocalTurn(threadId)) throw new Error("Cannot edit a message while a turn is starting or running");
+      if (!await this.hydrateThread(threadId)) throw new Error("Could not verify the message history before editing");
+      const conversation = this.ensureConversation(threadId);
+      const index = conversation.turns.findIndex(turn => turn.turnId === params.turnId);
+      if (index < 0 || conversation.turns.slice(index + 1).some(turn => Array.isArray(turn.params.input) && turn.params.input.length > 0)) {
+        throw new Error("Only the most recent message can be edited");
+      }
+      if (this.hasActiveLocalTurn(threadId)) throw new Error("Cannot edit a message while a turn is running");
+      const original = conversation.turns[index]!;
+      const input = clone(original.params.input) as JsonRecord[];
+      const textIndex = input.findIndex(item => item.type === "text");
+      if (textIndex < 0) throw new Error("This message has no editable text");
+      input[textIndex] = { ...input[textIndex], text: params.message, text_elements: [] };
+      let permissions: JsonRecord = {};
+      if (params.shouldSendPermissionOverrides === true) {
+        // Reuse the validated Desktop permission mapping instead of silently
+        // keeping permissions from the prompt being replaced.
+        permissions = desktopFollowUpTurnParams({ id: "edit-permissions", text: params.message,
+          submissionOptions: { permissionSelection: { kind: "agent-mode", agentMode: params.agentMode } },
+        });
+        delete permissions.input;
+        delete permissions.clientUserMessageId;
+      }
+      const startParams = sanitizeTurnStartParams(remodexRuntimeModelSelectors({
+        ...original.params, ...this.withRuntimeOverrides(threadId, {}), ...permissions,
+        threadId, input, modelProvider: conversation.modelProvider,
+        clientUserMessageId: randomUUID(), turnTrigger: "edit_user_message",
+        ...(params.serviceTier !== undefined ? { serviceTier: params.serviceTier } : {}),
+        ...(params.additionalContext !== undefined ? { additionalContext: params.additionalContext } : {}),
+      }));
+      if (permissions.permissions != null) delete startParams.sandboxPolicy;
+      const response = record(await this.sendCodexRequest(
+        conversation.historyMode === "paginated" ? "thread/revert" : "thread/rollback",
+        conversation.historyMode === "paginated"
+          ? { threadId, beforeTurnId: original.turnId }
+          : { threadId, numTurns: conversation.turns.length - index },
+      ));
+      const thread = record(response?.thread);
+      if (!thread || thread.id !== threadId || !Array.isArray(thread.turns)) throw new Error("Codex did not confirm the edited history; refresh before retrying");
+      this.mergeThread(conversation, thread, true);
+      this.pendingTurnStarts.delete(threadId);
+      this.stopAwaitingInitialHistory(threadId);
+      this.forceSnapshot(threadId);
+      this.rememberFollowerTurnStart(threadId, startParams);
+      try {
+        const started = await this.sendCodexRequest("turn/start", startParams);
+        this.confirmStartedTurn(threadId, started);
+      } catch (error) {
+        this.rejectTurnStart(threadId, nativeStartDefinitelyRejected(error));
+        throw error;
+      }
+      return { ok: true };
+    } finally { this.editsInFlight.delete(threadId); }
+  }
+
+  private confirmStartedTurn(threadId: string, response: unknown): void {
+    const turn = record(record(response)?.turn);
+    if (typeof turn?.id !== "string" || !turn.id) return;
+    // Reconcile a successful acknowledgement even if turn/started was lost.
+    // Do not consume another pending turn when the notification already won.
+    if (findTurn(this.ensureConversation(threadId), turn.id)) return;
+    this.observeCodexMessage({ method: "turn/started", params: { threadId, turn } });
   }
 
   private ensureConversation(threadId: string, cwd = ""): ConversationState {
@@ -2998,6 +3209,7 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
         const thread = record(result?.thread) ?? record(result);
         if (!thread || stringValue(thread.id) !== threadId || !this.ownedThreadIds.has(threadId)) return false;
         this.mergeThread(this.ensureConversation(threadId), thread);
+        this.unverifiedHistory.delete(threadId);
         this.markDirty(threadId);
         return true;
       })
@@ -3015,8 +3227,7 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
     if (this.hydrationPromises.has(threadId) || this.initialHistoryTimers.has(threadId)) return;
     const attempts = this.initialHistoryAttempts.get(threadId) ?? 0;
     if (attempts >= Math.max(1, this.initialHistoryMaxAttempts)) {
-      this.warn(`Could not establish a complete Desktop history baseline for ${threadId}; releasing IPC ownership`);
-      this.releaseThread(threadId);
+      this.finishDegradedHistoryBaseline(threadId);
       return;
     }
     this.initialHistoryAttempts.set(threadId, attempts + 1);
@@ -3025,12 +3236,13 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
       if (success) {
         this.stopAwaitingInitialHistory(threadId);
         this.markDirty(threadId);
+        this.followUpQueue.publish(threadId);
+        this.followUpQueue.wake(threadId);
         return;
       }
       const completedAttempts = this.initialHistoryAttempts.get(threadId) ?? attempts + 1;
       if (completedAttempts >= Math.max(1, this.initialHistoryMaxAttempts)) {
-        this.warn(`Could not establish a complete Desktop history baseline for ${threadId}; releasing IPC ownership`);
-        this.releaseThread(threadId);
+        this.finishDegradedHistoryBaseline(threadId);
         return;
       }
       const delay = Math.max(0, this.initialHistoryRetryMs) * (2 ** Math.min(completedAttempts - 1, 5));
@@ -3041,6 +3253,15 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
       timer.unref?.();
       this.initialHistoryTimers.set(threadId, timer);
     });
+  }
+
+  private finishDegradedHistoryBaseline(threadId: string): void {
+    // History availability and execution ownership are independent. Keep the
+    // writer reachable so Stop and subsequent native events still work.
+    this.warn(`History is temporarily unavailable for ${threadId}; retaining native writer ownership`);
+    this.unverifiedHistory.add(threadId);
+    this.stopAwaitingInitialHistory(threadId);
+    this.markDirty(threadId);
   }
 
   private stopAwaitingInitialHistory(threadId: string): void {
@@ -3071,6 +3292,9 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
     conversation.title = stringValue(thread.name) || conversation.title;
     conversation.cwd = stringValue(thread.cwd) || conversation.cwd;
     conversation.rolloutPath = stringValue(thread.path) || conversation.rolloutPath;
+    if (thread.historyMode === "paginated" || thread.historyMode === "legacy") conversation.historyMode = thread.historyMode;
+    if (typeof thread.daybreakEnabled === "boolean") conversation.daybreakEnabled = thread.daybreakEnabled;
+    if (thread.threadSource !== undefined) conversation.threadSource = clone(thread.threadSource);
     conversation.gitInfo = boundInboundPatchValue(thread.gitInfo ?? conversation.gitInfo ?? null) as JsonRecord | null;
     conversation.threadRuntimeStatus = boundInboundPatchValue(
       thread.status ?? conversation.threadRuntimeStatus ?? null,
@@ -3087,7 +3311,25 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
         const rawTurn = record(candidate);
         const turnId = stringValue(rawTurn?.id) || stringValue(rawTurn?.turnId);
         if (!rawTurn || !turnId) continue;
-        const built = createConversationTurn(rawTurn, conversation, this.now, currentById.get(turnId)?.params);
+        // The Desktop projection folds the opening user message into turn.params.input.
+        // Reconcile its durable client ID before that presentation-only transformation.
+        for (const candidateItem of (Array.isArray(rawTurn.items) ? rawTurn.items.slice(0, DESKTOP_HISTORY_PAGE_MAX_ITEMS) : [])) {
+          const item = record(candidateItem);
+          if (item?.type === "userMessage") this.followUpQueue.accepted(conversation.id, item.clientId ?? item.clientUserMessageId);
+        }
+        const pendingQueue = this.pendingTurnStarts.get(conversation.id);
+        const matching = pendingQueue?.find(pending => {
+          const clientId = stringValue(pending.params.clientUserMessageId);
+          return clientId && Array.isArray(rawTurn.items) && rawTurn.items.some(value => {
+            const item = record(value);
+            return item?.type === "userMessage" && (item.clientId === clientId || item.clientUserMessageId === clientId);
+          });
+        });
+        if (matching && pendingQueue) {
+          this.pendingTurnStarts.set(conversation.id, pendingQueue.filter(pending => pending !== matching));
+          currentById.delete(matching.fallbackTurnId);
+        }
+        const built = createConversationTurn(rawTurn, conversation, this.now, matching?.params ?? currentById.get(turnId)?.params);
         const previous = currentById.get(turnId);
         hydrated.push(previous ? mergeTurnContinuity(previous, built) : built);
         currentById.delete(turnId);
@@ -3208,21 +3450,33 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
     if (record(params.collaborationMode)) conversation.latestCollaborationMode = clone(params.collaborationMode);
   }
 
-  private async applyFollowerRuntimeSettings(threadId: string, params: JsonRecord): Promise<void> {
+  private readonly settingsUpdates = new Map<string, Promise<void>>();
+
+  private applyFollowerRuntimeSettings(threadId: string, params: JsonRecord): Promise<void> {
+    const update = (this.settingsUpdates.get(threadId) ?? Promise.resolve()).catch(() => {}).then(() => this.applyFollowerRuntimeSettingsOnce(threadId, params));
+    this.settingsUpdates.set(threadId, update);
+    void update.finally(() => {
+      if (this.settingsUpdates.get(threadId) === update) this.settingsUpdates.delete(threadId);
+    }).catch(() => {});
+    return update;
+  }
+
+  private async applyFollowerRuntimeSettingsOnce(threadId: string, params: JsonRecord): Promise<void> {
     params = remodexRuntimeModelSelectors({
       modelProvider: this.ensureConversation(threadId).modelProvider,
       ...params,
     });
-    const current = this.runtimeOverrides.get(threadId) ?? {};
+    const current = { ...this.runtimeOverrides.get(threadId) };
     const model = stringValue(params.model) || stringValue(record(record(params.collaborationMode)?.settings)?.model);
-    if (model) current.model = model;
+    if (model) {
+      current.model = model;
+      const mode = record(current.collaborationMode) ?? record(this.ensureConversation(threadId).latestCollaborationMode);
+      current.collaborationMode = { ...mode, settings: { ...record(mode?.settings), model } };
+    }
     if ("reasoningEffort" in params) current.effort = params.reasoningEffort;
     if ("effort" in params) current.effort = params.effort;
     if ("serviceTier" in params) current.serviceTier = params.serviceTier;
     if (record(params.collaborationMode)) current.collaborationMode = clone(params.collaborationMode);
-    this.runtimeOverrides.set(threadId, current);
-    this.applyRuntimeMetadata(this.ensureConversation(threadId), current);
-    this.markDirty(threadId);
     const update: JsonRecord = { threadId };
     if (model) update.model = model;
     if ("reasoningEffort" in params) update.effort = params.reasoningEffort;
@@ -3237,6 +3491,9 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
       // override on the next turn. Newer builds persist and notify all clients.
       if (!threadSettingsUpdateUnavailable(error)) throw error;
     }
+    this.runtimeOverrides.set(threadId, current);
+    this.applyRuntimeMetadata(this.ensureConversation(threadId), current);
+    this.markDirty(threadId);
   }
 
   private withRuntimeOverrides(threadId: string, params: JsonRecord): JsonRecord {

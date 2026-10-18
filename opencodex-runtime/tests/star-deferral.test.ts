@@ -53,7 +53,7 @@ describe("maybeShowStarPrompt deferral flow (behavior)", () => {
   const stdinTTY = process.stdin.isTTY;
   const stdoutTTY = process.stdout.isTTY;
   const AGENT_ENV_VARS = [
-    "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT",
+    "OCX_SERVICE", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT",
     "CODEX_THREAD_ID", "CODEX_SHELL", "CODEX_CI", "CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED",
     "CURSOR_TRACE_ID", "CURSOR_SESSION_TOKEN", "CURSOR_AGENT",
     "AIDER_CHAT", "OPENCODE_BIN_PATH", "GEMINI_CLI",

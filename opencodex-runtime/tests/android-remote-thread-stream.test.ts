@@ -12,6 +12,15 @@ import {
 type JsonRecord = Record<string, unknown>;
 
 describe("history cursor recovery", () => {
+  test("Claude sharing status survives a bounded history window", () => {
+    const sharing = { ...statusActivity(), id: "claude-sync", kind: "claude.desktop-sync.updated", payload: { status: "connected" } };
+    const state = createProjectedThreadStreamState(detail({
+      activities: [sharing], messages: Array.from({ length: 120 }, (_, i) => message(`m-${i}`, "Text", i)),
+    }));
+    const snapshot = projectedThreadBoundedSnapshot(state, 2) as any;
+    expect(snapshot.snapshot.thread.activities).toContainEqual(sharing);
+    expect(snapshot.snapshot.historyPage.hasOlder).toBe(true);
+  });
   test("loads an older boundary after the live stream advances to a different bounded window", async () => {
     const messages = Array.from({ length: 240 }, (_, index) => message(`m-${index}`, `Message ${index}`, index));
     const full = detail({ messages });

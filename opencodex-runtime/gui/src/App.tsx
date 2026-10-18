@@ -3,11 +3,12 @@ import { useKeyedClientResource } from "./client-resource";
 import { NativeLogs as Logs, NativeUsage as Usage, NativeGuide as Guide } from "./pages/NativeActivity";
 import Storage from "./pages/Storage";
 import AndroidRemote from "./pages/AndroidRemote";
+import Agents from "./pages/Agents";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { SidebarUpdateAction } from "./components/sidebar-update-action";
 import Updates from "./pages/Updates";
 import AdvancedSettings from "./pages/AdvancedSettings";
-import { IconGrid, IconList, IconActivity, IconHardDrive, IconMenu, IconSun, IconMoon, IconMonitor, IconGlobe, IconPower, IconSmartphone, IconBookOpen, IconX } from "./icons";
+import { IconGrid, IconBot, IconList, IconActivity, IconHardDrive, IconMenu, IconSun, IconMoon, IconMonitor, IconGlobe, IconPower, IconSmartphone, IconBookOpen, IconX } from "./icons";
 import { useI18n, useT, LOCALES, type Locale, type TKey } from "./i18n/shared";
 import { Select } from "./ui";
 import { installApiAuthFetch } from "./api";
@@ -35,6 +36,7 @@ const PAGE_TKEY: Record<Page, TKey> = {
   "android-remote": "nav.androidRemote",
   guide: "nav.guide",
   advanced: "advanced.title",
+  agents: "nav.agents",
 };
 
 const API_BASE = import.meta.env.VITE_API_BASE || "";
@@ -48,6 +50,7 @@ type NavEntry = {
 
 const NAV: NavEntry[] = [
   { id: "android-remote", tkey: "nav.androidRemote", Icon: IconSmartphone },
+  { id: "agents", tkey: "nav.agents", Icon: IconBot },
   { id: "logs", tkey: "nav.logs", Icon: IconList },
   { id: "usage", tkey: "nav.usage", Icon: IconActivity },
   { id: "storage", tkey: "nav.storage", Icon: IconHardDrive },
@@ -327,6 +330,7 @@ export default function App() {
             {page === "usage" && <Usage apiBase={API_BASE} />}
             {page === "storage" && <Storage apiBase={API_BASE} />}
             {page === "android-remote" && <AndroidRemote apiBase={API_BASE} />}
+            {page === "agents" && <Agents apiBase={API_BASE} />}
             {page === "guide" && <Guide />}
             {page === "advanced" && <AdvancedSettings apiBase={API_BASE} />}
           </ErrorBoundary>

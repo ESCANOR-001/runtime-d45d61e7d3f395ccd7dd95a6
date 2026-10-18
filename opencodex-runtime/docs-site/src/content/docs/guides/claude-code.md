@@ -500,3 +500,12 @@ it by default (`blockedSkills: ["claude-api"]`).
 **Subagent dispatches to wrong model** — Roster agents (`ocx-*`) use `<!-- ocx-route: ... -->`
 directives, not the Agent tool's `model` argument. Make sure the directive matches the intended
 route. Pass `"haiku"` as the model placeholder.
+
+### Add a project from Android
+
+In the new-chat composer, tap the project selector, then **Add project folder**.
+Folder browsing stays in the same bottom sheet. Browse the paired PC, use **Up
+one level**, or enter a folder path and tap its arrow. Choose **Select this folder**
+to use an existing folder. **Create folder** lets you name a new folder inside the
+current one; **Create and select folder** adds it to your projects and selects it
+for the draft. Back returns to the project list without losing your draft.

@@ -75,11 +75,15 @@ it is not the optional Codex goal pause/resume API.
 Manual Stop routes to the Desktop owner before reading status or saved history.
 It omits `expectedTurnId`: Desktop's normal user-stop resolves its current turn,
 handles turn-id changes, pauses an active goal and cleans up running work. A stale
-expected id can acknowledge a no-op and skip goal pausing. Only a nonempty
-`interruptedTurnId` confirms interruption; `ok:true` alone is insufficient.
+expected id can acknowledge a no-op and skip goal pausing. A nonempty
+`interruptedTurnId` directly confirms interruption; `ok:true` alone is insufficient.
 Confirmed owner results publish the matching interrupted lifecycle immediately;
-newer observed turns remain protected. A null result, unreachable owner or goal
-pause failure is surfaced to Android and triggers a fresh status read. Android
+newer observed turns remain protected. A null result triggers a bounded state read: a successful user-stop plus the matching
+terminal turn reconciles an already-ended task, including a restart with no final
+rollout event. Unavailable or mismatched evidence and goal pause failures remain
+errors. Confirmed terminal identities suppress old rollout starts during refresh
+and routing, while a different new turn remains actionable. The Remodex-owned
+follower Stop handler returns the same interrupted-turn acknowledgement as Desktop. Android
 keeps Stop pending until the request settles and never invents a paused state
 from a button tap. Stop does not fall back to a secondary writer or kill Desktop.
 
@@ -315,9 +319,30 @@ the same client-message id. Stale local mirrors are released, stale renderer ids
 and `thread/loaded/list` can prove a retained private writer without another `thread/resume`.
 Recovery never deletes writer locks, replaces an authoritative Desktop owner with an unverified
 private writer, or retries an ambiguous turn-start timeout. Unavailable routes keep ordinary sends
-in the durable queue with capped retry backoff. Recovery queue delivery records an uncertain marker
+in the durable queue with capped retry backoff. Every queued delivery records an uncertain marker
 before dispatch; after a disconnect or restart it reconciles exact message-id evidence rather than
 replaying. Prompt edits are excluded from this retry because rollback may already have happened.
+Queue snapshots commit to disk before memory or recovery timers change. An uncertain
+queued send cannot be edited or converted into a steer until delivery
+is reconciled. Cancelling removes the pending queue entry but cannot undo an
+already accepted upstream send. Queued-to-steer conversion uses the same marker.
+Android settings, mutation, and ownership ledgers enforce the same byte budget on
+writes and reads. Their bounds accommodate older valid ledgers above the former
+read limits. An over-budget write preserves the previous file; an over-budget
+existing ledger raises an error rather than becoming empty defaults on the next update.
+
+Desktop's `thread-follower-set-queued-follow-ups-state` is also an ordinary-send
+admission path: acknowledging without executing it loses the prompt. The local
+IPC owner validates and durably accepts this queue in the protected, bounded
+`android-remote-desktop-follow-ups.json` journal, then dispatches `turn/start`
+only after initial history is ready and the previous turn is terminal. This
+journal contains pending prompt context and is separate from the metadata-only
+mutation ledger. Attempt markers precede dispatch; accepted message IDs suppress
+stale retries. A lost acknowledgement retains an uncertain entry for exact
+receipt reconciliation, never automatic replay. Queue changes broadcast through
+`thread-queued-followups-changed`. An unreadable journal rejects admission without
+publishing an empty queue or preventing the optional IPC bridge from starting.
+Unsupported rich desktop context is rejected before queue acceptance.
 
 Android sends, atomic prompt edits, and queued-message steer conversions use one stable command id
 and client message id from the phone through Remodex and Codex Desktop IPC. Remodex serializes
@@ -1094,3 +1119,129 @@ On the OpenAI path there is one deterministic `openai` sidecar candidate and its
 owns credential selection; API-key OpenAI is not a ChatGPT forward sidecar candidate.
 
 Sidecar failures must degrade to text markers or skipped capability, not abort the main request.
+
+## Native creation and follower lifecycle reconciliation
+
+New Android drafts keep their existing public ID for compatibility. The first
+send creates a native Codex thread and persists its ID alias before execution.
+The creation response supplies the effective model, cwd, permission policy and
+workspace roots for the first turn; explicit effort overrides remain per-turn.
+A returned creation response is retained in the draft if saving the alias fails,
+so an in-process retry does not create another native thread.
+
+History hydration failure does not release a native writer. After bounded
+retries, the Desktop bridge exposes available state and retains its control
+route. An uncertain start keeps its pending state until a matching native client
+message or start acknowledgement establishes the real turn. Protocol validation
+rejection clears only the pending prompt. A successful interrupt acknowledgement
+alone is not terminal evidence: both owner paths verify the exact native turn,
+prefer bounded status pages, and retain unknown state when verification fails.
+Manual Stop also pauses an active native goal instead of letting it schedule new
+work. Confirmed terminal state, not history availability, controls subsequent work.
+
+The follower adapter supports model-setting reads, queue removal/clear, metadata
+updates and last-user-message editing. Editing verifies terminal recent history,
+replaces the rolled-back snapshot before starting the replacement prompt, and
+preserves attachments. Settings are published only after native acceptance (or
+an explicitly recognized legacy settings API fallback).
+
+## Managed Claude Desktop sharing
+
+`claude-code/managed.ts` owns its CLI sessions independently of the Codex adapters.
+Optional Desktop sharing keeps an SDK input stream open between turns and uses
+the experimental Remote Control method through `claude-code/desktop-sync.ts`.
+Only Remodex-owned sessions are attached. Persist the native and bridge session
+IDs before reporting sharing as connected; reject a changed bridge identity.
+Restart attaches eligible saved sessions without replaying prompts or permissions.
+`claude-code/sync-recovery.ts` serializes unexpected-disconnect retries with 5-second
+to 2-minute backoff. Retries retain both identities, wait for owned turns/background
+tools to finish, and never evict another worker. Lost owned workers reserve their
+capacity during retry delays so older background restores cannot strand them.
+The allocator checks reservations inside its serialized gate; explicit user opens
+still take precedence, and terminal failures or pauses release reservations.
+Explicitly paused/parked sessions
+stay paused across restart. Authentication, policy, missing-session, ownership and
+identity errors stop automatic retries. Desktop-owned sessions only rejoin their
+original remote worker. Queued/uncertain deliveries are never replayed by recovery.
+Desktop-originated user messages are echoed by UUID and deduplicated against
+local sends. Terminal cancellation and permission aborts reconcile phone state.
+A serialized worker allocator parks the least recently used idle worker when a
+new or reopened managed chat needs one of four worker slots. Running workers and
+pending approvals are never eligible. Parking preserves native/bridge IDs and
+never replays prompts. Desktop sharing is paused until that chat is reopened or
+sent to from Android. Read-only SDK discovery projects existing local Claude Code
+sessions into the phone list without starting writers. `claude-code/remote-client.ts`
+can join the recorded Remote Control identity through the SDK browser client using
+PC-local Claude CLI subscription credentials. Existing history IDs become writable
+only after worker acknowledgement; metadata and session IDs are checked before
+exposing control. This path never calls the bridge worker-claim endpoint, resumes a
+second CLI, edits native transcripts, or interrupts Desktop on client shutdown.
+Unsupported or unshared history remains read-only. Discovery refreshes only while phone subscriptions exist.
+Sharing metadata remains available in bounded thread snapshots. No Desktop
+files, plugins, account tokens or Codex session owners are changed by this path.
+
+Claude session controls use the operate-scoped `claude.sessionAction` RPC.
+Conversation branching uses the SDK's `forkSession` only for idle Remodex-owned
+sessions. The new native identity is persisted before its remapped history is
+imported; failed reads can retry after restart without forking again or sending
+with empty context. The source worker and history remain unchanged. A branch
+shares the project folder but inherits no approvals, queued prompts, live connection,
+usage status or file checkpoints. Its first prompt resumes the new native session
+with approval-required access and the normal Desktop sharing path.
+Internal task-notification envelopes are excluded from imported user messages.
+Owned-worker Stop interrupts the foreground prompt and explicitly stops reported
+background task IDs, then flushes any held foreground result after acknowledgement.
+It does not cancel other workers or another client's queued prompts. Completed
+Claude work entries retain turn timestamps and duration for stable older folds.
+Collapsed `work.deferred` rows retain those timing fields, and final text records
+the acknowledged completion time even when there are no retained tool entries.
+`claude-code/project-files.ts` serves Files and working-tree Changes from roots
+already present in the Claude shell. It does not borrow the Codex workspace cache.
+Text reads reuse the confined file-preview reader; searches skip link directories
+and are bounded. Git previews are read-only, limited to the selected project,
+disable external diff/text-conversion programs, and include untracked files.
+File checkpoints are SDK user-message UUIDs from Remodex-owned workers with checkpointing
+enabled. Restore previews bind the client, chat, worker, update time and file hashes;
+they expire after one minute and are consumed once. Restores require an idle chat
+with no pending permissions or queued prompts and never truncate conversation.
+Worktree creation uses Git from committed HEAD, keeps source changes, and creates
+a new approval-required Claude chat. MCP controls accept only names reported by
+the current worker. Skill/plugin reload reads already-installed configuration and
+honors the SDK's cache-impact hold. No credentials, MCP configuration or plugin paths
+are returned. Capability reads remain single-flight until both SDK controls settle,
+even after the UI deadline. Closing a Claude worker clears its capability reads,
+restore-preview references, and streaming metadata. Resolved permissions unregister
+their abort listeners immediately. Connected imported chats share the same capability reader.
+An imported chat retains at most 8,000 recent transport event IDs in memory and
+on disk. The connection separately protects the message IDs from its initial
+history, so evicting old stream frames cannot replay saved prompts. Detaching
+clears both in-memory sets without clearing the persisted reconnect window.
+Native history remains byte-bounded at 16 MiB and cached for at most four chats;
+the importer preserves all entries inside that bound so ten-prompt Android pages
+can reach the beginning without a separate 2,000-entry cutoff.
+
+Explicit Claude link recovery can fork an owned idle native session through the SDK after user confirmation. Stable Remodex storage and thread IDs survive native-ID replacement; previous native IDs remain excluded from discovery. Reconnection never silently substitutes an identity. The Claude-only recovery RPC requires the existing operate scope and a deduplicated command ID. No native Desktop history is edited.
+
+## Claude automatic connection preference
+
+`claude-code/auto-connect.ts` reads and merges only `remoteControlAtStartup` in
+Claude user settings (honoring `CLAUDE_CONFIG_DIR`). It preserves unrelated keys,
+rejects malformed/oversized/nonregular files, and does not register the user file
+for Remodex uninstall cleanup. `disableRemoteControl` is never overridden.
+The Claude-only `claude.getSyncSettings` RPC requires read scope;
+`claude.setAutoConnect` requires operate scope and accepts one boolean only.
+No file path, executable, credentials, or arbitrary settings cross this boundary.
+The dashboard uses the existing authenticated Claude settings endpoint.
+
+Enabling the preference also enables managed Claude sharing; disabling it does
+not disconnect running sessions. User settings alone cannot prove Desktop's
+effective preference or override an explicit Desktop choice or organization policy.
+The status reader also inspects only `preferences.ccRemoteControlDefaultEnabled`
+from the native Desktop config at standard Linux, macOS, and Windows locations.
+It never writes that file or returns its contents/paths. Explicit off triggers
+one-time Desktop setup instructions in the dashboard and Android settings panel;
+missing, malformed, oversized, nonregular, or unrecognized files remain unknown.
+Refresh rereads the preference so completing setup clears the warning. Clients
+never report a saved preference as a live session acknowledgement.
+Existing unshared sessions still require their original
+worker to enable sharing; this path never starts a competing writer.

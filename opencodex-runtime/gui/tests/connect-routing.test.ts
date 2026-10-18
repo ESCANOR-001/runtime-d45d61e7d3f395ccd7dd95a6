@@ -8,7 +8,7 @@ test("the new dashboard lands on Android Remote and retires unrelated routes", (
 });
 
 test("the sections including Advanced Settings and their subviews survive reload", () => {
-  for (const hash of ["android-remote", "android-remote/pair", "logs", "logs/debug", "logs/desktop", "usage", "storage", "guide", "advanced"]) {
+  for (const hash of ["android-remote", "android-remote/pair", "logs", "logs/debug", "logs/desktop", "usage", "storage", "guide", "advanced", "agents", "agents/claude-code", "agents/codex"]) {
     expect(resolveConnectHashChange(`#/${hash}`)).toEqual({ page: hash.split("/")[0], replaceTo: null });
   }
 });

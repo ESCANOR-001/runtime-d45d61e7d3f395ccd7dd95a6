@@ -1,11 +1,31 @@
 import { describe, expect, test } from "bun:test";
 import type { AndroidCodexClient } from "../src/android-remote/codex-app-server";
 import { decodeNativeHistoryCursor, nativeHistoryCursor, nativeHistoryIsUnsupported, nativeHistoryNeedsSessionRecovery, readNativeTurnsPage, windowsNativeHistoryNeedsSessionRecovery } from "../src/android-remote/native-turn-history";
-import { projectedTurnWorkPage } from "../src/android-remote/thread-work-page";
+import { compactProjectedWork, projectedTurnWorkPage } from "../src/android-remote/thread-work-page";
 import { projectCodexThreadDetail } from "../src/android-remote/projection";
 import { createProjectedThreadStreamState, projectedThreadBoundedSnapshot, projectedThreadOlderPage, projectedThreadRecentPage } from "../src/android-remote/thread-stream";
 
 describe("complete bounded Android history", () => {
+  test("collapsed and paged work preserve the original completed turn duration", () => {
+    const timing = { turnDurationMs: 33_000, turnStartedAt: "2026-10-18T00:00:00Z", turnCompletedAt: "2026-10-18T00:00:33Z" };
+    const thread = {
+      id: "timing", messages: [
+        { id: "prompt", role: "user", turnId: "first", sequence: 1 },
+        { id: "answer", role: "assistant", phase: "final_answer", turnId: "first", sequence: 103 },
+        { id: "next", role: "user", turnId: "next", sequence: 104 },
+      ],
+      activities: Array.from({ length: 101 }, (_, index) => ({ id: `tool-${index}`, kind: "tool.completed", turnId: "first", sequence: index + 2, payload: { ...timing, status: "completed" } })),
+    };
+    const collapsed = compactProjectedWork(thread, "next");
+    expect(collapsed.activities).toHaveLength(1);
+    expect(collapsed.activities[0]!.payload).toMatchObject(timing);
+    const first = projectedTurnWorkPage(thread, "first");
+    expect(first.activities.at(-1)!.payload).toMatchObject(timing);
+    expect(first.nextCursor).not.toBeNull();
+    const second = projectedTurnWorkPage(thread, "first", first.nextCursor!);
+    expect(second.activities.at(-1)!.payload).toMatchObject({ ...timing, remaining: 0 });
+  });
+
   test("recognizes the exact lineage failure for recovery on every operating system", () => {
     expect(nativeHistoryNeedsSessionRecovery(new Error("invalid paginated history lineage for task: source rollout belongs to another thread"))).toBe(true);
     expect(nativeHistoryNeedsSessionRecovery({ message: "invalid paginated history lineage: source rollout belongs to another thread" })).toBe(true);

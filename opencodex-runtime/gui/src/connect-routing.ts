@@ -1,4 +1,5 @@
 import type { AppHashChangeAction, Page } from "./app-routing";
+import { AGENT_HASHES } from "./agent-catalog";
 import { normalizeHashPath } from "./hash-routing";
 
 export function resolveConnectHashChange(hash: string): AppHashChangeAction {
@@ -22,6 +23,8 @@ export function resolveConnectHashChange(hash: string): AppHashChangeAction {
     storage: "storage",
     guide: "guide",
     advanced: "advanced",
+    agents: "agents",
+    ...Object.fromEntries(AGENT_HASHES.map(hash => [hash, "agents" as const])),
   };
   const page = Object.hasOwn(routes, target) ? routes[target] : undefined;
   if (page) return { page, replaceTo: target === raw ? null : target };

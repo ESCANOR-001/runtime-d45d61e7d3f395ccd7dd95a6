@@ -8,7 +8,8 @@ import { assertNotRealHomeUnderTest } from "../lib/test-home-guard";
 import { hardenSecretDir } from "../lib/windows-secret-acl";
 
 const MUTATION_STATE_VERSION = 1;
-const MUTATION_STATE_MAX_BYTES = 4 * 1024 * 1024;
+// Accommodates previously written ledgers; writes enforce the same bound.
+const MUTATION_STATE_MAX_BYTES = 16 * 1024 * 1024;
 const MAX_MUTATIONS = 4_096;
 const MUTATION_RETENTION_MS = 90 * 24 * 60 * 60 * 1_000;
 const SAFE_ID = /^[a-zA-Z0-9._:/-]{1,256}$/;
@@ -216,10 +217,12 @@ export function createAndroidRemoteMutationStore(
 
   const read = (): AndroidRemoteMutationState => {
     if (!path) return structuredClone(memoryState);
+    if (existsSync(path) && statSync(path).size > MUTATION_STATE_MAX_BYTES) {
+      throw new RangeError("Android Remote mutation state exceeds its storage limit");
+    }
     try {
       if (!existsSync(path)) return defaultState();
       hardenExistingSecret(path);
-      if (statSync(path).size > MUTATION_STATE_MAX_BYTES) return defaultState();
       return parseState(JSON.parse(readFileSync(path, "utf8")));
     } catch {
       return defaultState();
@@ -236,7 +239,11 @@ export function createAndroidRemoteMutationStore(
       return structuredClone(next);
     }
     ensureStateDirectory(root);
-    atomicWriteFile(path, `${JSON.stringify(next, null, 2)}\n`);
+    const serialized = `${JSON.stringify(next, null, 2)}\n`;
+    if (Buffer.byteLength(serialized, "utf8") > MUTATION_STATE_MAX_BYTES) {
+      throw new RangeError("Android Remote mutation state exceeds its storage limit");
+    }
+    atomicWriteFile(path, serialized);
     return next;
   };
 

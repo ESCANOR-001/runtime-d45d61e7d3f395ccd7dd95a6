@@ -1,9 +1,13 @@
+import { ManagedClaudeCode } from "../claude-code/managed";
+import { claudeProjectRoot, claudeProjectEntries, claudeProjectFile, claudeProjectDiff } from "../claude-code/project-files";
+import { confirmNativeTurnStopped, readNativeStopState, pauseNativeGoal, nativeStartDefinitelyRejected } from "./native-turn-lifecycle";
 import { codexAccountQuotaReport } from "./codex-account-usage";
 import { projectedTurnWorkPage } from "./thread-work-page";
 import { isPrivateLanIpv4 } from "./local-network";
 import { desktopAnswerMessage, desktopAsyncQuestionItem, desktopQuestionReplyIds, readDesktopInteractions, type DesktopInteractions } from "./desktop-interactions";
 import { DEFAULT_ANDROID_GATEWAY_PORT as DEFAULT_GATEWAY_PORT } from "./ports";
 import { createDesktopUpdateRoutes } from "./desktop-updates";
+import { createDesktopFollowUpStore } from "./desktop-follow-up-queue";
 import { createTaskActivityReader } from "../update/task-activity";
 import { readUpdateTaskIds, readUpdateTaskPath } from "../update/task-inventory";
 import { decodeNativeHistoryCursor, nativeHistoryCursor, nativeHistoryIsUnsupported, readNativeTurnsPage, nativeHistoryNeedsSessionRecovery } from "./native-turn-history";
@@ -237,6 +241,8 @@ function userMessageImagePaths(message: string): ReadonlySet<string> {
 
 type GatewayWsData = {
   clientId: string;
+  agent?: "claude-code";
+  stopClaudeSubscription?: () => void;
   subscription?: SubscriptionKind;
   requestId?: RequestId;
   threadId?: string;
@@ -252,6 +258,8 @@ type DraftProject = {
 };
 
 type DraftThread = {
+  /** Retain native creation across a failed alias write; never create it twice. */
+  nativeStart?: JsonRecord;
   id: string;
   projectId: string;
   projectTitle: string;
@@ -1901,6 +1909,7 @@ function mutationFailureDefinitelyNotDelivered(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return (
     desktopTurnStartDefinitelyNotDelivered(error)
+    || nativeStartDefinitelyRejected(error)
     || codexHasActiveWriter(error)
     || /no running turn to steer|prompt exceeds|cannot be empty|not supported|is required|is not valid|no prompt to edit|no longer present|not found/iu.test(
       message,
@@ -2043,6 +2052,10 @@ export function androidRemoteSubscriptionFingerprint(value: unknown): string {
 }
 
 export class AndroidRemoteGatewayController {
+  private managedClaude: ManagedClaudeCode | null = null;
+  claudeCode(): ManagedClaudeCode {
+    return this.managedClaude ??= new ManagedClaudeCode(join(this.store.stateRoot ?? getConfigDir(), "managed-claude-code"));
+  }
   readonly auth: AndroidRemoteAuth;
   private readonly runtime: CodexRuntimeLike;
   private readonly now: () => number;
@@ -2419,6 +2432,7 @@ export class AndroidRemoteGatewayController {
       sendCodexRequest: (method, params) => this.requireCodex().request(method, params),
       respondToCodexRequest: (id, result) => this.requireCodex().respond(id, result),
       ownershipStore: createAndroidDesktopOwnershipStore(store.stateRoot),
+      followUpStore: createDesktopFollowUpStore(store.stateRoot),
       log: message => {
         if (process.env.OPENCODEX_ANDROID_IPC_DEBUG === "1") console.log(`[remodex] ${message}`);
       },
@@ -2471,7 +2485,8 @@ export class AndroidRemoteGatewayController {
 
   createPairingInvitation(desktopName = readHostname() || "Remodex Desktop", replaceClientId?: string): AndroidRemotePairingInvitation {
     if (this.gatewayStatus !== "ready") throw new Error("Android Remote gateway is not ready");
-    const localUrls = this.pairingUrls();
+    // A loopback listener is reachable by the tunnel, never by the phone itself.
+    const localUrls = this.listeningOnLocalNetwork ? this.pairingUrls() : [];
     const settings = this.store.read().settings;
     const tunnel = this.cloudflareTunnel.state();
     const cloudflareUrl = tunnel.status === "ready" ? tunnel.publicUrl : null;
@@ -2479,7 +2494,7 @@ export class AndroidRemoteGatewayController {
       throw new Error("Named Tunnel is not ready yet. Wait for the custom domain to be verified, then generate a new QR code.");
     }
     if (localUrls.length === 0 && !cloudflareUrl) {
-      throw new Error("No phone-reachable network address is available");
+      throw new Error("No phone-reachable network address is available. Wait for remote access to be ready, or enable local network access and connect the PC to Wi-Fi.");
     }
     return this.auth.createInvitation({ desktopName, localUrls, cloudflareUrl, replaceClientId });
   }
@@ -2682,6 +2697,7 @@ export class AndroidRemoteGatewayController {
   }
 
   async stop(): Promise<void> {
+    await this.managedClaude?.close();
     const starting = this.startFlight;
     if (starting) await starting.catch(() => undefined);
     await this.stopResources();
@@ -2837,7 +2853,9 @@ export class AndroidRemoteGatewayController {
       const headers = requestedProtocols.includes("opencodex-json-v1")
         ? { "Sec-WebSocket-Protocol": "opencodex-json-v1" }
         : undefined;
-      if (server.upgrade(req, { data: { clientId: client.id }, ...(headers ? { headers } : {}) })) {
+      const agent = url.searchParams.get("agent");
+      if (agent && agent !== "claude-code") return errorResponse(400, "Unknown agent");
+      if (server.upgrade(req, { data: { clientId: client.id, ...(agent === "claude-code" ? { agent } : {}) }, ...(headers ? { headers } : {}) })) {
         return undefined;
       }
       return errorResponse(426, "WebSocket upgrade failed");
@@ -2887,12 +2905,20 @@ export class AndroidRemoteGatewayController {
       }
     }
     if (url.pathname === "/api/orchestration/snapshot" && req.method === "GET") {
+      if (url.searchParams.get("agent") === "claude-code") {
+        if (!authenticated.client.scopes.includes("orchestration:read")) return errorResponse(403, "Read access required");
+        return jsonResponse(this.claudeCode().shell());
+      }
       try { return jsonResponse(await this.readModel()); }
       catch { return errorResponse(503, "Codex task history is temporarily unavailable"); }
     }
     if (url.pathname === "/api/orchestration/dispatch" && req.method === "POST") {
       try {
         const command = await readJsonBody(req);
+        if (url.searchParams.get("agent") === "claude-code") {
+          if (!authenticated.client.scopes.includes("orchestration:operate")) return errorResponse(403, "Task access required");
+          return jsonResponse(await this.claudeCode().dispatch(command, authenticated.client.id));
+        }
         return jsonResponse(await this.dispatch(authenticated.client.id, command));
       } catch (error) {
         return this.dispatchError(error);
@@ -3054,10 +3080,11 @@ export class AndroidRemoteGatewayController {
     const rows = this.socketsByClient.get(ws.data.clientId) ?? new Set();
     rows.add(ws);
     this.socketsByClient.set(ws.data.clientId, rows);
-    this.ensurePoller();
+    if (ws.data.agent !== "claude-code") this.ensurePoller();
   }
 
   private onSocketClose(ws: ServerWebSocket<GatewayWsData>): void {
+    ws.data.stopClaudeSubscription?.();
     this.sockets.delete(ws);
     const rows = this.socketsByClient.get(ws.data.clientId);
     rows?.delete(ws);
@@ -3092,6 +3119,10 @@ export class AndroidRemoteGatewayController {
     }
     const params = record(message.params) ?? {};
     try {
+      if (ws.data.agent === "claude-code") {
+        await this.claudeSocketMessage(ws, id, method, params);
+        return;
+      }
       if (method === "server.getConfig") {
         socketResult(ws, id, await this.serverConfig());
         return;
@@ -3233,6 +3264,104 @@ export class AndroidRemoteGatewayController {
     } catch (error) {
       socketError(ws, id, error instanceof Error ? error.message : "Android Remote request failed");
     }
+  }
+
+  private async claudeSocketMessage(ws: ServerWebSocket<GatewayWsData>, id: RequestId, method: string, params: JsonRecord): Promise<void> {
+    const client = this.store.read().clients.find(c => c.id === ws.data.clientId);
+    if (!client?.scopes.includes("orchestration:read")) throw new TypeError("This phone is no longer authorized.");
+    const claude = this.claudeCode();
+    const config = (refresh = false) => claude.config(this.environmentDescriptor(), this.authDescriptor(), this.mobileConnectionState(), refresh);
+    // A phone connection (including pull-to-refresh) explicitly reads config.
+    // Recheck the PC login before replying; background config streams stay cached.
+    if (method === "server.getConfig") { socketResult(ws, id, await config(true)); return; }
+    if (method === "claude.getSyncSettings") { socketResult(ws, id, claude.syncSettings()); return; }
+    if (method === "claude.setAutoConnect") {
+      if (!client.scopes.includes("orchestration:operate")) throw new TypeError("Task access required");
+      socketResult(ws, id, await claude.setAutoConnect(params)); return;
+    }
+    if (method === "claude.getCapabilities") {
+      socketResult(ws, id, await claude.capabilities(stringValue(params.threadId, 128))); return;
+    }
+    if (method === "claude.getUsage") {
+      socketResult(ws, id, await claude.refreshUsage(stringValue(params.threadId, 128))); return;
+    }
+    if (method === "claude.sessionAction") {
+      if (!client.scopes.includes("orchestration:operate")) throw new TypeError("Task access required");
+      socketResult(ws, id, await claude.sessionAction(params, client.id)); return;
+    }
+    if (method === "assets.createUrl") {
+      const resource = record(params.resource);
+      if (resource?._tag !== "workspace-file") throw new TypeError("Select a Claude tool image to preview.");
+      const path = await claude.toolImagePath(stringValue(resource.threadId, 128), stringValue(resource.path, 4097));
+      socketResult(ws, id, await this.assets.issueAssistantReferencedImage(path)); return;
+    }
+    if (["orchestration.subscribeShell", "orchestration.subscribeThread", "subscribeServerConfig"].includes(method)) {
+      await claude.refreshHistory();
+      const threadId = stringValue(params.threadId, 128);
+      let stream: ProjectedThreadStreamState | null = null;
+      let fingerprint = "";
+      let publishing = false; let republish = false;
+      const publish = async () => {
+        if (publishing) { republish = true; return; }
+        publishing = true;
+        try { do { republish = false; await publishOnce(); } while (republish && this.sockets.has(ws)); } finally { publishing = false; }
+      };
+      const publishOnce = async () => {
+        if (!this.sockets.has(ws)) return;
+        try {
+          if (method === "orchestration.subscribeThread") {
+            // Freeze the previous frame: the SDK adapter updates its owned state in place.
+            const detail = structuredClone(await claude.readDetail(threadId));
+            if (!stream) {
+              stream = createProjectedThreadStreamState(detail);
+              socketEvent(ws, id, projectedThreadBoundedSnapshot(stream));
+            } else {
+              const advanced = advanceProjectedThreadStream(stream, detail);
+              stream = advanced.state;
+              for (const item of advanced.items) socketEvent(ws, id, item);
+            }
+          } else {
+            const value = method === "orchestration.subscribeShell" ? { kind: "snapshot", snapshot: claude.shell() }
+              : { version: 1, type: "snapshot", config: await config() };
+            const next = JSON.stringify(value);
+            if (next !== fingerprint) { fingerprint = next; socketEvent(ws, id, value); }
+          }
+        } catch (error) { socketError(ws, id, error instanceof Error ? error.message : "Claude Code could not update this session."); }
+      };
+      ws.data.stopClaudeSubscription?.();
+      ws.data.stopClaudeSubscription = claude.onChange(() => { void publish(); });
+      await publish();
+      // Show saved messages immediately; Remote Control startup may take seconds.
+      if (method === "orchestration.subscribeThread") void claude.prepareThread(threadId).catch(() => {});
+      return;
+    }
+    if (method === "orchestration.dispatchCommand") {
+      if (!client.scopes.includes("orchestration:operate")) throw new TypeError("Task access required");
+      socketResult(ws, id, await claude.dispatch(params, client.id)); return;
+    }
+    if (method === "claude.recoverDesktopSync") {
+      if (!client.scopes.includes("orchestration:operate")) throw new TypeError("Task access required");
+      socketResult(ws, id, await claude.recoverDesktop(stringValue(params.threadId, 128), stringValue(params.mode, 32), stringValue(params.commandId, 128), client.id)); return;
+    }
+    if (method === "orchestration.getThreadPage") { socketResult(ws, id, await claude.page(params)); return; }
+    if (method === "orchestration.getTurnWork") {
+      await claude.readDetail(stringValue(params.threadId, 128));
+      socketResult(ws, id, claude.work(params)); return;
+    }
+    if (method === "filesystem.browse") { socketResult(ws, id, await this.browseFilesystem(params)); return; }
+    if (["projects.listEntries", "projects.searchEntries", "projects.readFile", "review.getDiffPreview"].includes(method)) {
+      const cwd = await claudeProjectRoot(params.cwd, claude.shell());
+      const result = method === "projects.readFile" ? await claudeProjectFile(cwd, params.relativePath)
+        : method === "review.getDiffPreview" ? await claudeProjectDiff(cwd, params.ignoreWhitespace === true)
+        : await claudeProjectEntries(cwd, method === "projects.searchEntries" ? params.query : undefined, params.limit);
+      socketResult(ws, id, result); return;
+    }
+    if (method === "filesystem.readTextFile") {
+      const threadId = stringValue(params.threadId, 128);
+      await claude.readDetail(threadId);
+      socketResult(ws, id, await readWorkspaceTextFile(claude.workspace(threadId), stringValue(params.path, 4097))); return;
+    }
+    throw new TypeError("This action is not available for managed Claude Code sessions.");
   }
 
   private ensurePoller(): void {
@@ -4914,6 +5043,21 @@ export class AndroidRemoteGatewayController {
       const cachedTokenUsage = this.latestThreadTokenUsage.get(remoteThreadId);
       if (cachedTokenUsage) thread = { ...thread, latestTokenUsageInfo: cachedTokenUsage };
     }
+    const confirmedTurnId = this.completedDesktopTurns.get(remoteThreadId);
+    const confirmed = this.shellLifecycles.get(remoteThreadId)
+      ?? record(this.threadStreams.get(remoteThreadId)?.detail.thread);
+    const confirmedTurn = record(confirmed?.latestTurn);
+    const latestNativeTurnId = canonicalTurnId(canonicalTurnsNewestFirst(thread.turns)[0]);
+    if (confirmedTurnId && confirmedTurn?.turnId === confirmedTurnId
+      && desktopStateStatusIsTerminal(confirmedTurn.state)
+      && (!latestNativeTurnId || latestNativeTurnId === confirmedTurnId)
+      && (!thread.androidRemoteLatestTurnId || thread.androidRemoteLatestTurnId === confirmedTurnId)) {
+      thread = { ...thread, androidRemoteLatestTurnId: confirmedTurnId,
+        androidRemoteLatestTurnState: confirmedTurn.state,
+        androidRemoteLatestTurnAt: confirmedTurn.completedAt ?? confirmed?.updatedAt,
+        androidRemoteActivityUnverified: false, androidRemoteWaitingOnUserInput: false,
+        androidRemoteLatestTurnError: undefined };
+    }
     const detail = projectCodexThreadDetail(thread, ++this.sequence, { compactCompletedWork: true });
     const projected = record(detail.thread);
     if (!projected) return detail;
@@ -4974,7 +5118,7 @@ export class AndroidRemoteGatewayController {
       && authoritativeLatestTurn?.state === "interrupted"
       && !authoritativeLatestTurn.completedAt
       && this.desktopSessions.isWatching(remoteThreadId)
-      && this.desktopSessions.activeTurnId?.(remoteThreadId) === liveProjectedActiveTurnId;
+      && this.activeDesktopSessionTurnId(remoteThreadId) === liveProjectedActiveTurnId;
     const authoritativeTerminalSupersedesLive =
       authoritativeLatestTurnId.length > 0
       && desktopStateStatusIsTerminal(authoritativeLatestTurn?.state)
@@ -5250,8 +5394,13 @@ export class AndroidRemoteGatewayController {
     }
   }
 
+  private activeDesktopSessionTurnId(remoteThreadId: string): string | null | undefined {
+    const turnId = this.desktopSessions.activeTurnId?.(remoteThreadId);
+    return turnId && this.completedDesktopTurns.get(remoteThreadId) === turnId ? "" : turnId;
+  }
+
   private syncKnownActiveTurnFromDesktopSession(remoteThreadId: string): void {
-    const activeTurnId = this.desktopSessions.activeTurnId?.(remoteThreadId);
+    const activeTurnId = this.activeDesktopSessionTurnId(remoteThreadId);
     // Compatibility streams supplied by older callers/tests do not expose a
     // projector snapshot. Leave their existing knowledge untouched.
     if (activeTurnId === undefined) return;
@@ -5518,7 +5667,7 @@ export class AndroidRemoteGatewayController {
   private async isOwningRuntimeThreadActive(threadId: string): Promise<boolean | null> {
     const remoteThreadId = this.remoteThreadId(threadId);
     if (this.desktopSessions.isWatching(remoteThreadId)) {
-      const watchedTurnId = this.desktopSessions.activeTurnId?.(remoteThreadId);
+      const watchedTurnId = this.activeDesktopSessionTurnId(remoteThreadId);
       // Use the same start/stop evidence as Stop and message routing. Silence
       // during a long command is not an interruption, and Windows' secondary
       // reader cannot verify a turn owned by the Desktop process.
@@ -6513,11 +6662,13 @@ export class AndroidRemoteGatewayController {
     }
   }
 
-  private persistQueuedTurns(): void {
-    this.queuedTurnStore.replace([...this.queuedTurns.values()].flat());
-  }
-
   private replaceQueuedTurns(remoteThreadId: string, queued: QueuedAndroidTurn[]): void {
+    // Validate and commit the candidate snapshot before changing memory or timers.
+    // A rejected enqueue/cancel must not become live after a failed disk write.
+    const next = new Map(this.queuedTurns);
+    if (queued.length === 0) next.delete(remoteThreadId);
+    else next.set(remoteThreadId, queued);
+    this.queuedTurnStore.replace([...next.values()].flat());
     if (queued.length === 0) {
       this.queuedTurns.delete(remoteThreadId);
       const timer = this.writerRecoveryTimers.get(remoteThreadId);
@@ -6527,7 +6678,6 @@ export class AndroidRemoteGatewayController {
     } else {
       this.queuedTurns.set(remoteThreadId, queued);
     }
-    this.persistQueuedTurns();
   }
 
   private publishQueuedTurnState(remoteThreadId: string): void {
@@ -6577,6 +6727,9 @@ export class AndroidRemoteGatewayController {
     const queued = this.queuedTurns.get(remoteThreadId) ?? [];
     const existingIndex = queued.findIndex(candidate => candidate.messageId === messageId);
     const existing = existingIndex >= 0 ? queued[existingIndex] : undefined;
+    if (existing?.command.writerRecoveryDeliveryUncertain === true) {
+      throw new Error(UNCERTAIN_MUTATION_MESSAGE);
+    }
     if (!existing && this.queuedTurnCount() >= MAX_QUEUED_ANDROID_TURNS) {
       throw new Error("Too many queued messages. Cancel one and try again.");
     }
@@ -6642,6 +6795,9 @@ export class AndroidRemoteGatewayController {
     const queuedTurn = queuedIndex >= 0 ? queued[queuedIndex] : undefined;
     if (!remoteThreadId || !messageId || !queuedTurn) {
       throw new Error("This queued message is no longer available");
+    }
+    if (queued[queuedIndex]?.command.writerRecoveryDeliveryUncertain === true) {
+      throw new Error(UNCERTAIN_MUTATION_MESSAGE);
     }
     const displayText = typeof command.text === "string" ? command.text : "";
     if (displayText.length > 120_000) {
@@ -6768,7 +6924,7 @@ export class AndroidRemoteGatewayController {
     // avoids a private thread/read that can block behind Desktop's writer.
     await this.ensureDesktopSessionWatchForThread(remoteThreadId).catch(() => false);
     if (this.desktopSessions.isWatching(remoteThreadId)) {
-      const watchedTurnId = this.desktopSessions.activeTurnId?.(remoteThreadId);
+      const watchedTurnId = this.activeDesktopSessionTurnId(remoteThreadId);
       if (watchedTurnId !== undefined) {
         const nativeThreadId = this.nativeThreadId(remoteThreadId);
         if (watchedTurnId) {
@@ -6834,7 +6990,7 @@ export class AndroidRemoteGatewayController {
     // app-server read so a rotated rollout cannot inherit a stale turn.
     await this.ensureDesktopSessionWatchForThread(remoteThreadId).catch(() => false);
     if (this.desktopSessions.isWatching(remoteThreadId)) {
-      const watchedTurnId = this.desktopSessions.activeTurnId?.(remoteThreadId);
+      const watchedTurnId = this.activeDesktopSessionTurnId(remoteThreadId);
       if (watchedTurnId !== undefined) {
         if (watchedTurnId) {
           this.rememberKnownActiveTurn(nativeThreadId, watchedTurnId);
@@ -7050,7 +7206,7 @@ export class AndroidRemoteGatewayController {
       if (delivered) return;
       throw new Error(
         retainQueuedTurnOnFailure
-          ? "Codex did not persist the steering message. It remains queued so you can try again."
+          ? "Steering delivery is uncertain. The message remains queued while Remodex checks for confirmation."
           : "Codex did not persist the steering message. It was not queued; try again.",
       );
     } finally {
@@ -7318,12 +7474,16 @@ export class AndroidRemoteGatewayController {
       await existingFlight;
       return;
     }
+    if (queued[queuedIndex]?.command.writerRecoveryDeliveryUncertain === true) {
+      throw new Error(UNCERTAIN_MUTATION_MESSAGE);
+    }
     const flightPrefix = `${remoteThreadId}\u0000`;
     if ([...this.queuedSteerFlights.keys()].some(key => key.startsWith(flightPrefix))) {
       throw new Error("Another queued message action is already in progress for this task");
     }
     let ownsThreadLock = false;
     let deliveryAttempted = false;
+    let deliveryConfirmed = false;
     const operation = (async (): Promise<void> => {
       try {
         // Queueing performs an automatic idle probe so a message submitted on
@@ -7338,6 +7498,9 @@ export class AndroidRemoteGatewayController {
         );
         if (!currentQueuedTurn) {
           throw new Error("This queued message is no longer available");
+        }
+        if (currentQueuedTurn.command.writerRecoveryDeliveryUncertain === true) {
+          throw new Error(UNCERTAIN_MUTATION_MESSAGE);
         }
         if (this.queuedTurnStarts.has(remoteThreadId)) {
           throw new Error("Another queued message action is already in progress for this task");
@@ -7355,6 +7518,10 @@ export class AndroidRemoteGatewayController {
         }
         this.queuedTurnStarts.add(remoteThreadId);
         ownsThreadLock = true;
+        this.replaceQueuedTurns(remoteThreadId, (this.queuedTurns.get(remoteThreadId) ?? [])
+          .map(turn => turn.messageId === messageId
+            ? { ...turn, command: { ...turn.command, writerRecoveryDeliveryUncertain: true } }
+            : turn));
         deliveryAttempted = true;
         await this.steerTurn(
           currentQueuedTurn.clientId,
@@ -7363,6 +7530,7 @@ export class AndroidRemoteGatewayController {
           options.retainOnFailure !== false,
           currentQueuedTurn.stagedAttachments,
         );
+        deliveryConfirmed = true;
         const current = this.queuedTurns.get(remoteThreadId) ?? [];
         this.replaceQueuedTurns(
           remoteThreadId,
@@ -7379,9 +7547,17 @@ export class AndroidRemoteGatewayController {
           this.publishQueuedTurnState(remoteThreadId);
         }
         if (deliveryAttempted) {
-          // An explicitly queued message stays queued so the phone can retry
-          // it. A direct steer is removed instead: it must never be silently
-          // downgraded into a normal turn after the active task completes.
+          // Only a conclusive rejection permits later delivery. A timeout or
+          // missing durability event must not turn a steer into a normal send.
+          if (!deliveryConfirmed && options.retainOnFailure !== false && mutationFailureDefinitelyNotDelivered(error)) {
+            this.replaceQueuedTurns(remoteThreadId, (this.queuedTurns.get(remoteThreadId) ?? [])
+              .map(turn => {
+                if (turn.messageId !== messageId) return turn;
+                const command = { ...turn.command };
+                delete command.writerRecoveryDeliveryUncertain;
+                return { ...turn, command };
+              }));
+          }
           this.requestAuthoritativeThreadRefresh(remoteThreadId);
           console.warn(
             `[Remodex] Android ${options.retainOnFailure === false ? "direct" : "queued"} steer was not durably confirmed: ${
@@ -7399,6 +7575,7 @@ export class AndroidRemoteGatewayController {
     // the tracked promise guarantees the map entry is removed after it is set.
     const flight = operation.finally(() => {
       this.queuedSteerFlights.delete(flightKey);
+      this.scheduleWriterRecovery(remoteThreadId);
     });
     this.queuedSteerFlights.set(flightKey, flight);
     await flight;
@@ -7407,7 +7584,8 @@ export class AndroidRemoteGatewayController {
   private scheduleWriterRecovery(remoteThreadId: string): void {
     if (this.writerRecoveryStopped || this.gatewayStatus !== "ready" || this.writerRecoveryTimers.has(remoteThreadId)) return;
     const pending = this.queuedTurns.get(remoteThreadId)?.[0];
-    if (!pending || pending.command.writerRecoveryPending !== true) return;
+    if (!pending || (pending.command.writerRecoveryPending !== true
+      && pending.command.writerRecoveryDeliveryUncertain !== true)) return;
     const attempt = this.writerRecoveryAttempts.get(remoteThreadId) ?? 0;
     this.writerRecoveryAttempts.set(remoteThreadId, attempt + 1);
     const timer = setTimeout(() => {
@@ -7447,24 +7625,37 @@ export class AndroidRemoteGatewayController {
         if (!knownIdle && await this.threadHasActiveTurn(remoteThreadId)) return;
         const queued = this.queuedTurns.get(remoteThreadId) ?? [];
         const queuedTurn = queued[0];
-        if (!queuedTurn) return;
+        if (!queuedTurn || queuedTurn.command.pausedAfterUserStop === true) return;
         attemptedMessageId = queuedTurn.messageId;
-        if (queuedTurn.command.writerRecoveryPending === true) {
-          if (queuedTurn.command.writerRecoveryDeliveryUncertain === true) {
-            const descriptor = durableMutationDescriptor(queuedTurn.command);
-            const mutation = descriptor && this.mutationStore.get(descriptor.mutationId);
-            // A lost acknowledgement or process restart must only read for
-            // proof of delivery, never replay the queued prompt blindly.
-            if (!mutation || !await this.reconcileDurableMutation({ ...mutation, owner: "desktop" })) return;
-            this.replaceQueuedTurns(remoteThreadId, (this.queuedTurns.get(remoteThreadId) ?? [])
-              .filter(turn => turn.messageId !== queuedTurn.messageId));
-            this.publishQueuedTurnState(remoteThreadId);
-            reconciledDelivery = true;
-            return;
-          }
-          queuedTurn.command.writerRecoveryDeliveryUncertain = true;
-          this.persistQueuedTurns();
+        if (queuedTurn.command.writerRecoveryDeliveryUncertain === true) {
+          const descriptor = durableMutationDescriptor(queuedTurn.command);
+          const mutation: AndroidRemoteMutation = (descriptor && this.mutationStore.get(descriptor.mutationId)) || {
+            mutationId: `queue:${queuedTurn.messageId}`,
+            commandId: descriptor?.commandId ?? queuedTurn.messageId,
+            taskId: remoteThreadId,
+            messageId: queuedTurn.messageId,
+            kind: "turn-start",
+            payloadFingerprint: "queue-delivery",
+            status: "uncertain",
+            createdAt: queuedTurn.createdAt,
+            updatedAt: queuedTurn.updatedAt,
+          };
+          // Legacy commands and aged-out journals still have the exact message
+          // identity in the durable queue; they need no payload-based fallback.
+          // Queue acceptance is not upstream delivery evidence. After a lost
+          // acknowledgement or restart, require the exact message in history.
+          if (!await this.reconcileDurableMutation({ ...mutation, owner: "desktop" })) return;
+          this.replaceQueuedTurns(remoteThreadId, (this.queuedTurns.get(remoteThreadId) ?? [])
+            .filter(turn => turn.messageId !== queuedTurn.messageId));
+          this.publishQueuedTurnState(remoteThreadId);
+          reconciledDelivery = true;
+          return;
         }
+        // Persist before *every* send, including ordinary queued turns. A crash
+        // after owner acceptance but before queue removal must never replay it.
+        this.replaceQueuedTurns(remoteThreadId, queued.map(turn => turn === queuedTurn
+          ? { ...turn, command: { ...turn.command, writerRecoveryDeliveryUncertain: true } }
+          : turn));
         // Keep the durable queue row until the owner confirms the turn start.
         // Removing it first creates a crash window where an accepted prompt is
         // present in neither the queue nor the transcript.
@@ -7483,9 +7674,10 @@ export class AndroidRemoteGatewayController {
         if (error instanceof WriterOwnershipUnavailableError) {
           const queuedTurn = this.queuedTurns.get(remoteThreadId)?.find(turn => turn.messageId === attemptedMessageId);
           if (queuedTurn) {
-            queuedTurn.command.writerRecoveryPending = true;
-            delete queuedTurn.command.writerRecoveryDeliveryUncertain;
-            this.persistQueuedTurns();
+            const command: JsonRecord = { ...queuedTurn.command, writerRecoveryPending: true };
+            delete command.writerRecoveryDeliveryUncertain;
+            this.replaceQueuedTurns(remoteThreadId, (this.queuedTurns.get(remoteThreadId) ?? [])
+              .map(turn => turn === queuedTurn ? { ...turn, command } : turn));
           }
         }
         // The queue entry remains durable and visible. A later terminal event,
@@ -7850,6 +8042,10 @@ export class AndroidRemoteGatewayController {
           },
         });
         this.rememberKnownActiveTurn(nativeThreadId, confirmedSteerTurnId(started));
+        const turn = record(record(started)?.turn);
+        if (stringValue(turn?.id, 128)) this.desktopIpc.observeCodexMessage({
+          method: "turn/started", params: { threadId: nativeThreadId, turn },
+        });
         rememberStartedTurn();
         routeDiagnostics("acknowledged", { route: "desktop" });
         return true;
@@ -7922,11 +8118,15 @@ export class AndroidRemoteGatewayController {
         this.markDurableMutationOwner(command, "private", nativeThreadId);
         const started = await this.requireCodex().request("turn/start", turnStartParams);
         this.rememberKnownActiveTurn(nativeThreadId, confirmedSteerTurnId(started));
+        const turn = record(record(started)?.turn);
+        if (stringValue(turn?.id, 128)) this.desktopIpc.observeCodexMessage({
+          method: "turn/started", params: { threadId: nativeThreadId, turn },
+        });
       } catch (error) {
-        // A rejected start never becomes an authoritative live owner.
-        // Releasing here also cancels the blocked initial-history path and
-        // prevents stale private ownership from surviving a failed start.
-        this.desktopIpc.releaseThread(nativeThreadId);
+        // A failed turn does not unload the native thread. Only a conflicting
+        // native writer invalidates this owner; unknown delivery stays pending.
+        if (codexHasActiveWriter(error)) this.desktopIpc.releaseThread(nativeThreadId);
+        else this.desktopIpc.rejectTurnStart?.(nativeThreadId, mutationFailureDefinitelyNotDelivered(error));
         routeDiagnostics("failed", {
           route: "private",
           failure: codexHasActiveWriter(error) ? "active-writer" : "owner-error",
@@ -8093,17 +8293,43 @@ export class AndroidRemoteGatewayController {
           throw new Error("The neutral Chats workspace could not be prepared");
         }
       }
-      const started = record(await this.requireCodex().request("thread/start", {
+      const started = draft.nativeStart ?? record(await this.requireCodex().request("thread/start", {
         cwd: draft.cwd,
         model: selection.model,
+        serviceTier,
         approvalPolicy: config.approvalPolicy,
         approvalsReviewer: config.approvalsReviewer,
         sandbox: config.sandbox,
+        ephemeral: false,
+        threadSource: "user",
       }));
       const nativeThread = record(started?.thread);
       nativeThreadId = stringValue(nativeThread?.id, 128);
       if (!nativeThreadId) throw new Error("Codex did not create the task");
-      turnStartParams = makeTurnStartParams(nativeThreadId);
+      draft.nativeStart = started!;
+      const resolvedModel = stringValue(started?.model, 256) || selection.model;
+      const resolvedCwd = stringValue(started?.cwd, 4096) || stringValue(nativeThread?.cwd, 4096) || draft.cwd;
+      selection.model = this.normalizedTaskModelSelection({ ...selection, model: resolvedModel }).model;
+      collaborationMode.settings.model = selection.model;
+      turnStartParams = {
+        ...makeTurnStartParams(nativeThreadId),
+        cwd: resolvedCwd,
+        ...(started?.approvalPolicy != null ? { approvalPolicy: started.approvalPolicy } : {}),
+        ...(started?.approvalsReviewer != null ? { approvalsReviewer: started.approvalsReviewer } : {}),
+        ...(record(started?.sandbox) ? { sandboxPolicy: started!.sandbox } : {}),
+        ...(Array.isArray(started?.runtimeWorkspaceRoots) ? { runtimeWorkspaceRoots: started.runtimeWorkspaceRoots } : {}),
+      };
+      const profile = record(started?.activePermissionProfile);
+      if (typeof profile?.id === "string") {
+        turnStartParams.permissions = profile.id;
+        delete turnStartParams.sandboxPolicy;
+      }
+      // Preserve explicit per-turn effort overrides; otherwise adopt the native default.
+      if (effort == null && typeof started?.reasoningEffort === "string") {
+        turnStartParams.effort = started.reasoningEffort;
+        collaborationMode.settings.reasoning_effort = started.reasoningEffort;
+        selection.options = modelOptionsWithValue(selection.options, "reasoningEffort", started.reasoningEffort);
+      }
       const createdAt = draft.createdAt;
       const alias: AndroidRemoteThreadAlias = {
         remoteThreadId,
@@ -8111,9 +8337,12 @@ export class AndroidRemoteGatewayController {
         projectId: draft.projectId,
         ...(draft.workspaceKind ? { workspaceKind: draft.workspaceKind } : {}),
         title: stringValue(command.titleSeed, 256) || draft.title,
-        cwd: draft.cwd,
+        cwd: resolvedCwd,
         instanceId: selection.instanceId,
         model: selection.model,
+        nativeModelProvider: stringValue(started?.modelProvider ?? nativeThread?.modelProvider, 128) || undefined,
+        nativeServiceTier: typeof started?.serviceTier === "string" ? started.serviceTier : null,
+        nativeReasoningEffort: typeof started?.reasoningEffort === "string" ? started.reasoningEffort : null,
         runtimeMode,
         interactionMode,
         createdAt,
@@ -8190,9 +8419,24 @@ export class AndroidRemoteGatewayController {
     return currentTurns.length - targetIndex;
   }
 
+  private pauseQueuedTurnsAfterStop(remoteThreadId: string): void {
+    const queued = this.queuedTurns.get(remoteThreadId);
+    if (!queued?.length) return;
+    const paused = queued.map(turn => ({ ...turn, command: { ...turn.command, pausedAfterUserStop: true } }));
+    try { this.replaceQueuedTurns(remoteThreadId, paused); }
+    catch {
+      // Disk failure must not prevent the native interrupt or allow in-process
+      // dispatch after it. Retain the prompts; never discard them on Stop.
+      this.queuedTurns.set(remoteThreadId, paused);
+      console.warn("Could not persist the paused follow-up queue; retained it in memory");
+    }
+    this.publishQueuedTurnState(remoteThreadId);
+  }
+
   private async interruptTurn(command: JsonRecord): Promise<void> {
     const remoteThreadId = stringValue(command.threadId, 128);
     if (!remoteThreadId) throw new TypeError("task id is required");
+    this.pauseQueuedTurnsAfterStop(remoteThreadId);
     const nativeThreadId = this.nativeThreadId(remoteThreadId);
     const requestFollowerAction = this.desktopIpc.requestFollowerAction;
     const ownership = fallbackOwnershipState(this.desktopIpc, nativeThreadId);
@@ -8226,7 +8470,24 @@ export class AndroidRemoteGatewayController {
           mode: "user-stop",
         }));
         const result = record(response?.result) ?? response;
-        const interruptedTurnId = nativeExpectedTurnId(result?.interruptedTurnId);
+        let interruptedTurnId = nativeExpectedTurnId(result?.interruptedTurnId);
+        let terminalStatus = "interrupted";
+        if (!interruptedTurnId && result?.ok === true && result.interruptedTurnId === null
+          && !stringValue(result.goalPauseError, 2048)) {
+          // Desktop returns null when the turn already ended (including after
+          // a restart). Its successful user-stop plus an exact terminal row
+          // can reconcile a rollout whose final event was never written.
+          const state = await this.desktopIpc.readFollowerThreadState?.(nativeThreadId, { fresh: true }).catch(() => null);
+          const latest = canonicalTurnsNewestFirst(desktopConversationTurnRows(state))[0];
+          const latestId = canonicalTurnId(latest);
+          const status = normalizedTurnStatus(latest?.status ?? latest?.state);
+          if (latestId && (!stoppedSnapshotTurnId || latestId === stoppedSnapshotTurnId)
+            && desktopStateStatusIsTerminal(status)) {
+            interruptedTurnId = latestId;
+            terminalStatus = status === "completed" ? "completed"
+              : status === "failed" || status === "error" ? "failed" : "interrupted";
+          }
+        }
         if (!interruptedTurnId) {
           throw new Error("Codex Desktop did not confirm an active turn was stopped. Refresh the task and try Stop again.");
         }
@@ -8234,7 +8495,7 @@ export class AndroidRemoteGatewayController {
         // turn id. The lifecycle reducer protects any newer observed turn.
         this.applyLiveCodexNotification({ method: "turn/completed", params: {
           threadId: nativeThreadId,
-          turn: { id: interruptedTurnId, status: "interrupted" },
+          turn: { id: interruptedTurnId, status: terminalStatus },
           stoppedSnapshotTurnId,
         } }, true, "desktop-stop");
         this.forgetKnownActiveTurn(nativeThreadId, interruptedTurnId);
@@ -8261,7 +8522,7 @@ export class AndroidRemoteGatewayController {
     // The owning app-server validates this id when processing turn/interrupt.
     const cachedThread = record(this.threadStreams.get(remoteThreadId)?.detail.thread);
     const watchedTurnId = this.desktopSessions.isWatching(remoteThreadId)
-      ? this.desktopSessions.activeTurnId?.(remoteThreadId)
+      ? this.activeDesktopSessionTurnId(remoteThreadId)
       : undefined;
     let turnId = watchedTurnId ?? (
       nativeExpectedTurnId(record(cachedThread?.session)?.activeTurnId)
@@ -8280,7 +8541,30 @@ export class AndroidRemoteGatewayController {
       turnId = stringValue(active?.id, 128);
     }
     if (!turnId) throw new Error("This task has no running turn to stop");
-    await this.requireCodex().request("turn/interrupt", { threadId: nativeThreadId, turnId });
+    let terminalStatus = "interrupted";
+    try {
+      await this.requireCodex().request("turn/interrupt", { threadId: nativeThreadId, turnId });
+    } catch (error) {
+      // A previous Stop may have succeeded while its response was lost. Only
+      // the owning runtime's exact terminal row can settle that retry.
+      if (!(error instanceof Error) || !/^no active turn to interrupt$/iu.test(error.message.trim())) throw error;
+      const result = record(await this.requireCodex().request("thread/read", { threadId: nativeThreadId, includeTurns: true }));
+      const latest = canonicalTurnsNewestFirst(record(result?.thread)?.turns)[0];
+      const status = normalizedTurnStatus(latest?.status ?? latest?.state);
+      if (canonicalTurnId(latest) !== turnId || !desktopStateStatusIsTerminal(status)) throw error;
+      terminalStatus = status === "completed" ? "completed"
+        : status === "failed" || status === "error" ? "failed" : "interrupted";
+    }
+    terminalStatus = await confirmNativeTurnStopped({ threadId: nativeThreadId, turnId,
+      read: () => readNativeStopState(nativeThreadId, (method, params) => this.requireCodex().request(method, params, 2_000)),
+    });
+    const stopped: CodexJsonRpcMessage = { method: "turn/completed", params: {
+      threadId: nativeThreadId, turn: { id: turnId, status: terminalStatus },
+    } };
+    this.desktopIpc.observeCodexMessage(stopped);
+    this.applyLiveCodexNotification(stopped, true, "desktop-stop");
+    this.requestAuthoritativeThreadRefresh(remoteThreadId);
+    await pauseNativeGoal(nativeThreadId, (method, params) => this.requireCodex().request(method, params, 2_000));
   }
 
   private requestAuthoritativeThreadRefresh(remoteThreadId: string): void {
@@ -9739,7 +10023,7 @@ export class AndroidRemoteGatewayController {
     const remoteThreadId = this.remoteThreadId(nativeThreadId);
     const eventItem = record(params.item);
     const eventTurnId = stringValue(params.turnId, 128) || stringValue(record(params.turn)?.id, 128);
-    if (method === "item/started" && eventItem?.type === "contextCompaction"
+    if ((method === "turn/started" || method === "item/started" && eventItem?.type === "contextCompaction")
       && eventTurnId && this.completedDesktopTurns.get(remoteThreadId) === eventTurnId) return true;
     if (method === "item/started" && eventItem?.type === "contextCompaction"
       && eventTurnId && stringValue(eventItem.id, 128)) {
@@ -10398,7 +10682,7 @@ export class AndroidRemoteGatewayController {
       source === "desktop-session"
       && turnId
       && (method === "item/started" || method === "item/completed" || method === "item/agentMessage/delta")
-      && this.desktopSessions.activeTurnId?.(remoteThreadId) === turnId
+      && this.activeDesktopSessionTurnId(remoteThreadId) === turnId
       && !turnStatusIsActive(record(nextThread.session)?.status)
     ) {
       // A stale secondary-reader snapshot must not strand the phone on Pause
@@ -10453,7 +10737,8 @@ export class AndroidRemoteGatewayController {
     if (method === "turn/started" || method === "turn/completed" || method === "thread/status/changed") {
       this.requestAuthoritativeThreadRefresh(remoteThreadId);
       if (method === "turn/completed") {
-        void this.startNextQueuedTurnAfterCompletion(remoteThreadId, turnId);
+        if (normalizedTurnStatus(record(params.turn)?.status) === "interrupted") this.pauseQueuedTurnsAfterStop(remoteThreadId);
+        else void this.startNextQueuedTurnAfterCompletion(remoteThreadId, turnId);
       }
     }
     return true;

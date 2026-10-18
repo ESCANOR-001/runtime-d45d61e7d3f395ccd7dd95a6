@@ -5,7 +5,8 @@ import { assertNotRealHomeUnderTest } from "../lib/test-home-guard";
 import { hardenSecretDir } from "../lib/windows-secret-acl";
 
 const STATE_VERSION = 1;
-const STATE_MAX_BYTES = 512 * 1024;
+// Accommodates previously written ledgers; writes enforce the same bound.
+const STATE_MAX_BYTES = 2 * 1024 * 1024;
 const MAX_THREAD_IDS = 4_096;
 const SAFE_THREAD_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/u;
 
@@ -53,10 +54,12 @@ export function createAndroidDesktopOwnershipStore(
 
   const read = (): DesktopOwnershipState => {
     if (!path) return structuredClone(memoryState);
+    if (existsSync(path) && statSync(path).size > STATE_MAX_BYTES) {
+      throw new RangeError("Android Remote desktop ownership state exceeds its storage limit");
+    }
     try {
       if (!existsSync(path)) return parsedState(null);
       hardenExistingSecret(path);
-      if (statSync(path).size > STATE_MAX_BYTES) return parsedState(null);
       return parsedState(JSON.parse(readFileSync(path, "utf8")));
     } catch {
       return parsedState(null);
@@ -70,7 +73,11 @@ export function createAndroidDesktopOwnershipStore(
       return;
     }
     ensureStateDirectory(root);
-    atomicWriteFile(path, `${JSON.stringify(next, null, 2)}\n`);
+    const serialized = `${JSON.stringify(next, null, 2)}\n`;
+    if (Buffer.byteLength(serialized, "utf8") > STATE_MAX_BYTES) {
+      throw new RangeError("Android Remote desktop ownership state exceeds its storage limit");
+    }
+    atomicWriteFile(path, serialized);
     try { chmodSync(path, 0o600); } catch { /* platform may ignore chmod */ }
     hardenExistingSecret(path);
   };

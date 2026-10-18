@@ -127,7 +127,7 @@ function compareBlocks(left: TimelineBlock, right: TimelineBlock): number {
 }
 
 function isThreadStatusActivity(value: JsonRecord): boolean {
-  return value.kind === "context-window.updated" || value.kind === "provider.usage.updated";
+  return value.kind === "context-window.updated" || value.kind === "provider.usage.updated" || value.kind === "claude.desktop-sync.updated";
 }
 
 function currentStatusActivities(thread: JsonRecord): JsonRecord[] {

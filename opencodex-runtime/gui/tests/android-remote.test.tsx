@@ -324,6 +324,8 @@ test("keeps connection methods visible with only its three nested disclosures co
     "Advanced manual setup",
   ]);
   expect(sections[2]?.getAttribute("aria-labelledby")).toBe("android-remote-clients-heading");
+  expect(container.querySelector('a[href="#agents"]')?.textContent).toBe("Agent setup & settings");
+  expect(container.querySelector("#managed-claude-heading")).toBeNull();
   expect(container.querySelector(".android-remote-connect-card")).toBeNull();
   expect(container.querySelector(".android-remote-advanced-links")).toBeNull();
   expect(container.querySelector('a[href="#android-remote/account"]')).toBeNull();
@@ -1011,4 +1013,72 @@ test("a failed selection save restores the saved option and shows an error", asy
   expect(container.querySelector<HTMLInputElement>('input[value="local"]')?.checked).toBe(true);
   expect(connectionChoice).toBeUndefined();
   expect(container.textContent).toContain("The Android Remote change could not be saved. Try again.");
+});
+
+test("Claude Desktop sync changes only the Claude settings endpoint", async () => {
+  const { ManagedClaudeCodeCard } = await import("../src/pages/ManagedClaudeCodeCard");
+  const { createRoot } = await import("react-dom/client");
+  let desktopSync = false;
+  const writes: unknown[] = [];
+  Object.defineProperty(globalThis, "fetch", { configurable: true, value: async (url: string, init?: RequestInit) => {
+    expect(url.split("?")[0]).toBe("/api/android-remote/claude-code");
+    if (init?.method === "PUT") { const body = JSON.parse(String(init.body)); writes.push(body); desktopSync = body.desktopSync; }
+    return new Response(JSON.stringify({ enabled: true, installed: true, ready: true, binary: "", account: {}, desktopSync, connectedSessions: 0, activeSessions: 0 }));
+  } });
+  await act(async () => { root = createRoot(container); root.render(<LanguageProvider><ManagedClaudeCodeCard apiBase="" /></LanguageProvider>); });
+  await act(async () => { await new Promise(resolve => testWindow.setTimeout(resolve, 30)); });
+  const toggle = container.querySelector('[aria-label="Sync with Claude Desktop (preview)"]') as HTMLElement;
+  expect(toggle).toBeTruthy();
+  await act(async () => toggle.click());
+  expect(writes).toEqual([{ desktopSync: true }]);
+  expect(container.textContent).toContain("four tasks can run at once");
+  expect(container.textContent).toContain("Idle sessions pause automatically");
+});
+
+test("Claude automatic connection saves only its preference and reports the override caveat", async () => {
+  const { ManagedClaudeCodeCard } = await import("../src/pages/ManagedClaudeCodeCard");
+  const { createRoot } = await import("react-dom/client");
+  let preference: boolean | null = null;
+  const writes: unknown[] = [];
+  Object.defineProperty(globalThis, "fetch", { configurable: true, value: async (url: string, init?: RequestInit) => {
+    expect(url.split("?")[0]).toBe("/api/android-remote/claude-code");
+    if (init?.method === "PUT") { const body = JSON.parse(String(init.body)); writes.push(body); preference = body.autoConnectNewSessions; }
+    return new Response(JSON.stringify({ enabled: true, ready: true, binary: "", account: {}, desktopSync: true, autoConnect: { preference, blockedByUserSettings: false, desktopPreference: "default", error: null } }));
+  } });
+  await act(async () => { root = createRoot(container); root.render(<LanguageProvider><ManagedClaudeCodeCard apiBase="" /></LanguageProvider>); });
+  await act(async () => { await new Promise(resolve => testWindow.setTimeout(resolve, 30)); });
+  expect(writes).toEqual([]);
+  expect(container.textContent).toContain("No user preference saved");
+  const toggle = container.querySelector('[aria-label="Automatically connect new Claude Code chats"]') as HTMLElement;
+  await act(async () => toggle.click());
+  expect(writes).toEqual([{ autoConnectNewSessions: true }]);
+  expect(container.textContent).toContain("Automatic connection preference is on");
+  expect(container.textContent).toContain("Desktop or organization settings may override");
+});
+
+test("Claude Desktop off shows one-time setup even with Remodex enabled and refresh removes the warning", async () => {
+  const { ManagedClaudeCodeCard } = await import("../src/pages/ManagedClaudeCodeCard");
+  const { createRoot } = await import("react-dom/client");
+  let desktopPreference: string | undefined = "off";
+  const writes: unknown[] = [];
+  Object.defineProperty(globalThis, "fetch", { configurable: true, value: async (_url: string, init?: RequestInit) => {
+    if (init?.method === "PUT") writes.push(JSON.parse(String(init.body)));
+    return new Response(JSON.stringify({ enabled: true, ready: true, binary: "", account: {}, desktopSync: true, autoConnect: { preference: true, desktopPreference, blockedByUserSettings: false, error: null } }));
+  } });
+  await act(async () => { root = createRoot(container); root.render(<LanguageProvider><ManagedClaudeCodeCard apiBase="" /></LanguageProvider>); });
+  await act(async () => { await new Promise(resolve => testWindow.setTimeout(resolve, 30)); });
+  expect(container.querySelector('[role="status"]')?.textContent).toContain("One-time Desktop setup needed");
+  expect(container.textContent).toContain("Connect new sessions to Remote Control");
+  expect(container.textContent).not.toContain("Automatic connection preference is on");
+  expect(container.textContent).not.toContain("Claude Code is ready");
+  expect(writes).toEqual([]);
+  const refresh = Array.from(container.querySelectorAll("button")).find(b => b.textContent === "Check again")!;
+  desktopPreference = "on";
+  await act(async () => refresh.click());
+  expect(container.querySelector('[role="status"]')).toBeNull();
+  expect(container.textContent).toContain("Claude Desktop is set to connect new chats automatically");
+  desktopPreference = undefined;
+  await act(async () => refresh.click());
+  expect(container.textContent).toContain("could not be verified");
+  expect(writes).toEqual([]);
 });

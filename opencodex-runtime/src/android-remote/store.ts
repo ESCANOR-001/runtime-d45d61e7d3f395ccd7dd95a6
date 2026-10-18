@@ -9,7 +9,8 @@ import { assertNotRealHomeUnderTest } from "../lib/test-home-guard";
 import { hardenSecretDir } from "../lib/windows-secret-acl";
 
 const ANDROID_REMOTE_STATE_VERSION = 1;
-const ANDROID_REMOTE_STATE_MAX_BYTES = 1024 * 1024;
+// Accommodates previously written ledgers; writes enforce the same bound.
+const ANDROID_REMOTE_STATE_MAX_BYTES = 16 * 1024 * 1024;
 const CLIENT_ID_PATTERN = /^[a-zA-Z0-9._-]{1,128}$/;
 const STORED_MODEL_OPTION_IDS = new Set([
   "effort",
@@ -65,6 +66,9 @@ export type AndroidRemoteThreadAlias = {
   cwd: string;
   instanceId?: string;
   model: string;
+  nativeModelProvider?: string;
+  nativeServiceTier?: string | null;
+  nativeReasoningEffort?: string | null;
   runtimeMode: "approval-required" | "auto-accept-edits" | "full-access";
   interactionMode: "default" | "plan";
   createdAt: string;
@@ -217,6 +221,9 @@ function storedThreadAlias(value: unknown): AndroidRemoteThreadAlias | null {
     cwd,
     ...(instanceId ? { instanceId } : {}),
     model,
+    ...(typeof row.nativeModelProvider === "string" ? { nativeModelProvider: row.nativeModelProvider.slice(0, 128) } : {}),
+    ...(row.nativeServiceTier === null || typeof row.nativeServiceTier === "string" ? { nativeServiceTier: row.nativeServiceTier === null ? null : row.nativeServiceTier.slice(0, 64) } : {}),
+    ...(row.nativeReasoningEffort === null || typeof row.nativeReasoningEffort === "string" ? { nativeReasoningEffort: row.nativeReasoningEffort === null ? null : row.nativeReasoningEffort.slice(0, 64) } : {}),
     runtimeMode,
     interactionMode,
     createdAt,
@@ -350,10 +357,12 @@ export function createAndroidRemoteStore(root = getConfigDir()): AndroidRemoteSt
   const path = androidRemoteStatePath(root);
 
   const read = (): AndroidRemoteState => {
+    if (existsSync(path) && statSync(path).size > ANDROID_REMOTE_STATE_MAX_BYTES) {
+      throw new RangeError("Android Remote state exceeds its storage limit");
+    }
     try {
       if (!existsSync(path)) return defaultState();
       hardenExistingSecret(path);
-      if (statSync(path).size > ANDROID_REMOTE_STATE_MAX_BYTES) return defaultState();
       return parseState(JSON.parse(readFileSync(path, "utf8")));
     } catch {
       // Fail closed. Invalid local state never enables remote control or admits a client.
@@ -363,7 +372,11 @@ export function createAndroidRemoteStore(root = getConfigDir()): AndroidRemoteSt
 
   const write = (state: AndroidRemoteState): AndroidRemoteState => {
     ensureStateDirectory(root);
-    atomicWriteFile(path, `${JSON.stringify(state, null, 2)}\n`);
+    const serialized = `${JSON.stringify(state, null, 2)}\n`;
+    if (Buffer.byteLength(serialized, "utf8") > ANDROID_REMOTE_STATE_MAX_BYTES) {
+      throw new RangeError("Android Remote state exceeds its storage limit");
+    }
+    atomicWriteFile(path, serialized);
     return state;
   };
 

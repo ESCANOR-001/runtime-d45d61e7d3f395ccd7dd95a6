@@ -47,7 +47,8 @@ test("Android Remote leads the connection-focused sidebar", async () => {
   const nav = app.slice(app.indexOf("const NAV"), app.indexOf("];", app.indexOf("const NAV")));
   const order = [...nav.matchAll(/id: "([a-z-]+)"/g)].map((m) => m[1]);
   expect(order[0]).toBe("android-remote");
-  expect(order[1]).toBe("logs");
+  expect(order[1]).toBe("agents");
+  expect(order[2]).toBe("logs");
   expect(order).not.toContain("dashboard");
   expect(order).not.toContain("codex-auth");
   // Order only — no divider markup was introduced (Q3).

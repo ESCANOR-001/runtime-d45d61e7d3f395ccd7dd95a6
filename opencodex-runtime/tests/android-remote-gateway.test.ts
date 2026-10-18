@@ -1,3 +1,5 @@
+import { ClaudeAutoConnect } from "../src/claude-code/auto-connect";
+import { ManagedClaudeCode } from "../src/claude-code/managed";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { Buffer } from "node:buffer";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -45,7 +47,7 @@ import type {
 import { createAndroidRemoteStore } from "../src/android-remote/store";
 import type { ReasoningControl } from "../src/types";
 import { AndroidRemoteSessionCommandRecovery } from "../src/android-remote/session-command-recovery";
-import { createAndroidRemoteQueuedTurnStore } from "../src/android-remote/queued-turn-store";
+import { createAndroidRemoteQueuedTurnStore, type PersistedAndroidQueuedTurn } from "../src/android-remote/queued-turn-store";
 import { createAndroidRemoteMutationStore } from "../src/android-remote/mutation-store";
 import { listManagementModelRows } from "../src/server/management/model-rows";
 import { DesktopSessionRecordProjector } from "../src/android-remote/desktop-session-stream";
@@ -1001,6 +1003,43 @@ describe("Android Remote pairing addresses", () => {
 });
 
 describe("Android Remote credentials", () => {
+  test("does not issue a loopback QR while remote access is starting or unverified", async () => {
+    const store = memoryStore();
+    store.updateSettings({ controlEnabled: true, localNetworkEnabled: false });
+    const tunnel = new ReadyCloudflareTunnel(null, "quick", "starting");
+    const controller = new AndroidRemoteGatewayController(store, {
+      port: 0, networkInterfaces: () => ({}),
+      runtime: { start: async () => new FakeCodexClient(), stop: async () => {} },
+      desktopIpcSync: new FakeDesktopIpcSync(), cloudflareTunnel: tunnel,
+    });
+    try {
+      await controller.applySettings(store.read().settings);
+      expect(() => controller.createPairingInvitation()).toThrow("No phone-reachable");
+      tunnel.publish("https://pending.trycloudflare.com", "checking");
+      expect(() => controller.createPairingInvitation()).toThrow("No phone-reachable");
+      tunnel.publish("https://ready.trycloudflare.com");
+      const invitation = controller.createPairingInvitation();
+      expect(invitation.payload.localUrls).toEqual([]);
+      expect(invitation.payload.directUrl).toBe("https://ready.trycloudflare.com");
+      expect(invitation.payload.pairingToken).toBeTruthy();
+    } finally { await controller.stop(); }
+  });
+
+  test("LAN without a usable interface does not enable pairing", async () => {
+    const store = memoryStore();
+    store.updateSettings({ controlEnabled: true, localNetworkEnabled: true });
+    const controller = new AndroidRemoteGatewayController(store, {
+      port: 0, networkInterfaces: () => ({}),
+      runtime: { start: async () => new FakeCodexClient(), stop: async () => {} },
+      desktopIpcSync: new FakeDesktopIpcSync(),
+      cloudflareTunnel: new ReadyCloudflareTunnel(null, "quick", "starting"),
+    });
+    try {
+      await controller.applySettings(store.read().settings);
+      expect(() => controller.createPairingInvitation()).toThrow("No phone-reachable");
+    } finally { await controller.stop(); }
+  });
+
   test("HTTP token exchange recovers a dropped response without granting another phone access", async () => {
     const store = memoryStore();
     store.updateSettings({ controlEnabled: true, localNetworkEnabled: true });
@@ -1372,6 +1411,12 @@ describe("Android Remote credentials", () => {
   });
 });
 
+// Transport/projection tests authorize a local test client without advertising a
+// phone-facing QR. Reachability is covered by the gateway invitation tests above.
+function createLoopbackTestInvitation(controller: AndroidRemoteGatewayController, desktopName: string) {
+  return controller.auth.createInvitation({ desktopName, localUrls: [`http://127.0.0.1:${controller.status().port}`] });
+}
+
 describe("Android Remote attachments", () => {
   test("stages valid images and files and rejects unsafe attachment shapes", () => {
     const root = mkdtempSync(join(tmpdir(), "ocx-android-files-"));
@@ -1507,7 +1552,7 @@ describe("Android Remote attachments", () => {
     try {
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Test PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Image preview phone", os: "android" },
@@ -1679,7 +1724,7 @@ describe("Android Remote attachments", () => {
     let socket: WebSocket | null = null;
     try {
       await controller.start();
-      const invitation = controller.createPairingInvitation("Test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Test PC");
       const exchanged = controller.auth.exchangePairingToken({ pairingToken: invitation.payload.pairingToken, metadata: { label: "Test phone", os: "android" } })!;
       const ticket = controller.auth.issueWebSocketTicket(exchanged.client.id);
       socket = new WebSocket(`ws://127.0.0.1:${controller.status().port}/ws?wsTicket=${encodeURIComponent(ticket.ticket)}`, "opencodex-json-v1");
@@ -1758,7 +1803,7 @@ describe("Android Remote attachments", () => {
     let socket: WebSocket | null = null;
     try {
       await controller.start();
-      const invitation = controller.createPairingInvitation("Test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Test PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Historical file phone", os: "android" },
@@ -3967,7 +4012,7 @@ describe("Android Remote Codex connection", () => {
       let restartedController: AndroidRemoteGatewayController | null = null;
       try {
         await controller.start();
-        const invitation = controller.createPairingInvitation("Projectless Chats test PC");
+        const invitation = createLoopbackTestInvitation(controller, "Projectless Chats test PC");
         const exchanged = controller.auth.exchangePairingToken({
           pairingToken: invitation.payload.pairingToken,
           metadata: { label: "Projectless Chats test phone", os: "android" },
@@ -4102,7 +4147,7 @@ describe("Android Remote Codex connection", () => {
     let socket: WebSocket | null = null;
     try {
       await controller.start();
-      const invitation = controller.createPairingInvitation("Add project test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Add project test PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Add project test phone", os: "android" },
@@ -4189,7 +4234,7 @@ describe("Android Remote Codex connection", () => {
     let socket: WebSocket | null = null;
     try {
       await controller.start();
-      const invitation = controller.createPairingInvitation("Empty project restart test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Empty project restart test PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Empty project restart test phone", os: "android" },
@@ -4241,7 +4286,7 @@ describe("Android Remote Codex connection", () => {
     let socket: WebSocket | null = null;
     try {
       await controller.start();
-      const invitation = controller.createPairingInvitation("Registration failure test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Registration failure test PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Registration failure test phone", os: "android" },
@@ -4324,7 +4369,7 @@ describe("Android Remote Codex connection", () => {
     let socket: WebSocket | null = null;
     try {
       await controller.start();
-      const invitation = controller.createPairingInvitation("Status test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Status test PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Status test phone", os: "android" },
@@ -4786,7 +4831,7 @@ describe("Android Remote Codex connection", () => {
     let phoneSocket: WebSocket | null = null;
     try {
       await controller.start();
-      const invitation = controller.createPairingInvitation("Recovery test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Recovery test PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Existing phone", os: "android" },
@@ -5567,7 +5612,7 @@ describe("Android Remote Codex connection", () => {
     try {
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Test PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Model catalog phone", os: "android" },
@@ -5929,7 +5974,7 @@ describe("Android Remote Codex connection", () => {
       await controller.start();
       await (controller as unknown as { serverConfig: () => Promise<unknown> }).serverConfig();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Reasoning contract PC");
+      const invitation = createLoopbackTestInvitation(controller, "Reasoning contract PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Reasoning contract phone", os: "android" },
@@ -6082,7 +6127,7 @@ describe("Android Remote Codex connection", () => {
       expect(runtimeStarts).toBe(1);
       expect(desktopIpc.starts).toBe(1);
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Test PC");
       const tokenBody = new URLSearchParams({
         grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
         subject_token_type: "urn:t3:params:oauth:token-type:environment-bootstrap",
@@ -6919,7 +6964,7 @@ describe("Android Remote Codex connection", () => {
         },
       });
 
-      const interruptedSnapshot = socketMessage(socket, 3_000, "interrupt acknowledgement");
+      const interruptedSnapshot = socketMessageMatching(socket, message => Boolean(snapshotSession(message)));
       expect((await dispatch({
         type: "thread.turn.interrupt",
         threadId: "remote-1",
@@ -6929,9 +6974,10 @@ describe("Android Remote Codex connection", () => {
         method: "turn/interrupt",
         params: { threadId: "native-1", turnId: "turn-restarted-1" },
       });
-      expect(snapshotSession(await interruptedSnapshot)).toMatchObject({ status: "idle", activeTurnId: null });
+      expect(snapshotSession(await interruptedSnapshot)).toMatchObject({ status: "interrupted", statusConfidence: "confirmed", activeTurnId: null });
 
-      const approvalSnapshotMessage = socketMessage(socket, 3_000, "approval request");
+      const approvalSnapshotMessage = socketMessageMatching(socket, message =>
+        snapshotActivities(message).some(activity => activity.kind === "approval.requested"));
       codex.emit({
         id: 701,
         method: "item/commandExecution/requestApproval",
@@ -7350,7 +7396,7 @@ describe("Android Remote Codex connection", () => {
     try {
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Private owner PC");
+      const invitation = createLoopbackTestInvitation(controller, "Private owner PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Private owner phone", os: "android" },
@@ -7442,7 +7488,7 @@ describe("Android Remote Codex connection", () => {
     try {
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Stale owner PC");
+      const invitation = createLoopbackTestInvitation(controller, "Stale owner PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Stale owner phone", os: "android" },
@@ -7539,7 +7585,7 @@ describe("Android Remote Codex connection", () => {
       let controller = makeController();
       try {
         await controller.start();
-        const invitation = controller.createPairingInvitation("Writer recovery PC");
+        const invitation = createLoopbackTestInvitation(controller, "Writer recovery PC");
         const exchanged = controller.auth.exchangePairingToken({ pairingToken: invitation.payload.pairingToken,
           metadata: { label: "Writer recovery phone", os: "android" } })!;
         const send = () => fetch(`http://127.0.0.1:${controller.status().port}/api/orchestration/dispatch`, {
@@ -7630,7 +7676,7 @@ describe("Android Remote Codex connection", () => {
     try {
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Desktop IPC loop PC");
+      const invitation = createLoopbackTestInvitation(controller, "Desktop IPC loop PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Desktop IPC loop phone", os: "android" },
@@ -7694,7 +7740,7 @@ describe("Android Remote Codex connection", () => {
     try {
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("External writer PC");
+      const invitation = createLoopbackTestInvitation(controller, "External writer PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "External writer phone", os: "android" },
@@ -7758,7 +7804,7 @@ describe("Android Remote Codex connection", () => {
     try {
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Ambiguous delivery PC");
+      const invitation = createLoopbackTestInvitation(controller, "Ambiguous delivery PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Ambiguous delivery phone", os: "android" },
@@ -7837,7 +7883,7 @@ describe("Android Remote Codex connection", () => {
         desktopIpcSync: firstDesktop,
       });
       await firstController.start();
-      const firstInvitation = firstController.createPairingInvitation("First controller");
+      const firstInvitation = createLoopbackTestInvitation(firstController, "First controller");
       const firstAuth = firstController.auth.exchangePairingToken({
         pairingToken: firstInvitation.payload.pairingToken,
         metadata: { label: "Restart phone", os: "android" },
@@ -7889,7 +7935,7 @@ describe("Android Remote Codex connection", () => {
       );
       await restartedController.start();
       const restartedInvitation =
-        restartedController.createPairingInvitation("Restarted controller");
+        createLoopbackTestInvitation(restartedController, "Restarted controller");
       const restartedAuth = restartedController.auth.exchangePairingToken({
         pairingToken: restartedInvitation.payload.pairingToken,
         metadata: { label: "Restart phone", os: "android" },
@@ -7946,7 +7992,7 @@ describe("Android Remote Codex connection", () => {
     try {
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Queue acknowledgement PC");
+      const invitation = createLoopbackTestInvitation(controller, "Queue acknowledgement PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Queue acknowledgement phone", os: "android" },
@@ -8022,7 +8068,7 @@ describe("Android Remote Codex connection", () => {
     try {
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Unhealthy route PC");
+      const invitation = createLoopbackTestInvitation(controller, "Unhealthy route PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Unhealthy route phone", os: "android" },
@@ -8111,7 +8157,7 @@ describe("Android Remote Codex connection", () => {
     try {
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Writer race PC");
+      const invitation = createLoopbackTestInvitation(controller, "Writer race PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Writer race phone", os: "android" },
@@ -8224,7 +8270,7 @@ describe("Android Remote Codex connection", () => {
     try {
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Fresh terminal PC");
+      const invitation = createLoopbackTestInvitation(controller, "Fresh terminal PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Fresh terminal phone", os: "android" },
@@ -8422,7 +8468,7 @@ describe("Android Remote Codex connection", () => {
     try {
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Stale projection PC");
+      const invitation = createLoopbackTestInvitation(controller, "Stale projection PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Stale projection phone", os: "android" },
@@ -8559,7 +8605,7 @@ describe("Android Remote Codex connection", () => {
     try {
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Latest terminal PC");
+      const invitation = createLoopbackTestInvitation(controller, "Latest terminal PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Latest terminal phone", os: "android" },
@@ -8656,7 +8702,7 @@ describe("Android Remote Codex connection", () => {
       // Simulate the private app-server read hanging behind Desktop's active
       // writer. The Desktop follower snapshot remains available and must win.
       codex.blockReads = true;
-      const invitation = controller.createPairingInvitation("Desktop steer test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Desktop steer test PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Desktop steer test phone", os: "android" },
@@ -8740,7 +8786,7 @@ describe("Android Remote Codex connection", () => {
     try {
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Late steer PC");
+      const invitation = createLoopbackTestInvitation(controller, "Late steer PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Late steer phone", os: "android" },
@@ -8917,7 +8963,7 @@ describe("Android Remote Codex connection", () => {
         return { turnId: "turn-1" };
       };
       const privateRequestsBeforeDispatch = codex.requests.length;
-      const invitation = controller.createPairingInvitation("Desktop steer race PC");
+      const invitation = createLoopbackTestInvitation(controller, "Desktop steer race PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Desktop steer race phone", os: "android" },
@@ -8977,7 +9023,7 @@ describe("Android Remote Codex connection", () => {
     try {
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Queue test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Queue test PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Queue test phone", os: "android" },
@@ -9745,7 +9791,7 @@ describe("Android Remote Codex connection", () => {
     try {
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Direct steer failure PC");
+      const invitation = createLoopbackTestInvitation(controller, "Direct steer failure PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Direct steer failure phone", os: "android" },
@@ -9853,7 +9899,7 @@ describe("Android Remote Codex connection", () => {
     try {
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Edit test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Edit test PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Edit test phone", os: "android" },
@@ -9961,7 +10007,7 @@ describe("Android Remote Codex connection", () => {
     try {
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Atomic edit PC");
+      const invitation = createLoopbackTestInvitation(controller, "Atomic edit PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Atomic edit phone", os: "android" },
@@ -10160,7 +10206,7 @@ describe("Android Remote Codex connection", () => {
     try {
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Restarted Desktop edit PC");
+      const invitation = createLoopbackTestInvitation(controller, "Restarted Desktop edit PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Restarted Desktop edit phone", os: "android" },
@@ -10250,7 +10296,7 @@ describe("Android Remote Codex connection", () => {
     try {
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Test PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Ownerless response phone", os: "android" },
@@ -10401,7 +10447,7 @@ describe("Android Remote Codex connection", () => {
     try {
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Test PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Desktop replay phone", os: "android" },
@@ -10791,7 +10837,7 @@ describe("Android Remote Codex connection", () => {
     let socket: WebSocket | null = null;
     try {
       await controller.start();
-      const invitation = controller.createPairingInvitation("Desktop activity PC");
+      const invitation = createLoopbackTestInvitation(controller, "Desktop activity PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Background activity phone", os: "android" },
@@ -10877,7 +10923,7 @@ describe("Android Remote Codex connection", () => {
     let threadSocket: WebSocket | null = null;
     try {
       await controller.start();
-      const invitation = controller.createPairingInvitation("Activity PC");
+      const invitation = createLoopbackTestInvitation(controller, "Activity PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Activity phone", os: "android" },
@@ -11095,7 +11141,7 @@ describe("Android Remote Codex connection", () => {
     try {
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Test PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Slow history phone", os: "android" },
@@ -11164,7 +11210,7 @@ describe("Android Remote Codex connection", () => {
     let socket: WebSocket | null = null;
     try {
       await controller.start();
-      const invitation = controller.createPairingInvitation("Test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Test PC");
       const paired = controller.auth.exchangePairingToken({ pairingToken: invitation.payload.pairingToken, metadata: { label: "Phone", os: "android" } })!;
       const ticket = controller.auth.issueWebSocketTicket(paired.client.id);
       socket = new WebSocket(`ws://127.0.0.1:${controller.status().port}/ws?wsTicket=${encodeURIComponent(ticket.ticket)}`, "opencodex-json-v1");
@@ -11235,7 +11281,7 @@ describe("Android Remote Codex connection", () => {
     let socket: WebSocket | null = null;
     try {
       await controller.start();
-      const invitation = controller.createPairingInvitation("Test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Test PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Refresh phone", os: "android" },
@@ -11319,7 +11365,7 @@ describe("Android Remote Codex connection", () => {
     let socket: WebSocket | null = null;
     try {
       await controller.start();
-      const invitation = controller.createPairingInvitation("Recency test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Recency test PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Recency phone", os: "android" },
@@ -11423,7 +11469,7 @@ describe("Android Remote Codex connection", () => {
     let socket: WebSocket | null = null;
     try {
       await controller.start();
-      const invitation = controller.createPairingInvitation("Recovery test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Recovery test PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Recovery phone", os: "android" },
@@ -11505,7 +11551,7 @@ describe("Android Remote Codex connection", () => {
     let socket: WebSocket | null = null;
     try {
       await controller.start();
-      const invitation = controller.createPairingInvitation("Ghost test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Ghost test PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Ghost test phone", os: "android" },
@@ -11579,7 +11625,7 @@ describe("Android Remote Codex connection", () => {
     let shellSocket: WebSocket | null = null;
     try {
       await controller.start();
-      const invitation = controller.createPairingInvitation("Watcher test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Watcher test PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Watcher phone", os: "android" },
@@ -11697,7 +11743,7 @@ describe("Android Remote Codex connection", () => {
     let socket: WebSocket | null = null;
     try {
       await controller.start();
-      const invitation = controller.createPairingInvitation("Sidebar test");
+      const invitation = createLoopbackTestInvitation(controller, "Sidebar test");
       (controller as unknown as { shellCache: unknown }).shellCache = {
         snapshotSequence: 0, threads: [], projects: [], updatedAt: new Date(fixedNow).toISOString(),
       };
@@ -11785,7 +11831,7 @@ describe("Android Remote Codex connection", () => {
     let socket: WebSocket | null = null;
     try {
       await controller.start();
-      const invitation = controller.createPairingInvitation("Retry test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Retry test PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Retry phone", os: "android" },
@@ -11894,7 +11940,7 @@ describe("Android Remote Codex connection", () => {
       });
       await controller.start();
       const base = `http://127.0.0.1:${controller.status().port}`;
-      const invitation = controller.createPairingInvitation("Restart test PC");
+      const invitation = createLoopbackTestInvitation(controller, "Restart test PC");
       const exchanged = controller.auth.exchangePairingToken({
         pairingToken: invitation.payload.pairingToken,
         metadata: { label: "Restart test phone", os: "android" },
@@ -12077,7 +12123,7 @@ describe("Android bounded first-open history", () => {
     let socket: WebSocket | null = null;
     try {
       await controller.start();
-      const invitation = controller.createPairingInvitation("Recent history PC");
+      const invitation = createLoopbackTestInvitation(controller, "Recent history PC");
       const paired = controller.auth.exchangePairingToken({ pairingToken: invitation.payload.pairingToken, metadata: { label: "History phone", os: "android" } })!;
       const ticket = controller.auth.issueWebSocketTicket(paired.client.id);
       socket = new WebSocket(`ws://127.0.0.1:${controller.status().port}/ws?wsTicket=${encodeURIComponent(ticket.ticket)}`, "opencodex-json-v1");
@@ -12168,7 +12214,7 @@ describe("Android bounded first-open history", () => {
     let socket: WebSocket | null = null;
     try {
       await controller.start();
-      const invitation = controller.createPairingInvitation("History test PC");
+      const invitation = createLoopbackTestInvitation(controller, "History test PC");
       const paired = controller.auth.exchangePairingToken({ pairingToken: invitation.payload.pairingToken, metadata: { label: "History phone", os: "android" } });
       const ticket = controller.auth.issueWebSocketTicket(paired!.client.id);
       socket = new WebSocket(`ws://127.0.0.1:${controller.status().port}/ws?wsTicket=${encodeURIComponent(ticket.ticket)}`, "opencodex-json-v1");
@@ -12283,7 +12329,7 @@ describe("Android bounded first-open history", () => {
     let socket: WebSocket | null = null;
     try {
       await controller.start();
-      const invitation = controller.createPairingInvitation("History test PC");
+      const invitation = createLoopbackTestInvitation(controller, "History test PC");
       const paired = controller.auth.exchangePairingToken({ pairingToken: invitation.payload.pairingToken, metadata: { label: "History phone", os: "android" } });
       const ticket = controller.auth.issueWebSocketTicket(paired!.client.id);
       socket = new WebSocket(`ws://127.0.0.1:${controller.status().port}/ws?wsTicket=${encodeURIComponent(ticket.ticket)}`, "opencodex-json-v1");
@@ -12401,4 +12447,436 @@ describe("runtime status authority", () => {
     emit("item/completed", "desktop-session");
     expect(internal.desktopInteractions.get("owned").compaction.active).toBe(false);
   });
+});
+
+
+describe("queued delivery persistence boundaries", () => {
+  const turn = (): PersistedAndroidQueuedTurn => ({
+    taskId: "queued-task", clientId: "phone", messageId: "queued-message",
+    command: { type: "thread.turn.start", commandId: "queued-command", threadId: "queued-task",
+      message: { messageId: "queued-message", role: "user", text: "Check this", attachments: [] } },
+    displayText: "Check this", stagedAttachments: { codexInputs: [], referencedFiles: [], stagedPaths: [] },
+    createdAt: "2026-10-11T00:00:00.000Z", updatedAt: "2026-10-11T00:00:00.000Z",
+  });
+  type QueueAccess = {
+    queuedTurns: Map<string, PersistedAndroidQueuedTurn[]>;
+    writerRecoveryAttempts: Map<string, number>;
+    replaceQueuedTurns(id: string, turns: PersistedAndroidQueuedTurn[]): void;
+    startNextQueuedTurn(id: string, knownIdle?: boolean): Promise<void>;
+    startTurnNormally(): Promise<void>;
+    steerTurn(): Promise<void>;
+    threadHasActiveTurn(): Promise<boolean>;
+    requestAuthoritativeThreadRefresh(): void;
+    requireCodex(): AndroidCodexClient;
+    publishQueuedTurnState(): void;
+    updateQueuedTurn(command: Record<string, unknown>): void;
+    steerQueuedTurn(command: Record<string, unknown>): Promise<void>;
+  };
+
+  test.each(["enqueue", "remove"])("failed %s persistence leaves memory and recovery state unchanged", operation => {
+    const queueStore = createAndroidRemoteQueuedTurnStore();
+    if (operation === "remove") queueStore.replace([turn()]);
+    const controller = new AndroidRemoteGatewayController(memoryStore(), {
+      queuedTurnStore: queueStore, desktopIpcSync: new FakeDesktopIpcSync(),
+    });
+    const access = controller as unknown as QueueAccess;
+    access.writerRecoveryAttempts.set("queued-task", 4);
+    const before = structuredClone([...access.queuedTurns]);
+    const persisted = queueStore.list();
+    queueStore.replace = () => { throw new Error("disk full"); };
+    expect(() => access.replaceQueuedTurns("queued-task", operation === "enqueue" ? [turn()] : []))
+      .toThrow("disk full");
+    expect([...access.queuedTurns]).toEqual(before);
+    expect(queueStore.list()).toEqual(persisted);
+    expect(access.writerRecoveryAttempts.get("queued-task")).toBe(4);
+  });
+
+  test.each(["timeout", "queue-removal-failure", "missing-journal", "steer-timeout"])("ordinary queue reconciles %s across restart without resending", async failure => {
+    const root = mkdtempSync(join(tmpdir(), "android-queue-boundary-"));
+    try {
+      const queueStore = createAndroidRemoteQueuedTurnStore(root);
+      queueStore.replace([turn()]);
+      const mutationStore = createAndroidRemoteMutationStore(root);
+      if (failure !== "missing-journal") mutationStore.put({ mutationId: "command:queued-command", commandId: "queued-command",
+        taskId: "queued-task", messageId: "queued-message", kind: "turn-start",
+        payloadFingerprint: "fingerprint", status: "accepted", owner: "queue" });
+      const codex = new FakeCodexClient();
+      codex.threads.push({ id: "queued-task", turns: [] });
+      let attempts = 0;
+      const make = (restarted = false): QueueAccess => {
+        const controller = new AndroidRemoteGatewayController(memoryStore(), {
+          queuedTurnStore: restarted ? createAndroidRemoteQueuedTurnStore(root) : queueStore,
+          mutationStore: createAndroidRemoteMutationStore(root), desktopIpcSync: new FakeDesktopIpcSync(),
+        });
+        const access = controller as unknown as QueueAccess;
+        access.requireCodex = () => codex;
+        access.publishQueuedTurnState = () => {};
+        access.threadHasActiveTurn = async () => true;
+        access.requestAuthoritativeThreadRefresh = () => {};
+        access.startTurnNormally = async () => {
+          attempts += 1;
+          expect(createAndroidRemoteQueuedTurnStore(root).list()[0]!.command.writerRecoveryDeliveryUncertain).toBe(true);
+          if (failure !== "queue-removal-failure") throw new Error("Codex Desktop IPC request timed out");
+          queueStore.replace = () => { throw new Error("disk full after acceptance"); };
+        };
+        access.steerTurn = access.startTurnNormally;
+        return access;
+      };
+      const first = make();
+      if (failure === "steer-timeout") {
+        await expect(first.steerQueuedTurn({ threadId: "queued-task", messageId: "queued-message" }))
+          .rejects.toThrow("timed out");
+      } else {
+        await first.startNextQueuedTurn("queued-task", true);
+      }
+      await first.startNextQueuedTurn("queued-task", true);
+      expect(attempts).toBe(1);
+      const restarted = make(true);
+      await restarted.startNextQueuedTurn("queued-task", true);
+      expect(attempts).toBe(1);
+      expect(restarted.queuedTurns.get("queued-task")).toHaveLength(1);
+      expect(() => restarted.updateQueuedTurn({ threadId: "queued-task", messageId: "queued-message", text: "Edited" }))
+        .toThrow("uncertain");
+      await expect(restarted.steerQueuedTurn({ threadId: "queued-task", messageId: "queued-message" })).rejects.toThrow("uncertain");
+      // Only exact upstream message evidence permits removing the uncertain row.
+      codex.threads[0]!.turns = [{ id: "delivered", status: "completed", items: [
+        { type: "userMessage", id: "native-message", clientId: "queued-message", content: [{ type: "text", text: "Check this" }] },
+      ] }];
+      await restarted.startNextQueuedTurn("queued-task", true);
+      expect(attempts).toBe(1);
+      expect(createAndroidRemoteQueuedTurnStore(root).list()).toHaveLength(0);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test("a failed pre-send write never delivers or changes the queued command", async () => {
+    const queueStore = createAndroidRemoteQueuedTurnStore();
+    queueStore.replace([turn()]);
+    const controller = new AndroidRemoteGatewayController(memoryStore(), {
+      queuedTurnStore: queueStore, desktopIpcSync: new FakeDesktopIpcSync(),
+    });
+    const access = controller as unknown as QueueAccess;
+    let deliveries = 0;
+    access.startTurnNormally = async () => { deliveries += 1; };
+    queueStore.replace = () => { throw new Error("disk full"); };
+    await access.startNextQueuedTurn("queued-task", true);
+    expect(deliveries).toBe(0);
+    expect(access.queuedTurns.get("queued-task")).toEqual([turn()]);
+  });
+});
+
+describe("Stop recovery", () => {
+  test.each(["interrupted", "completed"])("reconciles an already-ended Desktop turn and allows the next prompt: %s", async terminalStatus => {
+    const codex = new FakeCodexClient();
+    const desktop = new FakeDesktopIpcSync();
+    const id = "stopped-desktop-task";
+    const turnId = "old-open-rollout-turn";
+    const stale = { id, cwd: process.cwd(), status: { type: "notLoaded" },
+      turns: [{ id: turnId, status: "inProgress", startedAt: 1_700_000_000, items: [] }] };
+    codex.threads.push(stale);
+    desktop.markDesktopOwned(id);
+    desktop.followerAction = async method => method === "thread-follower-interrupt-turn"
+      ? { ok: true, interruptedTurnId: null }
+      : { result: { turn: { id: "next-turn" } } };
+    desktop.followerStateAction = async () => ({ id, androidRemoteHistoryOnly: true,
+      turns: [{ id: turnId, status: terminalStatus }] });
+    const controller = new AndroidRemoteGatewayController(memoryStore(), {
+      port: 0, hostname: "127.0.0.1", runtime: { start: async () => codex, stop: async () => {} },
+      desktopIpcSync: desktop, desktopSessionStream: {
+        watchThread: async () => true, isWatching: () => true, activeTurnId: () => turnId,
+        unwatchThread: () => {}, close: () => {},
+      },
+    });
+    const internal = controller as any;
+    try {
+      await controller.start();
+      internal.threadStreams.set(id, createProjectedThreadStreamState(projectCodexThreadDetail(stale, 1), Date.now()));
+      await internal.interruptTurn({ threadId: id });
+      const current = () => internal.threadStreams.get(id).detail.thread;
+      expect(current().latestTurn).toMatchObject({ turnId, state: terminalStatus });
+      expect(current().session.statusConfidence).toBe("confirmed");
+      expect(await internal.threadHasActiveTurn(id)).toBe(false);
+      expect(await internal.activeTurnId(id, true)).toBe("");
+      // Replaying the orphaned start or rereading old history cannot revive it.
+      internal.applyLiveCodexNotification({ method: "turn/started", params: { threadId: id,
+        turn: { id: turnId, status: "inProgress" } } }, true, "desktop-session");
+      expect(current().latestTurn.state).toBe(terminalStatus);
+      const refreshed = await internal.readFullThreadDetail(id);
+      expect(refreshed.thread.session.statusConfidence).toBe("confirmed");
+      expect(refreshed.thread.session.activeTurnId).toBeNull();
+      expect(refreshed.thread.latestTurn.state).toBe(terminalStatus);
+      await internal.dispatch("test-phone", { type: "thread.turn.start", commandId: "after-stop",
+        threadId: id, runtimeMode: "full-access", interactionMode: "default",
+        modelSelection: { instanceId: "openai", model: "gpt-5.6-sol" },
+        message: { messageId: "next-message", text: "Continue with the next step." } });
+      expect(desktop.followerActions.some(action => action.method === "thread-follower-start-turn")).toBe(true);
+      expect(codex.requests.some(request => request.method === "thread/resume")).toBe(false);
+      internal.applyLiveCodexNotification({ method: "turn/started", params: { threadId: id,
+        turn: { id: "new-live-turn", status: "inProgress" } } }, true, "desktop-session");
+      expect(current().session.activeTurnId).toBe("new-live-turn");
+    } finally { await controller.stop(); }
+  });
+
+  test.each(["unavailable", "active", "wrong-turn", "goal-error"])("does not fabricate a stopped turn when reconciliation is %s", async scenario => {
+    const desktop = new FakeDesktopIpcSync();
+    desktop.markDesktopOwned("unconfirmed-task");
+    desktop.followerAction = async () => ({ ok: true, interruptedTurnId: null,
+      ...(scenario === "goal-error" ? { goalPauseError: "Could not pause goal" } : {}) });
+    desktop.followerStateAction = async () => {
+      if (scenario === "unavailable") throw new Error("timeout");
+      return { turns: [{ id: scenario === "wrong-turn" ? "older-turn" : "current-turn",
+        status: scenario === "active" ? "inProgress" : "interrupted" }] };
+    };
+    const controller = new AndroidRemoteGatewayController(memoryStore(), { desktopIpcSync: desktop });
+    const internal = controller as any;
+    internal.threadStreams.set("unconfirmed-task", createProjectedThreadStreamState(projectCodexThreadDetail({
+      id: "unconfirmed-task", turns: [{ id: "current-turn", status: "inProgress", items: [] }],
+    }, 1), Date.now()));
+    try {
+      await expect(internal.interruptTurn({ threadId: "unconfirmed-task" })).rejects.toThrow("did not confirm");
+      expect(internal.threadStreams.get("unconfirmed-task").detail.thread.session.activeTurnId).toBe("current-turn");
+    } finally { await controller.stop(); }
+  });
+});
+
+test.each(["acknowledged", "already-stopped", "newer-turn", "timeout"])("local Stop recovery keeps the composer usable without guessing: %s", async scenario => {
+  const codex = new FakeCodexClient();
+  const desktop = new FakeDesktopIpcSync();
+  desktop.adoptLocalThread("local-stop");
+  const request = codex.request.bind(codex);
+  codex.request = async <T>(method: string, params: unknown = {}): Promise<T> => {
+    if (method === "turn/interrupt") {
+      if (scenario === "acknowledged") return {} as T;
+      throw new Error(scenario === "timeout" ? "timeout" : "no active turn to interrupt");
+    }
+    if (method === "thread/read") return { thread: { id: "local-stop", turns: [{
+      id: scenario === "newer-turn" ? "newer-turn" : "stopping-turn",
+      status: scenario === "newer-turn" ? "inProgress" : "interrupted", items: [],
+    }] } } as T;
+    return request<T>(method, params);
+  };
+  const controller = new AndroidRemoteGatewayController(memoryStore(), {
+    port: 0, hostname: "127.0.0.1", desktopIpcSync: desktop,
+    runtime: { start: async () => codex, stop: async () => {} },
+  });
+  const internal = controller as any;
+  try {
+    await controller.start();
+    internal.threadStreams.set("local-stop", createProjectedThreadStreamState(projectCodexThreadDetail({
+      id: "local-stop", turns: [{ id: "stopping-turn", status: "inProgress", items: [] }],
+    }, 1), Date.now()));
+    const stop = internal.interruptTurn({ threadId: "local-stop" });
+    if (scenario === "newer-turn" || scenario === "timeout") {
+      await expect(stop).rejects.toThrow();
+      expect(desktop.messages.some(message => message.method === "turn/completed")).toBe(false);
+    } else {
+      await stop;
+      expect(internal.threadStreams.get("local-stop").detail.thread.session).toMatchObject({
+        status: "interrupted", statusConfidence: "confirmed", activeTurnId: null,
+      });
+      expect(desktop.messages).toContainEqual({ method: "turn/completed", params: {
+        threadId: "local-stop", turn: { id: "stopping-turn", status: "interrupted" },
+      } });
+    }
+  } finally { await controller.stop(); }
+});
+
+describe("native new-chat creation lifecycle", () => {
+  test.each([false, true])("adopts native settings and never duplicates creation after an alias-write failure: %s", async failFirstWrite => {
+    const store = memoryStore();
+    const originalWrite = store.upsertThreadAlias.bind(store);
+    let aliasWrites = 0;
+    store.upsertThreadAlias = alias => {
+      if (failFirstWrite && aliasWrites++ === 0) throw new Error("alias disk write failed");
+      return originalWrite(alias);
+    };
+    const codex = new FakeCodexClient();
+    const desktop = new FakeDesktopIpcSync();
+    const request = codex.request.bind(codex);
+    codex.request = async <T>(method: string, params: unknown = {}): Promise<T> => {
+      const result = await request<any>(method, params);
+      if (method !== "thread/start") return result;
+      return { ...result, model: "resolved-model", modelProvider: "openai", cwd: "/resolved/workspace",
+        serviceTier: null, reasoningEffort: "medium", approvalPolicy: "on-request", approvalsReviewer: "user",
+        sandbox: { type: "readOnly" }, runtimeWorkspaceRoots: ["/resolved/workspace"],
+      } as T;
+    };
+    const controller = new AndroidRemoteGatewayController(store, { port: 0, hostname: "127.0.0.1",
+      desktopDirectModelProvider: () => null, desktopIpcSync: desktop,
+      runtime: { start: async () => codex, stop: async () => {} },
+    });
+    const internal = controller as any;
+    try {
+      await controller.start();
+      await internal.serverConfig();
+      internal.createDraft({ threadId: "draft-native", projectId: "project-1", title: "Native creation",
+        modelSelection: { instanceId: "openai", model: "gpt-5.6-sol" }, runtimeMode: "full-access" });
+      expect(codex.requests.filter(call => call.method === "thread/start")).toHaveLength(0);
+      const command = { threadId: "draft-native", modelSelection: { instanceId: "openai", model: "gpt-5.6-sol" },
+        runtimeMode: "full-access", message: { messageId: "native-create-message", text: "Start" } };
+      if (failFirstWrite) {
+        await expect(internal.startTurnUsingOwner("phone", command)).rejects.toThrow("alias disk write failed");
+        expect(codex.requests.filter(call => call.method === "turn/start")).toHaveLength(0);
+      }
+      await internal.startTurnUsingOwner("phone", command);
+      expect(codex.requests.filter(call => call.method === "thread/start")).toHaveLength(1);
+      expect(codex.requests.find(call => call.method === "turn/start")?.params).toMatchObject({
+        threadId: "native-1", model: "resolved-model", cwd: "/resolved/workspace", approvalPolicy: "on-request",
+        sandboxPolicy: { type: "readOnly" }, runtimeWorkspaceRoots: ["/resolved/workspace"],
+      });
+      expect(store.read().threadAliases[0]).toMatchObject({ remoteThreadId: "draft-native", nativeThreadId: "native-1",
+        model: "resolved-model", cwd: "/resolved/workspace", nativeModelProvider: "openai", nativeReasoningEffort: "medium" });
+      expect(store.read().taskSelections.find(row => row.nativeThreadId === "native-1")?.model).toBe("resolved-model");
+      expect(desktop.messages.some(message => message.method === "turn/started")).toBe(true);
+    } finally { await controller.stop(); }
+  });
+});
+
+test("manual Stop retains Android queued prompts without automatically restarting them, including after restart", async () => {
+  const queuedStore = createAndroidRemoteQueuedTurnStore();
+  const now = new Date().toISOString();
+  queuedStore.replace([{ taskId: "paused-chat", clientId: "phone", messageId: "waiting", displayText: "Next task",
+    command: { type: "thread.turn.start", threadId: "paused-chat", message: { messageId: "waiting", role: "user", text: "Next task", attachments: [] } },
+    stagedAttachments: { codexInputs: [], referencedFiles: [], stagedPaths: [] }, createdAt: now, updatedAt: now,
+  }]);
+  const make = () => new AndroidRemoteGatewayController(memoryStore(), { queuedTurnStore: queuedStore, desktopIpcSync: new FakeDesktopIpcSync() }) as any;
+  const first = make();
+  first.publishQueuedTurnState = () => {};
+  first.pauseQueuedTurnsAfterStop("paused-chat");
+  const restarted = make();
+  let sends = 0;
+  restarted.threadHasActiveTurn = async () => false;
+  restarted.startTurnNormally = async () => { sends++; };
+  await restarted.startNextQueuedTurn("paused-chat", true);
+  expect(sends).toBe(0);
+  expect(queuedStore.list()).toHaveLength(1);
+  expect(queuedStore.list()[0]?.command.pausedAfterUserStop).toBe(true);
+});
+
+test("Claude phone refresh rechecks sign-in immediately without waiting for the cached status", async () => {
+  const root = mkdtempSync(join(tmpdir(), "rmx-claude-refresh-"));
+  cleanupFolders.push(root);
+  let signedIn = false;
+  let probes = 0;
+  let closedProbes = 0;
+  const claude = new ManagedClaudeCode(root, ((input: any) => {
+    probes++;
+    expect(input.options.sessionId).toBeUndefined();
+    expect(input.options.resume).toBeUndefined();
+    expect(input.options.settings.remoteControlAtStartup).toBe(false);
+    return {
+      supportedModels: async () => [{ value: "sonnet", displayName: "Sonnet", description: "" }],
+      accountInfo: async () => ({ apiProvider: "firstParty", subscriptionType: signedIn ? "Claude Pro" : null }),
+      close: () => { closedProbes++; },
+    };
+  }) as any, { list: async () => [], info: async () => undefined, messages: async () => [] } as any,
+  undefined, undefined, undefined, new ClaudeAutoConnect(join(root, "claude-user")));
+  const store = Object.assign(memoryStore(), { stateRoot: root });
+  store.updateSettings({ controlEnabled: true });
+  const controller = new AndroidRemoteGatewayController(store, { port: 0,
+    runtime: { start: async () => new FakeCodexClient(), stop: async () => {} },
+    desktopIpcSync: new FakeDesktopIpcSync(),
+    cloudflareTunnel: new ReadyCloudflareTunnel("https://fixture.trycloudflare.com"),
+  });
+  (controller as any).managedClaude = claude;
+  let socket: WebSocket | undefined;
+  try {
+    await claude.configure({ enabled: true, binary: process.execPath });
+    expect((await claude.config({}, {}, null)).providers[0].status).toBe("error");
+    expect(probes).toBe(1);
+    signedIn = true;
+    // Background reads retain their cache; the phone's explicit read must bypass it.
+    expect((await claude.config({}, {}, null)).providers[0].status).toBe("error");
+    await controller.applySettings(store.read().settings);
+    const invitation = controller.createPairingInvitation("Fixture PC");
+    const paired = controller.auth.exchangePairingToken({ pairingToken: invitation.payload.pairingToken, metadata: { label: "Phone" } })!;
+    const ticket = controller.auth.issueWebSocketTicket(paired.client.id);
+    socket = new WebSocket(`ws://127.0.0.1:${controller.status().port}/ws?agent=claude-code&wsTicket=${encodeURIComponent(ticket.ticket)}`, "opencodex-json-v1");
+    await socketOpen(socket);
+    const refreshed = socketMessage(socket, 3000, "fresh Claude sign-in");
+    socket.send(JSON.stringify({ id: "refresh", method: "server.getConfig", params: {} }));
+    expect((await refreshed).result.providers[0]).toMatchObject({ status: "ready", auth: { status: "authenticated" } });
+    expect(probes).toBe(2);
+    signedIn = false;
+    expect((await claude.config({}, {}, null)).providers[0].status).toBe("ready");
+    expect(probes).toBe(2);
+    const signedOut = socketMessage(socket, 3000, "fresh Claude sign-out");
+    socket.send(JSON.stringify({ id: "refresh-again", method: "server.getConfig", params: {} }));
+    expect((await signedOut).result.providers[0]).toMatchObject({ status: "error", auth: { status: "unknown" } });
+    expect(probes).toBe(3);
+    expect(closedProbes).toBe(probes);
+    expect(claude.shell().threads).toEqual([]);
+    expect(store.read().clients).toHaveLength(1);
+  } finally { socket?.close(); await controller.stop(); }
+});
+
+test("Claude Code shares the PC credential while isolating subscriptions and enforcing scopes", async () => {
+  const root = mkdtempSync(join(tmpdir(), "rmx-managed-auth-"));
+  cleanupFolders.push(root);
+  const store = Object.assign(memoryStore(), { stateRoot: root });
+  store.updateSettings({ controlEnabled: true });
+  const controller = new AndroidRemoteGatewayController(store, { port: 0,
+    runtime: { start: async () => new FakeCodexClient(), stop: async () => {} },
+    desktopIpcSync: new FakeDesktopIpcSync(),
+    cloudflareTunnel: new ReadyCloudflareTunnel("https://fixture.trycloudflare.com"),
+  });
+  let socket: WebSocket | undefined;
+  try {
+    await controller.applySettings(store.read().settings);
+    const invitation = controller.createPairingInvitation("Fixture PC");
+    const paired = controller.auth.exchangePairingToken({ pairingToken: invitation.payload.pairingToken, metadata: { label: "Phone" } })!;
+    const ticket = controller.auth.issueWebSocketTicket(paired.client.id);
+    const port = controller.status().port;
+    socket = new WebSocket(`ws://127.0.0.1:${port}/ws?agent=claude-code&wsTicket=${encodeURIComponent(ticket.ticket)}`, "opencodex-json-v1");
+    await socketOpen(socket);
+    (controller.claudeCode() as any).autoConnect = new ClaudeAutoConnect(join(root, "claude-user"));
+    const config = socketMessage(socket, 3000, "Claude config");
+    socket.send(JSON.stringify({ id: "config", method: "server.getConfig", params: {} }));
+    expect((await config).result).toMatchObject({ providers: [{ instanceId: "claude-code", driver: "claude", enabled: false }] });
+    const headers = { authorization: `Bearer ${paired.accessToken}`, "content-type": "application/json" };
+    const shell = await fetch(`http://127.0.0.1:${port}/api/orchestration/snapshot?agent=claude-code`, { headers });
+    expect(shell.status).toBe(200);
+    expect(await shell.json()).toMatchObject({ threads: [], projects: [] });
+    expect(store.read().clients).toHaveLength(1);
+    const imagePath = join(root, "tool-preview.png");
+    writeFileSync(imagePath, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=", "base64"));
+    const claude = controller.claudeCode() as any;
+    const readDetail = claude.readDetail.bind(claude);
+    claude.readDetail = async (threadId: string) => threadId === "image-chat"
+      ? { thread: { activities: [{ payload: { data: { providerName: "claude-code", toolImages: [imagePath] } } }] } }
+      : { thread: { activities: [] } };
+    const imageResult = socketMessage(socket, 3000, "Claude tool image");
+    socket.send(JSON.stringify({ id: "image", method: "assets.createUrl", params: { resource: { _tag: "workspace-file", threadId: "image-chat", path: imagePath } } }));
+    const asset = (await imageResult).result;
+    expect(asset.relativeUrl).toStartWith("/api/android-remote/assets/");
+    expect((await fetch(`http://127.0.0.1:${port}${asset.relativeUrl}`)).status).toBe(200);
+    const foreignImage = socketMessage(socket, 3000, "Claude image from another chat");
+    socket.send(JSON.stringify({ id: "foreign-image", method: "assets.createUrl", params: { resource: { _tag: "workspace-file", threadId: "other-chat", path: imagePath } } }));
+    expect((await foreignImage).error).toBeDefined();
+    claude.readDetail = readDetail;
+    const autoOn = socketMessage(socket, 3000, "Claude automatic connection preference");
+    socket.send(JSON.stringify({ id: "auto-on", method: "claude.setAutoConnect", params: { enabled: true } }));
+    expect((await autoOn).result).toMatchObject({ autoConnect: { preference: true } });
+    const invalidAuto = socketMessage(socket, 3000, "Claude setting validation");
+    socket.send(JSON.stringify({ id: "auto-invalid", method: "claude.setAutoConnect", params: { enabled: false, path: "/arbitrary" } }));
+    expect((await invalidAuto).error).toBeDefined();
+    store.upsertClient({ ...paired.client, scopes: ["orchestration:read"] });
+    const autoDenied = socketMessage(socket, 3000, "read-only Claude setting change");
+    socket.send(JSON.stringify({ id: "auto-denied", method: "claude.setAutoConnect", params: { enabled: false } }));
+    expect((await autoDenied).error).toBeDefined();
+    expect(controller.claudeCode().syncSettings().autoConnect.preference).toBe(true);
+    const sessionControlDenied = socketMessage(socket, 3000, "read-only Claude session control");
+    socket.send(JSON.stringify({ id: "session-control-denied", method: "claude.sessionAction", params: { threadId: "task", action: "mcpToggle", name: "server", enabled: false, commandId: "control" } }));
+    expect((await sessionControlDenied).error).toBeTruthy();
+    const autoRead = socketMessage(socket, 3000, "read-only Claude settings read");
+    socket.send(JSON.stringify({ id: "auto-read", method: "claude.getSyncSettings", params: {} }));
+    expect((await autoRead).result).toMatchObject({ autoConnect: { preference: true } });
+    const denied = socketMessage(socket, 3000, "read-only Claude mutation");
+    socket.send(JSON.stringify({ id: "send", method: "orchestration.dispatchCommand", params: { type: "thread.create" } }));
+    expect((await denied).error).toBeDefined();
+    const repairDenied = socketMessage(socket, 3000, "read-only Claude link recovery");
+    socket.send(JSON.stringify({ id: "repair", method: "claude.recoverDesktopSync", params: { threadId: "task", mode: "replace", commandId: "repair" } }));
+    expect((await repairDenied).error).toBeDefined();
+    const noToken = await fetch(`http://127.0.0.1:${port}/api/orchestration/snapshot?agent=claude-code`);
+    expect(noToken.status).toBe(401);
+  } finally { socket?.close(); await controller.stop(); }
 });
