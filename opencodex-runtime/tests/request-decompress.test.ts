@@ -169,7 +169,11 @@ describe("readJsonRequestBody", () => {
       headers: { "content-type": "application/json", "content-encoding": "zstd" },
       body: big,
     });
-    await expect(readJsonRequestBody(req)).rejects.toBeInstanceOf(DecompressedBodyTooLargeError);
+    // Settle the large-body read before invoking Bun's assertion machinery.
+    // Its asynchronous rejection matcher can stall with these large buffers.
+    const error = await readJsonRequestBody(req).then(() => null, error => error);
+    expect(error).toBeInstanceOf(DecompressedBodyTooLargeError);
+    expect(error.bytes).toBeGreaterThan(MAX_DECOMPRESSED_BODY_BYTES);
   });
 
   test("surfaces DecompressedBodyTooLargeError for oversized identity bodies too", async () => {
@@ -178,7 +182,9 @@ describe("readJsonRequestBody", () => {
       headers: { "content-type": "application/json" },
       body: new Uint8Array(MAX_DECOMPRESSED_BODY_BYTES + 1),
     });
-    await expect(readJsonRequestBody(req)).rejects.toBeInstanceOf(DecompressedBodyTooLargeError);
+    const error = await readJsonRequestBody(req).then(() => null, error => error);
+    expect(error).toBeInstanceOf(DecompressedBodyTooLargeError);
+    expect(error.bytes).toBe(MAX_DECOMPRESSED_BODY_BYTES + 1);
   });
 
   test("preserves SyntaxError for malformed identity JSON", async () => {
