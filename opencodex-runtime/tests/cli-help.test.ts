@@ -261,17 +261,15 @@ describe("CLI subcommand help", () => {
     expect(result.stdout).toContain("Usage: rmx start [--port <port>]");
   });
 
-  test("invalid service and codex-shim usage include remove alias", () => {
-    const cases = [
-      { args: ["service", "nope"], expected: "Usage: rmx service [install|repair|start|stop|status|uninstall|remove] [--native|--scheduler]" },
-      { args: ["codex-shim", "nope"], expected: "Usage: rmx codex-shim <install|status|uninstall|remove>" },
-    ];
-
-    for (const testCase of cases) {
-      const result = runCli(testCase.args);
-      expect(result.status).toBe(1);
-      expect(result.stderr).toContain(testCase.expected);
-      expect(result.stdout).toBe("");
-    }
+  // Each command starts a fresh runtime; give each the same deadline as the
+  // other CLI cases instead of making two startups share one five-second test.
+  test.each([
+    { args: ["service", "nope"], expected: "Usage: rmx service [install|repair|start|stop|status|uninstall|remove] [--native|--scheduler]" },
+    { args: ["codex-shim", "nope"], expected: "Usage: rmx codex-shim <install|status|uninstall|remove>" },
+  ])("invalid service and codex-shim usage include remove alias: %j", testCase => {
+    const result = runCli(testCase.args);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(testCase.expected);
+    expect(result.stdout).toBe("");
   });
 });
