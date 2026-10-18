@@ -72,6 +72,9 @@ import {
 
 const TEST_DIR = join(import.meta.dir, ".tmp-codex-auth-api-test");
 const TEST_CODEX_HOME = join(TEST_DIR, "codex");
+// Source-contract checks need one fixed file snapshot, independent of the
+// mocked login timers and asynchronous I/O used by the behavioral cases.
+const AUTH_API_SOURCE = readFileSync(join(import.meta.dir, "../src/codex/auth-api.ts"), "utf8");
 const MANUAL_IMPORT_ENV = "OPENCODEX_ENABLE_UNVERIFIED_CODEX_IMPORT";
 const WARMUP_INPUT = [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }];
 let previousOpencodexHome: string | undefined;
@@ -4314,32 +4317,32 @@ describe("codex-auth API", () => {
     expect(getAccountQuota("reauth-plan")).toBeNull();
   });
 
-  test("OAuth pool login excludes self from collision check when reauth", async () => {
-    const source = await Bun.file("src/codex/auth-api.ts").text();
+  test("OAuth pool login excludes self from collision check when reauth", () => {
+    const source = AUTH_API_SOURCE;
     expect(source).toContain("checkAccountIdCollision(oauthAccountId, email, plan, reauth ? accountId : undefined)");
   });
 
-  test("OAuth pool reauth binds ChatGPT identity to the existing pool slot", async () => {
-    const source = await Bun.file("src/codex/auth-api.ts").text();
+  test("OAuth pool reauth binds ChatGPT identity to the existing pool slot", () => {
+    const source = AUTH_API_SOURCE;
     expect(source).toContain("expectedChatgptId");
     expect(source).toContain("expectedEmail");
     expect(source).toContain("Signed-in ChatGPT account does not match this pool account");
     expect(source).toContain("Cannot verify account identity for reauth. Remove this account and add it again.");
   });
 
-  test("OAuth pool login waits for the current flow to finish, not stale credentials", async () => {
-    const source = await Bun.file("src/codex/auth-api.ts").text();
+  test("OAuth pool login waits for the current flow to finish, not stale credentials", () => {
+    const source = AUTH_API_SOURCE;
     expect(source).toContain("st.done && st.loggedIn");
     expect(source).toContain("Login timed out before OAuth completed.");
   });
 
-  test("OAuth pool login stores a privacy log label at the account creation call site", async () => {
-    const source = await Bun.file("src/codex/auth-api.ts").text();
+  test("OAuth pool login stores a privacy log label at the account creation call site", () => {
+    const source = AUTH_API_SOURCE;
     expect(source).toContain("withCodexAccountLogLabel({ id: accountId, email, plan, isMain: false }, accounts)");
   });
 
-  test("GET /api/codex-auth/login-status masks transient flow-state emails at response boundaries", async () => {
-    const source = await Bun.file("src/codex/auth-api.ts").text();
+  test("GET /api/codex-auth/login-status masks transient flow-state emails at response boundaries", () => {
+    const source = AUTH_API_SOURCE;
     expect(source).toContain("st ? { ...st, email: maskEmail(st.email) ?? undefined } : { status: \"expired\" }");
     expect(source).toContain("return jsonResponse({ ...st, email: maskEmail(st.email) ?? undefined });");
   });
