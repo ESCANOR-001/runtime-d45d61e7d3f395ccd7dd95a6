@@ -121,8 +121,17 @@ export async function runWindowsPackageSmoke() {
         const beforeRestart = await (await fetch(healthUrl, { signal: AbortSignal.timeout(5_000) })).json();
         assert(Number.isSafeInteger(beforeRestart.pid) && beforeRestart.pid > 0);
         cli("restart");
-        const response = await fetch(healthUrl, { signal: AbortSignal.timeout(5_000) });
-        assert(response.ok, "Restarted server must answer on the original port");
+        // The synchronous CLI wait can leave Node's HTTP pool holding the
+        // previous process's closed socket. Reconnect after that expected
+        // disconnect; never relax the replacement identity or port checks.
+        let response, reconnectError;
+        const reconnectDeadline = Date.now() + 10_000;
+        while (!response && Date.now() < reconnectDeadline) {
+          try {
+            response = await fetch(healthUrl, { signal: AbortSignal.timeout(2_000), headers: { connection: "close" } });
+          } catch (error) { reconnectError = error; await delay(100); }
+        }
+        assert(response?.ok, `Restarted server must answer on the original port: ${reconnectError ?? ""}`);
         const afterRestart = await response.json();
         assert.equal(afterRestart.service, "opencodex");
         assert.equal(afterRestart.version, version);
