@@ -6503,7 +6503,19 @@ describe("Android Remote Codex connection", () => {
         },
       });
 
-      const itemCompletedMessage = socketMessage(socket, 3_000, "item completed");
+      const itemCompletedMessage = socketMessageMatching(
+        socket,
+        message => {
+          const envelope = message.event as {
+            event?: { type?: string; payload?: { messageId?: string; streaming?: boolean } };
+          } | undefined;
+          return envelope?.event?.type === "thread.message-sent"
+            && envelope.event.payload?.messageId === "agent-live-1"
+            && envelope.event.payload.streaming === false;
+        },
+        3_000,
+        "item completed",
+      );
       codex.emit({
         method: "item/completed",
         params: {

@@ -12,12 +12,11 @@
  * act on — rather than artifacts the next start silently undoes.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { handleManagementAPI } from "../src/server/management-api";
-import type { ManagementApiDeps } from "../src/server/management/context";
 import type { OcxConfig } from "../src/types";
 import { CODEX_CONFIG_PATH } from "../src/codex/paths";
 
@@ -40,30 +39,26 @@ function baseConfig(): OcxConfig {
   };
 }
 
-function testDeps(overrides: Partial<ManagementApiDeps> = {}): ManagementApiDeps {
-  return {
-    fetchAllModels: async () => [] as never,
-    ...overrides,
-  } as ManagementApiDeps;
-}
-
-function dispatch(config: OcxConfig, path: string, init?: RequestInit, deps: ManagementApiDeps = testDeps()) {
-  const url = new URL(`http://127.0.0.1:10100${path}`);
-  return handleManagementAPI(
-    new Request(url, { ...init, headers: { Host: url.host, ...(init?.headers ?? {}) } }),
-    url,
-    config,
-    deps,
-  );
-}
-
-async function put(config: OcxConfig, body: unknown, deps?: ManagementApiDeps) {
-  const res = await dispatch(config, "/api/native-integrations/codex", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  }, deps);
-  return { status: res!.status, body: await res!.json() as Record<string, unknown> };
+type ToggleStep = { path: string; body?: unknown };
+type ToggleResult = { status: number; body: Record<string, unknown>; intent?: boolean; refreshes: number; liveWorkers: number };
+function toggle(body: unknown): ToggleStep { return { path: "/api/native-integrations/codex", body }; }
+function runSteps(steps: ToggleStep[], observeRefresh = false): ToggleResult[] {
+  const child = spawnSync(process.execPath, [join(import.meta.dir, "helpers/native-codex-toggle-peer.ts")], {
+    windowsHide: true,
+    env: { ...process.env, OPENCODEX_HOME: fixtureRoot },
+    input: JSON.stringify({ config: baseConfig(), steps, observeRefresh }),
+    encoding: "utf8",
+    timeout: (steps.length + 1) * 5_000,
+  });
+  if (child.error || child.status !== 0) {
+    throw new Error(`Native toggle peer failed: ${child.error?.message ?? child.stderr}\n${child.stdout}`);
+  }
+  const line = child.stdout.split(/\r?\n/).find(line => line.startsWith("NATIVE_TOGGLE_RESULT="));
+  if (!line) throw new Error(`Native toggle peer returned no result: ${child.stdout}`);
+  const results = JSON.parse(line.slice("NATIVE_TOGGLE_RESULT=".length)) as ToggleResult[];
+  expect(results).toHaveLength(steps.length);
+  for (const result of results) expect(result.liveWorkers).toBe(0);
+  return results;
 }
 
 function persistedCodexIntent(): unknown {
@@ -93,35 +88,27 @@ afterEach(() => {
 
 describe("request validation", () => {
   test("a non-boolean enabled is rejected before anything is written", async () => {
-    const result = await put(baseConfig(), { enabled: "false" });
-    expect(result.status).toBe(400);
+    const [result] = runSteps([toggle({ enabled: "false" })]);
+    expect(result!.status).toBe(400);
     expect(persistedCodexIntent()).toBeUndefined();
-  });
+  }, 30_000);
 
   test("a missing enabled is rejected before anything is written", async () => {
-    const result = await put(baseConfig(), {});
-    expect(result.status).toBe(400);
+    const [result] = runSteps([toggle({})]);
+    expect(result!.status).toBe(400);
     expect(persistedCodexIntent()).toBeUndefined();
-  });
+  }, 30_000);
 });
 
 describe("turning Codex off", () => {
   test("refreshes Android Remote so the phone immediately receives the native-only catalog", async () => {
-    let refreshes = 0;
-    const result = await put(baseConfig(), { enabled: false }, testDeps({
-      androidRemoteController: {
-        notifyModelCatalogChanged() {
-          refreshes += 1;
-        },
-      } as ManagementApiDeps["androidRemoteController"],
-    }));
-
-    expect(result.status).toBe(200);
-    expect(refreshes).toBe(1);
-  });
+    const [result] = runSteps([toggle({ enabled: false })], true);
+    expect(result!.status).toBe(200);
+    expect(result!.refreshes).toBe(1);
+  }, 30_000);
 
   test("persists the decision so it survives the next start", async () => {
-    const result = await put(baseConfig(), { enabled: false });
+    const result = runSteps([toggle({ enabled: false })])[0]!;
     expect(result.status).toBe(200);
     expect(result.body).toMatchObject({ ok: true, clientId: "codex" });
     expect(result.body.artifacts).toMatchObject({
@@ -132,7 +119,7 @@ describe("turning Codex off", () => {
     // The decision is on disk. Without this, an OFF lasts until the next
     // `ocx start` re-syncs over it, which is the defect this phase exists for.
     expect(persistedCodexIntent()).toBe(false);
-  });
+  }, 30_000);
 
   /**
    * THE PROXY STAYS UP. The user asked for this in exactly these terms: they may
@@ -140,40 +127,41 @@ describe("turning Codex off", () => {
    * every other client would lose its routing too.
    */
   test("the management API keeps serving other routes afterwards", async () => {
-    await put(baseConfig(), { enabled: false });
+    const [first, others, again] = runSteps([
+      toggle({ enabled: false }),
+      { path: "/api/native-integrations" },
+      toggle({ enabled: false }),
+    ]);
+    expect(first!.status).toBe(200);
 
     // `/healthz` is served by the request router rather than the management API,
     // so the observable claim HERE is that the management surface itself is
     // still answering — the route did not tear the process down or leave a
     // lock/flight wedged behind it.
-    const others = await dispatch(baseConfig(), "/api/native-integrations");
     expect(others!.status).toBe(200);
-    const body = await others!.json() as { clients: { clientId: string }[] };
+    const body = others!.body as { clients: { clientId: string }[] };
     expect(body.clients.some(c => c.clientId === "claude")).toBe(true);
 
     // And the switch is re-usable immediately: a wedged in-flight guard would
     // return 409 here rather than a normal answer.
-    const again = await put(baseConfig(), { enabled: false });
-    expect(again.status).toBe(200);
-  });
+    expect(again!.status).toBe(200);
+  }, 30_000);
 
   test("turning it off twice is honest about the second one changing nothing", async () => {
-    const first = await put(baseConfig(), { enabled: false });
-    const second = await put(baseConfig(), { enabled: false });
-    expect(first.body.changed).toBe(true);
-    expect(second.body.changed).toBe(false);
+    const [first, second] = runSteps([toggle({ enabled: false }), toggle({ enabled: false })]);
+    expect(first!.body.changed).toBe(true);
+    expect(second!.body.changed).toBe(false);
     expect(persistedCodexIntent()).toBe(false);
-  });
+  }, 30_000);
 });
 
 describe("turning Codex back on", () => {
   test("removes the key rather than storing true", async () => {
-    await put(baseConfig(), { enabled: false });
-    expect(persistedCodexIntent()).toBe(false);
-
-    const result = await put(baseConfig(), { enabled: true });
-    expect(result.status).toBe(200);
+    const [first, result] = runSteps([toggle({ enabled: false }), toggle({ enabled: true })]);
+    expect(first!.status).toBe(200);
+    expect(first!.intent).toBe(false);
+    expect(result!.status).toBe(200);
     // Absence is ON, so an untouched config and a re-enabled one are identical.
     expect(persistedCodexIntent()).toBeUndefined();
-  });
+  }, 30_000);
 });

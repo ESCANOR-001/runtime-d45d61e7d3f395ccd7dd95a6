@@ -963,6 +963,8 @@ describe("codex routing", () => {
     )).toEqual({ status: "expired", accountId: "a" });
   });
 
+  // These stress cases fill the real 2,048-entry cap. Their deadline includes
+  // thousands of credential lookups on slower hosted machines, not one request.
   test("thread affinity LRU cap evicts the oldest mapping", () => {
     const config = makeConfig();
     updateAccountQuota("a", 10);
@@ -976,7 +978,7 @@ describe("codex routing", () => {
 
     expect(resolveCodexAccountForThread("lru-1", config, now + CODEX_THREAD_AFFINITY_MAX_ENTRIES + 1)).toBe("a");
     expect(resolveCodexAccountForThread("lru-0", config, now + CODEX_THREAD_AFFINITY_MAX_ENTRIES + 2)).toBe("b");
-  });
+  }, 20_000);
 
   test("thread affinity LRU cap includes legacy and native quota scopes", () => {
     const config = makeConfig();
@@ -997,7 +999,7 @@ describe("codex routing", () => {
     expect(resolveCodexAccountForThread("scoped-lru-0", config, after, "shared")).toBe("a");
     expect(resolveCodexAccountForThread("scoped-lru-0", config, after + 1, "spark")).toBe("a");
     expect(resolveCodexAccountForThread("scoped-lru-0", config, after + 2)).toBe("b");
-  });
+  }, 20_000);
 
   test("generation mismatch invalidates a mapped thread before reuse", () => {
     const config = makeConfig();
