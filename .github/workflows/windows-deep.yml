@@ -46,6 +46,9 @@ jobs:
         run: bun run build
       - name: All runtime tests including nested suites
         run: bun scripts/test-file-shard.ts --shard=${{ matrix.shard }}/4
+      - name: Dependency security audit
+        if: ${{ !cancelled() && matrix.shard == 1 }}
+        run: bun run audit:high
       - name: Dashboard tests
         if: ${{ !cancelled() && matrix.shard == 1 }}
         working-directory: opencodex-runtime/gui

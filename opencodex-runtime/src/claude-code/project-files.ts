@@ -18,6 +18,9 @@ export async function claudeProjectRoot(cwd: unknown, shell: Row): Promise<strin
 }
 
 export async function claudeProjectEntries(cwd: string, query?: unknown, requestedLimit?: unknown) {
+  // macOS /var and Windows junctions can name the same project through an
+  // alias. Compare every child against the same canonical root.
+  cwd = await realpath(cwd);
   const search = query === undefined ? null : typeof query === 'string' ? query.trim().toLowerCase() : '';
   if (search !== null && (!search || search.length > 256)) throw new TypeError('Enter a file search of 1 to 256 characters.');
   const limit = typeof requestedLimit === 'number' && Number.isFinite(requestedLimit) ? Math.max(1, Math.min(200, Math.floor(requestedLimit))) : 200;
@@ -83,6 +86,7 @@ function git(cwd: string, args: string[], allowed = [0]): Promise<string> {
 }
 
 export async function claudeProjectDiff(cwd: string, ignoreWhitespace: boolean) {
+  cwd = await realpath(cwd);
   // No shell, external diff program, text conversion, index writes or checkout.
   const options = ['--no-ext-diff', '--no-textconv', '--no-color', ...(ignoreWhitespace ? ['--ignore-all-space'] : [])];
   const hasHead = await git(cwd, ['rev-parse', '--verify', 'HEAD']).then(() => true, () => false);

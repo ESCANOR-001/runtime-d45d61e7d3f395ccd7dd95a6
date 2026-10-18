@@ -1,6 +1,6 @@
 import { ClaudeAutoConnect } from '../src/claude-code/auto-connect';
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, readdirSync, writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
+import { mkdtempSync, rmSync, readdirSync, writeFileSync, readFileSync, existsSync, statSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { getEventListeners } from 'node:events';
 import { join } from 'node:path';
@@ -14,7 +14,7 @@ function fixture(modelCatalog?: ModelInfo[]) {
   let failFork = false;
   let failBranchRead = false;
   const forks: any[] = [];
-  const root = mkdtempSync(join(tmpdir(), 'remodex-managed-')); roots.push(root);
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'remodex-managed-'))); roots.push(root);
   const runs: any[] = [];
   const remoteCalls: any[] = [];
   const fake = ((input: any) => {

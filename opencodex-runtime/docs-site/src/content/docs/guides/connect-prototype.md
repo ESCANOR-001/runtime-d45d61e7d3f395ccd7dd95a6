@@ -323,6 +323,8 @@ Claude Desktop.
 Android remembers the selected agent and unsent chat drafts when the app closes.
 Tap a file link in a reply to preview the file on the connected PC. The chat's
 **Files** and **Changes** menu items open its working folder and changes view.
+Folder aliases on macOS and Windows resolve to the same project; file listing
+and new-file change previews stay inside that project's real folder.
 Completed work keeps its recorded duration when another prompt is sent.
 
 For Remodex-owned chats, **Stop** also stops background tools reported by that

@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { claudeGit } from '../src/claude-code/session-files';
@@ -12,8 +12,8 @@ afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: 
 test('Claude files use its project and worktree roots without borrowing Codex access', async () => {
   const root = fixture(), worktree = fixture(), outside = fixture();
   const shell = { projects: [{ workspaceRoot: root }], threads: [{ worktreePath: worktree }] };
-  expect(await claudeProjectRoot(root, shell)).toBe(root);
-  expect(await claudeProjectRoot(worktree, shell)).toBe(worktree);
+  expect(await claudeProjectRoot(root, shell)).toBe(realpathSync(root));
+  expect(await claudeProjectRoot(worktree, shell)).toBe(realpathSync(worktree));
   await expect(claudeProjectRoot(outside, shell)).rejects.toThrow('not part of a Claude task');
   writeFileSync(join(outside, 'private.txt'), 'outside');
   await expect(claudeProjectFile(root, join(outside, 'private.txt'))).rejects.toThrow('project folder');
@@ -67,4 +67,16 @@ test('a Claude project inside a larger repository only previews its own changes'
   const diff = (await claudeProjectDiff(project, false)).sources[0]!.diff;
   expect(diff).toContain('+inside after'); expect(diff).toContain('+new inside');
   expect(diff).not.toContain('outside private edit'); expect(diff).not.toContain('outside.txt');
+});
+
+test('Claude file listing and new-file changes accept a project reached through a directory alias', async () => {
+  const root = fixture(), links = fixture(), alias = join(links, 'project');
+  symlinkSync(root, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  await claudeGit(root, ['init']);
+  writeFileSync(join(root, 'new.txt'), 'new through alias\n');
+  const shell = { projects: [{ workspaceRoot: alias }], threads: [] };
+  expect(await claudeProjectRoot(alias, shell)).toBe(realpathSync(root));
+  expect((await claudeProjectEntries(alias)).entries).toEqual([{ path: 'new.txt', kind: 'file' }]);
+  const diff = (await claudeProjectDiff(alias, false)).sources[0]!.diff;
+  expect(diff).toContain('+new through alias');
 });

@@ -116,6 +116,21 @@ export async function runWindowsPackageSmoke() {
         await delay(250);
       }
       assert(ready, `Installed server did not become healthy: ${spawnError ?? ""}\n${output}`);
+      if (attempt === 0) {
+        const healthUrl = `http://127.0.0.1:${port}/healthz`;
+        const beforeRestart = await (await fetch(healthUrl, { signal: AbortSignal.timeout(5_000) })).json();
+        assert(Number.isSafeInteger(beforeRestart.pid) && beforeRestart.pid > 0);
+        cli("restart");
+        const response = await fetch(healthUrl, { signal: AbortSignal.timeout(5_000) });
+        assert(response.ok, "Restarted server must answer on the original port");
+        const afterRestart = await response.json();
+        assert.equal(afterRestart.service, "opencodex");
+        assert.equal(afterRestart.version, version);
+        assert.equal(afterRestart.port, port);
+        assert(Number.isSafeInteger(afterRestart.pid) && afterRestart.pid > 0);
+        assert.notEqual(afterRestart.pid, beforeRestart.pid, "Restart must replace the running server");
+        console.log("PASS installed rmx restart replaced the server and kept the same port");
+      }
       const dashboard = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(5_000) });
       assert(dashboard.ok);
       assert.match(await dashboard.text(), /<html/i);
@@ -135,6 +150,12 @@ export async function runWindowsPackageSmoke() {
     for (const alias of ["rmx", "remodex", "opencodex", "ocx"]) assert(!existsSync(join(prefix, `${alias}.cmd`)));
     console.log("PASS npm uninstall removed package and command shims");
   } finally {
+    // Restart can replace the original child with a detached server. Stop the
+    // server belonging to this disposable profile before uninstalling it.
+    if (installed) {
+      const launcher = join(prefix, "node_modules", "@remodex", "rmx", "bin", "ocx.mjs");
+      try { run(process.execPath, [launcher, "stop"], { cwd: home, env: environment }); } catch {}
+    }
     if (child?.pid && child.exitCode === null) {
       spawnSync(join(process.env.SystemRoot, "System32", "taskkill.exe"), ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, timeout: 15_000, stdio: "ignore" });
     }
