@@ -1,0 +1,28 @@
+name: Windows owner recovery checks
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-arm:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: opencodex-runtime
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.4
+      - name: Confirm native Windows ARM system calls
+        run: |
+          bun -e 'if(process.arch !== process.env.RUNNER_ARCH.toLowerCase()) throw Error("Not native ARM"); const {dlopen}=require("bun:ffi"); console.log(dlopen("kernel32.dll", {GetCurrentProcessId:{args:[],returns:"u32"}}).symbols.GetCurrentProcessId())'
+      - run: bun install --frozen-lockfile
+      - run: bun scripts/test.ts tests/native-main-owner-lifetime.test.ts

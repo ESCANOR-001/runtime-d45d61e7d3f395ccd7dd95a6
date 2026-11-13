@@ -147,6 +147,7 @@ class ChildHarness {
   readonly child: ReturnType<typeof Bun.spawn>;
   readonly events: Event[] = [];
   readonly stderr: Promise<string>;
+  private stderrSoFar = "";
   private nextId = 0;
   private readonly waiters = new Set<() => void>();
 
@@ -170,7 +171,15 @@ class ChildHarness {
       stderr: "pipe",
       windowsHide: true,
     });
-    this.stderr = new Response(this.child.stderr).text();
+    this.stderr = (async () => {
+      const reader = this.child.stderr.getReader();
+      const decoder = new TextDecoder();
+      for (;;) {
+        const { done, value } = await reader.read();
+        this.stderrSoFar += decoder.decode(value, { stream: !done });
+        if (done) return this.stderrSoFar;
+      }
+    })();
     void (async () => {
       const reader = this.child.stdout.getReader();
       const decoder = new TextDecoder();
@@ -196,8 +205,10 @@ class ChildHarness {
     for (;;) {
       const found = this.events.find(predicate);
       if (found) return found;
-      if (Date.now() >= deadline) {
-        throw new Error(`child event timeout; events=${JSON.stringify(this.events)} stderr=${await this.stderr}`);
+      if (Date.now() >= deadline || this.child.exitCode !== null) {
+        // stderr only closes when the child exits. Waiting for it here turns
+        // this deadline into a deadlock and hides the actual startup failure.
+        throw new Error(`child event timeout or exit (${this.child.exitCode}); events=${JSON.stringify(this.events)} stderr=${this.stderrSoFar}`);
       }
       await Promise.race([
         new Promise<void>(resolve => this.waiters.add(resolve)),
