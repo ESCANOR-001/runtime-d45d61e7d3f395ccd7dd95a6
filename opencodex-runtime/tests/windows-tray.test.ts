@@ -41,6 +41,7 @@ import { MEMORY_DRAIN_RESTART_MS, REPLACEMENT_READY_TIMEOUT_MS } from "../src/se
 import type { OcxConfig } from "../src/types";
 import { INTERNAL_DEADLINE_MS, SPAWN_BUDGET_MS } from "./helpers/test-budget";
 import { waitForPortAvailable } from "../src/server/ports";
+import { setSyntheticWindowsPrincipalForTests } from "../src/lib/windows-user-principal";
 
 const entry: WindowsTrayEntry = {
   bun: "C:\\사용자 공간\\%TEMP% ! ^ ( ) & 검증\\bun.exe",
@@ -79,6 +80,9 @@ describe("Windows tray packaging and command safety", () => {
     process.env.USERNAME = "ocx-test-user";
     resetHardenedStateForTests();
     setPlatformForTests("win32");
+    // This test injects file permissions to exercise memo cleanup only. Do not
+    // launch a real account lookup on Windows while the permission call is fake.
+    setSyntheticWindowsPrincipalForTests("*S-1-5-21-100-200-300-1001");
     setIcaclsRunnerForTests(() => ({ success: true, exitCode: 0, timedOut: false, stdout: "" }));
     const write = (path: string, contents: string | Buffer): void => {
       writeFileSync(path, contents, { mode: 0o600 });

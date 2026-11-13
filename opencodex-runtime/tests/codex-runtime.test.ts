@@ -866,7 +866,9 @@ describe("resolveCodexRuntime", () => {
           `  echo "codex-cli ${version}"`,
           "  exit 0",
           "fi",
-          `cat "$(dirname "$0")/catalog.json"`,
+          // PATH is deliberately empty below. Use shell builtins, not cat or dirname.
+          `IFS= read -r catalog < "\${0%/*}/catalog.json"`,
+          `printf '%s\\n' "$catalog"`,
           "",
         ].join("\n"), "utf8");
         chmodSync(path, 0o755);

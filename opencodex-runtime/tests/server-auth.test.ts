@@ -2694,7 +2694,7 @@ describe("server local API auth", () => {
       // records the failure instead.
       expect(getCodexUpstreamHealth("pool-a")).toBeNull();
       expect(getUpstreamHostHealth(upstreamHostHealthKey("openai", "https://chatgpt.com")))
-        .toMatchObject({ consecutiveFailures: 1, lastFailureCode: "ConnectionRefused" });
+        .toMatchObject({ consecutiveFailures: 1, lastFailureCode: expect.stringMatching(/^(?:ConnectionRefused|ECONNREFUSED)$/) });
     } finally {
       await server.stop(true);
     }

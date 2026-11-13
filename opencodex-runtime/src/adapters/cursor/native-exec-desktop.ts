@@ -149,12 +149,17 @@ function runExternalJson(command: string, payload: unknown, config: DesktopExecu
 
     child.stdout.on("data", chunk => { stdout += chunk.toString(); });
     child.stderr.on("data", chunk => { stderr += chunk.toString(); });
-    child.on("error", err => {
+    const fail = (err: unknown) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      child.kill("SIGKILL");
       reject(err);
-    });
+    };
+    child.on("error", fail);
+    // A helper can exit before reading its request. Stream errors are emitted
+    // later, outside the write() try/catch, and must not crash the conversation.
+    child.stdin.on("error", fail);
     child.on("close", code => {
       if (settled) return;
       settled = true;
@@ -174,11 +179,7 @@ function runExternalJson(command: string, payload: unknown, config: DesktopExecu
       child.stdin.write(JSON.stringify(payload));
       child.stdin.end();
     } catch (err) {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timer);
-        reject(err);
-      }
+      fail(err);
     }
   });
 }

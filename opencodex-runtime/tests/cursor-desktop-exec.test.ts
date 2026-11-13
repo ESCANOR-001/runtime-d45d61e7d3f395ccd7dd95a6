@@ -89,6 +89,17 @@ describe("Cursor desktop executor hooks", () => {
     expect(reply.message.value.result.case).toBe("failure");
   });
 
+  test("an executor exiting before a large request is read contains the broken pipe", async () => {
+    const deps = desktopDepsFromConfig({ recordScreenCommand: "exit 3" });
+    const reply = decode((await handleCursorNativeExec(execMessage({
+      case: "recordScreenArgs",
+      value: create(RecordScreenArgsSchema, {
+        mode: 1, toolCallId: "early-exit", saveAsFilename: "x".repeat(1024 * 1024),
+      }),
+    }), deps))[0]);
+    expect(reply.message.value.result.case).toBe("failure");
+  });
+
   test("a throwing recordScreen dep is contained as RecordScreenFailure (dispatcher boundary)", async () => {
     const reply = decode((await handleCursorNativeExec(execMessage({
       case: "recordScreenArgs",

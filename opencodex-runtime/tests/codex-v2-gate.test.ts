@@ -176,10 +176,13 @@ describe("features.ts config reader", () => {
     ))).toBe(true);
   });
 
-  test("#1295: an array may open on the line after `=`", () => {
-    expect(isMultiAgentV2Enabled(fixtureConfig(
-      '[features.multi_agent_v2]\nhint =\n[\n  ["nested"],\n]\nenabled = true\n',
-    ))).toBe(true);
+  test("#1295: an array opening after a newline is not valid TOML", () => {
+    // TOML requires the key, '=' and start of its value on the same line:
+    // https://toml.io/en/v1.0.0#keyvalue-pair . Bun 1.3 accepted this malformed
+    // fixture; the stricter parser must not be mistaken for a disabled valid flag.
+    const malformed = '[features.multi_agent_v2]\nhint =\n[\n  ["nested"],\n]\nenabled = true\n';
+    expect(() => Bun.TOML.parse(malformed)).toThrow();
+    expect(isMultiAgentV2Enabled(fixtureConfig(malformed))).toBe(false);
   });
 
   test("#1295: `#` inside a string is content, not a comment", () => {

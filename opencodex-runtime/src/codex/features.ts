@@ -135,7 +135,7 @@ export function multiAgentV2EnabledFromConfigText(content: string | null): boole
   // Prefer a real parse. The hand-written table scanner below cannot distinguish
   // an assignment from prose that looks like one — a `"""` value containing the
   // line `enabled = true` reads as the key itself — and TOML has enough value
-  // shapes (multi-line arrays opening on the next line, escapes, comments) that
+  // shapes (multi-line arrays, escapes, comments) that
   // each near-miss costs another special case (#1295).
   //
   // The scanner remains only for a document `Bun.TOML.parse` rejects. That is a
