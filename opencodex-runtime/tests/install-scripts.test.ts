@@ -51,7 +51,7 @@ describe("install scripts", () => {
     expect(pkg.homepage).toBe("https://remodex.net/");
     expect(pkg.bugs?.url).toBe("https://github.com/ESCANOR-001/remodex-android/issues");
     expect(pkg.publishConfig?.access).toBe("public");
-    expect(pkg.dependencies?.zod).toBe("4.4.3");
+    expect(pkg.dependencies?.zod).toBe("4.6.6");
     expect(pkg.dependencies?.bun).toBe("1.4.4");
     expect(pkg.devDependencies?.typescript).toBe("7.0.2");
     expect(pkg.devDependencies?.["@types/bun"]).toBe("1.3.14");
