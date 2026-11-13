@@ -31,6 +31,7 @@ const receiptPath = process.env.NATIVE_OWNER_RECEIPTS;
 const emit = (value: Record<string, unknown>): void => {
   process.stdout.write(`@@native-owner@@${JSON.stringify(value)}\n`);
 };
+emit({ event: "modules-loaded", at: Date.now() });
 
 class EnvKeyProvider implements NativeProfileKeyProvider {
   async get(): Promise<NativeProfileKey> { return { keyRef, key: Buffer.from(keyBytes) }; }

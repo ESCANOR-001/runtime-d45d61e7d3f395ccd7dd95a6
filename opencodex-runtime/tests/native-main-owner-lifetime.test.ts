@@ -152,7 +152,7 @@ class ChildHarness {
   private readonly waiters = new Set<() => void>();
 
   constructor(f: Fixture, extraEnv: Record<string, string> = {}) {
-    this.child = Bun.spawn([process.execPath, join(import.meta.dir, "helpers", "native-main-owner-child.ts")], {
+    this.child = Bun.spawn([process.execPath, join(import.meta.dir, "helpers", "native-main-owner-bootstrap.ts")], {
       cwd: join(import.meta.dir, ".."),
       env: {
         ...process.env,
@@ -215,6 +215,15 @@ class ChildHarness {
         Bun.sleep(50),
       ]);
     }
+  }
+
+  async ready(): Promise<Event> {
+    // Loading the full source server on a cold Windows runner is setup work.
+    // Keep the shorter ten-second deadline for ownership/recovery operations.
+    const ready = await this.waitFor(event => event.event === "listening", 30_000);
+    const boot = this.events.find(event => event.event === "booting");
+    if (boot) console.log(`owner fixture startup: ${Date.now() - Number(boot.at)}ms`);
+    return ready;
   }
 
   async command(op: string, fields: Record<string, unknown> = {}): Promise<Event> {
@@ -388,16 +397,16 @@ describe("native-main process owner lease", () => {
     let second: ChildHarness | undefined;
     let support: ChildHarness | undefined;
     try {
-      await first.waitFor(event => event.event === "listening");
+      await first.ready();
       await first.snapshot(isHeldReady);
       second = new ChildHarness(secondFixture);
-      await second.waitFor(event => event.event === "listening");
+      await second.ready();
       await second.snapshot(isContended);
 
       const supportConfig = join(firstFixture.root, "owner-support");
       writeConfig(firstFixture.codexHome, supportConfig);
       support = new ChildHarness({ ...firstFixture, configDir: supportConfig });
-      await support.waitFor(event => event.event === "listening");
+      await support.ready();
       await support.snapshot(isContended);
       expect((await support.command("set-mode", { mode: "pool" })).ok).toBe(true);
       const pool = await support.command("request", { kind: "pool" });
@@ -430,7 +439,7 @@ describe("native-main process owner lease", () => {
       if (second) await second.stop().catch(() => second!.hardKill());
       if (support) await support.stop().catch(() => support!.hardKill());
     }
-  }, 30_000);
+  }, 120_000);
 
   test("a hard-killed owner releases the OS lease and the successor recovers before opening main", async () => {
     const f = fixture("crash-a", false);
@@ -444,7 +453,7 @@ describe("native-main process owner lease", () => {
     const owner = new ChildHarness(f, { NATIVE_OWNER_HOLD_SWITCH_BOUNDARY: "auth-replaced" });
     let successor: ChildHarness | undefined;
     try {
-      const listening = await owner.waitFor(event => event.event === "listening");
+      const listening = await owner.ready();
       await owner.snapshot(isHeldReady);
       const switchRequest = fetch(`http://127.0.0.1:${Number(listening.port)}/api/native-main-profiles/switch`, {
         method: "POST",
@@ -455,7 +464,7 @@ describe("native-main process owner lease", () => {
       expect(probeNativeProfileRecoveryState(f.manager.context)).toBe("journal");
 
       successor = new ChildHarness(successorFixture);
-      await successor.waitFor(event => event.event === "listening");
+      await successor.ready();
       await successor.snapshot(isContended);
       const before = await successor.command("snapshot");
       const blockedMain = await successor.command("request", { kind: "main" });
@@ -474,7 +483,7 @@ describe("native-main process owner lease", () => {
       await owner.stop().catch(() => owner.hardKill());
       if (successor) await successor.stop().catch(() => successor!.hardKill());
     }
-  }, 30_000);
+  }, 120_000);
 
   test("a successor scrubs a hard-killed production auth write before recovery or main admission", async () => {
     const f = fixture("temp-crash", false);
@@ -487,7 +496,7 @@ describe("native-main process owner lease", () => {
     const owner = new ChildHarness(f, { NATIVE_OWNER_HOLD_AUTH_TEMP: "1" });
     let successor: ChildHarness | undefined;
     try {
-      const listening = await owner.waitFor(event => event.event === "listening");
+      const listening = await owner.ready();
       await owner.snapshot(isHeldReady);
       const switchRequest = fetch(`http://127.0.0.1:${Number(listening.port)}/api/native-main-profiles/switch`, {
         method: "POST",
@@ -508,7 +517,7 @@ describe("native-main process owner lease", () => {
       expect(probeNativeProfileRecoveryState(f.manager.context)).toBe("journal");
 
       successor = new ChildHarness(f, { NATIVE_OWNER_HOLD_RECOVERY: "1" });
-      await successor.waitFor(event => event.event === "listening");
+      await successor.ready();
       await successor.snapshot(isContended);
       await owner.hardKill();
       await switchRequest;
@@ -531,7 +540,7 @@ describe("native-main process owner lease", () => {
       await owner.hardKill();
       if (successor) await successor.hardKill();
     }
-  }, 45_000);
+  }, 120_000);
 
   test("an ambiguous exact residue keeps native-main startup fail closed", async () => {
     const f = fixture("unsafe-residue", false);
@@ -541,7 +550,7 @@ describe("native-main process owner lease", () => {
     linkSync(target, residue);
     const child = new ChildHarness(f);
     try {
-      await child.waitFor(event => event.event === "listening");
+      await child.ready();
       const blocked = await child.snapshot(event => {
         const owner = event.owner as { status?: string } | undefined;
         const gate = event.gate as { status?: string; reason?: string } | undefined;
@@ -555,7 +564,7 @@ describe("native-main process owner lease", () => {
     } finally {
       await child.stop().catch(() => child.hardKill());
     }
-  }, 30_000);
+  }, 120_000);
 
   test("same-process server references retain ownership until the last server stops", async () => {
     const f = fixture("refs-a");
@@ -565,13 +574,13 @@ describe("native-main process owner lease", () => {
     const owner = new ChildHarness(f);
     let contender: ChildHarness | undefined;
     try {
-      await owner.waitFor(event => event.event === "listening");
+      await owner.ready();
       await owner.snapshot(isHeldReady);
       const alias = resolve(f.codexHome, ".", "..", "codex", ".");
       const extra = await owner.command("start-extra-server", { codexHomeAlias: alias });
       expect(extra.ok).toBe(true);
       contender = new ChildHarness(contenderFixture);
-      await contender.waitFor(event => event.event === "listening");
+      await contender.ready();
       await contender.snapshot(isContended);
 
       expect((await owner.command("stop-server", { index: 0 })).ok).toBe(true);
@@ -584,5 +593,5 @@ describe("native-main process owner lease", () => {
       await owner.stop().catch(() => owner.hardKill());
       if (contender) await contender.stop().catch(() => contender!.hardKill());
     }
-  }, 30_000);
+  }, 120_000);
 });
