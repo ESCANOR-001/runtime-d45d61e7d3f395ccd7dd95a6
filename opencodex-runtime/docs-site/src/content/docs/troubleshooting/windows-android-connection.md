@@ -54,3 +54,19 @@ Remodex hides that record and displays the actual user message. Raw response
 annotation markers are also removed from displayed answers, while examples inside
 code remain intact. This changes the phone's presentation; saved conversations are
 not rewritten.
+
+## Development fixes after Rust beta 6
+
+The development source includes these fixes under cross-platform validation.
+They are not included merely by reinstalling the already-published beta 6:
+
+- Windows can give the same folder a short name and a full name. Explicit
+  assistant file links now recognize both names when they resolve to the same
+  local file. A different file with the same filename is still not shared.
+- Upgrading from the older server retains verified attachments when the uploads
+  folder itself is a Windows junction (another name for a folder). Links placed
+  inside the uploads folder remain rejected.
+- A private Claude callback file is explicitly owned by the current user, even
+  when Remodex is started with administrator rights. This prevents its own
+  ownership check from rejecting that file; it does not relax file permissions
+  or require users to disable Defender.
