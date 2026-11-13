@@ -442,7 +442,7 @@ test("two processes at the post-approval management seam serialize instead of in
   const warm = Bun.spawn([process.execPath, "--eval", `
     const { withConfigMutationLockSync } = await import("./src/config.ts");
     withConfigMutationLockSync(() => undefined);
-  `], { cwd: repoRoot, env: sandbox.env, stdout: "pipe", stderr: "pipe" });
+  `], { cwd: repoRoot, env: sandbox.env, stdout: "pipe", stderr: "pipe", windowsHide: true });
   expect(await warm.exited).toBe(0);
 
   const routeScript = (marker: string) => `
@@ -474,6 +474,20 @@ test("two processes at the post-approval management seam serialize instead of in
       },
     };
     const { handleManagementAPI } = await import("./src/server/management-api.ts");
+    // Load both children before racing the post-approval work. Let A persist
+    // its config mutation before B starts that mutation: config-lock contention
+    // is not the catalog serialization this test is meant to exercise.
+    const waitFor = async (path) => {
+      const deadline = Date.now() + 60000;
+      while (!existsSync(path)) {
+        if (Date.now() >= deadline) throw new Error("seam setup barrier timed out: " + path);
+        await Bun.sleep(5);
+      }
+    };
+    writeFileSync(${JSON.stringify(barrier)} + "-ready-" + ${JSON.stringify(marker)}, "ready");
+    await waitFor(${JSON.stringify(barrier)} + "-ready-a");
+    await waitFor(${JSON.stringify(barrier)} + "-ready-b");
+    if (${JSON.stringify(marker)} === "b") await waitFor(${JSON.stringify(barrier)} + "-a");
     const url = new URL("http://localhost/api/providers?name=together");
     const req = new Request(url, {
       method: "PATCH",
@@ -487,7 +501,7 @@ test("two processes at the post-approval management seam serialize instead of in
 
   const children = (["a", "b"] as const).map(marker => Bun.spawn(
     [process.execPath, "--eval", routeScript(marker)],
-    { cwd: repoRoot, env: sandbox.env, stdout: "pipe", stderr: "pipe" },
+    { cwd: repoRoot, env: sandbox.env, stdout: "pipe", stderr: "pipe", windowsHide: true },
   ));
 
   const results = await Promise.all(children.map(async child => {
@@ -536,7 +550,8 @@ test("two processes at the post-approval management seam serialize instead of in
 
   // At least one process must have gotten through to the seam, or this test would
   // be vacuous — two config-lock losers prove nothing about catalog serialization.
-  expect(results.some(r => r.exitCode === 0)).toBe(true);
+  expect({ reachedSeam: results.some(r => r.exitCode === 0), results }).toMatchObject({ reachedSeam: true });
+  expect(existsSync(`${barrier}-a`) && existsSync(`${barrier}-b`)).toBe(true);
 
   // At least one process must reach a real commit, or the race proves nothing:
   // the adapter is total, so a seam that only ever failed would still answer 2xx
@@ -556,4 +571,4 @@ test("two processes at the post-approval management seam serialize instead of in
   const fromA = slugs.some(s => s.includes("seam-model-a"));
   const fromB = slugs.some(s => s.includes("seam-model-b"));
   expect(fromA && fromB).toBe(false);
-}, 30_000);
+}, 120_000);

@@ -26,3 +26,10 @@ jobs:
           bun -e 'if(process.arch !== process.env.RUNNER_ARCH.toLowerCase()) throw Error("Not native ARM"); const {dlopen}=require("bun:ffi"); console.log(dlopen("kernel32.dll", {GetCurrentProcessId:{args:[],returns:"u32"}}).symbols.GetCurrentProcessId())'
       - run: bun install --frozen-lockfile
       - run: bun scripts/test.ts tests/native-main-owner-lifetime.test.ts
+      - name: Repeat post-approval process coordination check
+        shell: pwsh
+        run: |
+          1..3 | ForEach-Object {
+            bun scripts/test.ts tests/codex-retained-root-serialization.test.ts
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }

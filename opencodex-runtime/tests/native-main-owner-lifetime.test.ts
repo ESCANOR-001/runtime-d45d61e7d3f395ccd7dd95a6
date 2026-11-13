@@ -219,8 +219,10 @@ class ChildHarness {
 
   async ready(): Promise<Event> {
     // Loading the full source server on a cold Windows runner is setup work.
-    // Keep the shorter ten-second deadline for ownership/recovery operations.
-    const ready = await this.waitFor(event => event.event === "listening", 30_000);
+    // Give imports their own bounded budget; server startup and ownership
+    // operations still have the shorter ten-second deadline.
+    await this.waitFor(event => event.event === "modules-loaded", 90_000);
+    const ready = await this.waitFor(event => event.event === "listening");
     const boot = this.events.find(event => event.event === "booting");
     if (boot) console.log(`owner fixture startup: ${Date.now() - Number(boot.at)}ms`);
     return ready;
@@ -439,7 +441,7 @@ describe("native-main process owner lease", () => {
       if (second) await second.stop().catch(() => second!.hardKill());
       if (support) await support.stop().catch(() => support!.hardKill());
     }
-  }, 120_000);
+  }, 300_000);
 
   test("a hard-killed owner releases the OS lease and the successor recovers before opening main", async () => {
     const f = fixture("crash-a", false);
@@ -483,7 +485,7 @@ describe("native-main process owner lease", () => {
       await owner.stop().catch(() => owner.hardKill());
       if (successor) await successor.stop().catch(() => successor!.hardKill());
     }
-  }, 120_000);
+  }, 300_000);
 
   test("a successor scrubs a hard-killed production auth write before recovery or main admission", async () => {
     const f = fixture("temp-crash", false);
@@ -540,7 +542,7 @@ describe("native-main process owner lease", () => {
       await owner.hardKill();
       if (successor) await successor.hardKill();
     }
-  }, 120_000);
+  }, 300_000);
 
   test("an ambiguous exact residue keeps native-main startup fail closed", async () => {
     const f = fixture("unsafe-residue", false);
@@ -564,7 +566,7 @@ describe("native-main process owner lease", () => {
     } finally {
       await child.stop().catch(() => child.hardKill());
     }
-  }, 120_000);
+  }, 300_000);
 
   test("same-process server references retain ownership until the last server stops", async () => {
     const f = fixture("refs-a");
@@ -593,5 +595,5 @@ describe("native-main process owner lease", () => {
       await owner.stop().catch(() => owner.hardKill());
       if (contender) await contender.stop().catch(() => contender!.hardKill());
     }
-  }, 120_000);
+  }, 300_000);
 });
