@@ -31,7 +31,7 @@ Oversized WebSocket tests await the request using native promises before asserti
 
 ## Local checks
 
-Requires Bun 1.3.14 and Node.js 20.9 or newer.
+Requires Bun 1.4.4 and Node.js 20.9 or newer.
 
 ```sh
 cd opencodex-runtime
@@ -45,3 +45,5 @@ bun run privacy:scan
 ## Updating this snapshot
 
 Review each server-only export and scan for secrets before committing. Never mirror the private repository, push its history, or copy local configuration, environment files, signing keys, phone data, build outputs, or logs. Keeping a repository name obscure does not protect uploaded information.
+
+The compatibility runtime now pins Bun 1.4.4: the previous 1.3.14 lacks the native Windows ARM FFI support used for trusted system paths and account permissions. Focused real ARM tray/permission checks passed before the full matrix was started. No permissions were weakened.
