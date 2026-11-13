@@ -343,12 +343,15 @@ describe("storage mutation coordinator", () => {
       });
 
       const restoredPath = join(home, "archived_sessions", "rollout-old.jsonl");
+      const quarantinedPath = join(trashStage, "rollout-old.jsonl");
       const movedDeadline = Date.now() + 8000;
-      while (!existsSync(restoredPath) && Date.now() < movedDeadline) {
+      // A no-overwrite move can briefly expose both names before unlinking the
+      // quarantine source. Wait for the completed move, not its first step.
+      while ((!existsSync(restoredPath) || existsSync(quarantinedPath)) && Date.now() < movedDeadline) {
         await Bun.sleep(20);
       }
       expect(existsSync(restoredPath)).toBe(true);
-      expect(existsSync(join(trashStage, "rollout-old.jsonl"))).toBe(false);
+      expect(existsSync(quarantinedPath)).toBe(false);
       expect(existsSync(join(trashStage, "restore-pending.json"))).toBe(true);
 
       const quarantineDuring = await fetch(new URL("/api/storage/cleanup", server.url), {
