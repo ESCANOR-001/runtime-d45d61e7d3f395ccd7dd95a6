@@ -21,6 +21,7 @@ import { claimOwnedServiceHome, ownedServiceBunArgs } from "./helpers/owned-serv
 
 const repoRoot = resolve(import.meta.dir, "..");
 const sandboxes: Sandbox[] = [];
+const discoveryServers: Array<ReturnType<typeof Bun.serve>> = [];
 
 interface Sandbox {
   readonly root: string;
@@ -152,6 +153,7 @@ function seedCatalog(sandbox: Sandbox, bytes = catalogBytes()): string {
 }
 
 afterEach(() => {
+  for (const server of discoveryServers.splice(0)) server.stop(true);
   const identity = resolveEffectiveUserIdentity();
   for (const sandbox of sandboxes.splice(0)) {
     const database = resolveCodexCatalogSerializationDatabasePath(identity, sandbox.codexHome);
@@ -435,6 +437,25 @@ test("two processes at the post-approval management seam serialize instead of in
   const catalogPath = seedCatalog(sandbox);
   const seeded = readFileSync(catalogPath, "utf8");
   const barrier = join(sandbox.root, "seam-barrier");
+  // Use a real loopback provider, rather than replacing global fetch in an
+  // eval child. All discovery traffic must reach the synchronization barrier;
+  // a fallback after a real internet request would make this race vacuous.
+  const discovery = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const marker = new URL(request.url).pathname.split("/")[1];
+      if (marker !== "a" && marker !== "b") return new Response(null, { status: 404 });
+      writeFileSync(`${barrier}-${marker}`, "here");
+      const deadline = Date.now() + 8000;
+      while (!existsSync(`${barrier}-a`) || !existsSync(`${barrier}-b`)) {
+        if (Date.now() >= deadline) return new Response("discovery barrier timed out", { status: 504 });
+        await Bun.sleep(5);
+      }
+      return Response.json({ data: [{ id: `seam-model-${marker}` }] });
+    },
+  });
+  discoveryServers.push(discovery);
 
   // Warm the config ownership + mutation database in a single process first.
   // Two cold processes otherwise race to create `.opencodex-owner.json` and both
@@ -447,19 +468,6 @@ test("two processes at the post-approval management seam serialize instead of in
 
   const routeScript = (marker: string) => `
     import { existsSync, writeFileSync } from "node:fs";
-    // The stub lives on globalThis, NOT on the provider row. Catalog admission
-    // encodes the config to derive its identity and refuses a function member, so
-    // a per-provider \`fetch\` makes the seam throw before it can converge — which
-    // looked exactly like a production defect until the encoder said so.
-    globalThis.fetch = async () => {
-      writeFileSync(${JSON.stringify(barrier)} + "-" + ${JSON.stringify(marker)}, "here");
-      const deadline = Date.now() + 8000;
-      while (Date.now() < deadline) {
-        if (existsSync(${JSON.stringify(barrier)} + "-a") && existsSync(${JSON.stringify(barrier)} + "-b")) break;
-        await Bun.sleep(5);
-      }
-      return Response.json({ data: [{ id: "seam-model-" + ${JSON.stringify(marker)} }] });
-    };
     const config = {
       port: 10100,
       codexConfigWriteConsent: ${JSON.stringify(join(sandbox.codexHome, "config.toml"))},
@@ -467,8 +475,10 @@ test("two processes at the post-approval management seam serialize instead of in
       providers: {
         together: {
           adapter: "openai-chat",
-          baseUrl: "https://api.together.xyz/v1",
+          baseUrl: ${JSON.stringify(`${discovery.url}${marker}/v1`)},
           apiKey: "seam-key",
+          allowPrivateNetwork: true,
+          liveModels: true,
           models: ["fallback-model"],
         },
       },
@@ -496,7 +506,7 @@ test("two processes at the post-approval management seam serialize instead of in
     });
     const response = await handleManagementAPI(req, url, config);
     const body = await response.json();
-    console.log(JSON.stringify({ status: response.status, catalogRefresh: body.catalogRefresh }));
+    console.log(JSON.stringify({ status: response.status, catalogRefresh: body.catalogRefresh, error: body.error }));
   `;
 
   const children = (["a", "b"] as const).map(marker => Bun.spawn(
@@ -512,6 +522,7 @@ test("two processes at the post-approval management seam serialize instead of in
     ]);
     return { exitCode, stdout, stderr };
   }));
+  if (results.some(result => result.exitCode !== 0)) console.error("seam child failures", results);
 
   for (const result of results) {
     // A process can lose a race BEFORE approval and never reach the seam at all.
@@ -570,5 +581,6 @@ test("two processes at the post-approval management seam serialize instead of in
   const slugs = parsedCatalog.models.flatMap(m => typeof m.slug === "string" ? [m.slug] : []);
   const fromA = slugs.some(s => s.includes("seam-model-a"));
   const fromB = slugs.some(s => s.includes("seam-model-b"));
+  expect(fromA || fromB).toBe(true);
   expect(fromA && fromB).toBe(false);
 }, 120_000);
