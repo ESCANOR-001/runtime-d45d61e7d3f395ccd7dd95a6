@@ -503,9 +503,14 @@ route. Pass `"haiku"` as the model placeholder.
 
 ### Add a project from Android
 
-In the new-chat composer, tap the project selector, then **Add project folder**.
-Folder browsing stays in the same bottom sheet. Browse the paired PC, use **Up
-one level**, or enter a folder path and tap its arrow. Choose **Select this folder**
+In the new-chat composer, tap the project selector. Choose **No Project** for a
+general chat, or **Add project folder** to browse the paired PC.
+Folder browsing stays in the same expanded bottom sheet. Use **Up one level**,
+search by file or folder name, or enter a path. File results open their containing
+folder. Choose **Select this folder**
 to use an existing folder. **Create folder** lets you name a new folder inside the
 current one; **Create and select folder** adds it to your projects and selects it
 for the draft. Back returns to the project list without losing your draft.
+These controls are available in both agents. See
+[Android projects and PC availability](/guides/android-project-picker/) for search
+limits and automatic connection refresh.

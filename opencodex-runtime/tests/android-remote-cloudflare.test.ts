@@ -142,6 +142,23 @@ async function waitForTunnelState(
 }
 
 describe("Android Remote Cloudflare tunnel", () => {
+  test("verified quick handoff retains the original connector when the old owner stops", async () => {
+    let kills = 0;
+    const child = { ...fakeProcess("https://retained-upgrade.trycloudflare.com"), pid: 4321, upgradeRetainable: true,
+      kill() { kills++; } };
+    const tunnel = new ManagedAndroidRemoteCloudflareTunnel(new MemorySecretStore(), tunnelDeps(child, { platform: 'win32' }));
+    await tunnel.apply(quickInput);
+    await waitForReady(tunnel);
+    const handoff = tunnel.quickUpgradeHandoff()!;
+    expect(handoff.pid).toBe(4321);
+    expect(() => tunnel.retainQuickForUpgrade({ ...handoff, pid: 9999 })).toThrow();
+    expect(kills).toBe(0);
+    expect(tunnel.state().status).toBe('ready');
+    tunnel.retainQuickForUpgrade(handoff);
+    await tunnel.stop();
+    expect(kills).toBe(0);
+    expect(tunnel.quickUpgradeHandoff()).toBeNull();
+  });
   for (const mode of ["quick", "named"] as const) {
     test(`does not probe a ${mode} website until registration, including dashboard checks`, async () => {
       const child = controlledProcess();

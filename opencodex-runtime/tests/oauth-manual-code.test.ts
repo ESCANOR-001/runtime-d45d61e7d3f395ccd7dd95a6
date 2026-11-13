@@ -7,10 +7,12 @@ import {
   cancelLoginFlow,
   clearLoginState,
   getLoginStatus,
+  OAUTH_PROVIDERS,
   startLoginFlow,
   submitManualLoginCode,
 } from "../src/oauth";
 import { parseCallbackInput } from "../src/oauth/callback-server";
+import { XaiOAuthFlow } from "../src/oauth/xai";
 import { saveConfig } from "../src/config";
 import { startServer } from "../src/server";
 import type { OcxConfig } from "../src/types";
@@ -52,17 +54,30 @@ describe("parseCallbackInput kinds", () => {
 });
 
 describe("OAuth manual login code fallback", () => {
+  let originalLogin: typeof OAUTH_PROVIDERS.xai.login;
+
   beforeEach(() => {
     previousOpencodexHome = process.env.OPENCODEX_HOME;
     if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     clearLoginState("xai");
+    originalLogin = OAUTH_PROVIDERS.xai.login;
+    OAUTH_PROVIDERS.xai.login = ctrl => {
+      const flow = new XaiOAuthFlow(ctrl);
+      // These tests deliver the code through the manual-input slot, not the
+      // browser callback. Keep the real flow and provider's fixed redirect URI,
+      // but bind its unused listener to an OS-selected port: Windows can reserve
+      // 56121, and a real login on the test machine may already be using it.
+      flow.preferredPort = 0;
+      return flow.login();
+    };
   });
 
   afterEach(() => {
     cancelLoginFlow("xai");
     clearLoginState("xai");
+    OAUTH_PROVIDERS.xai.login = originalLogin;
     if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
     else process.env.OPENCODEX_HOME = previousOpencodexHome;
     if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
@@ -137,6 +152,7 @@ describe("OAuth manual login code fallback", () => {
       const state = authUrl.searchParams.get("state")!;
       const challenge = authUrl.searchParams.get("code_challenge")!;
       const redirectUri = authUrl.searchParams.get("redirect_uri")!;
+      expect(redirectUri).toBe("http://127.0.0.1:56121/callback");
       expect(state).toBeTruthy();
       expect(challenge).toBeTruthy();
 

@@ -13,9 +13,9 @@ The Android application, native desktop installer project, credentials, machine 
 - Original licensing remains in `opencodex-runtime/LICENSE`.
 - Embedded third-party Google OAuth client credentials are not distributed here. The legacy Antigravity integration requires explicit `GOOGLE_ANTIGRAVITY_CLIENT_ID` and `GOOGLE_ANTIGRAVITY_CLIENT_SECRET` environment settings; missing settings fail before network access. This does not affect the ChatGPT/Codex connection flow. CI uses synthetic values only in mocked OAuth tests.
 
-## Windows and macOS CI
+## Six-platform CI
 
-The root workflow uses standard `windows-2025` and `macos-15` runners, with four shards per OS. It runs on pushes, pull requests, or manual dispatch. It does not run Linux jobs or use repository secrets, publishing permissions, or private-repository checkout tokens.
+The root workflow uses Ubuntu 24.04, Windows 2025/11 ARM, and macOS 15 on x64 and ARM64 runners, with four shards per platform. It verifies the actual Bun architecture. It runs on pushes, pull requests, or manual dispatch, with read-only permissions and no repository secrets or publishing.
 
 The manually dispatched **Focused runtime regression checks** workflow runs the oversized-response and history-worker cases on both operating systems without rebuilding the dashboard.
 

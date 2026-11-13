@@ -434,6 +434,14 @@ Live session replay and saved history use `desktop-thread-item.ts` for the same 
 conversion. `item_started`/`item_completed` events publish public tools immediately, including
 additional tools inside code-mode wrappers. A single inferred wrapper row is replaced by the first
 canonical tool, with its position retained; later polls of an existing command do not add tools.
+Explicit command-session results keep an inferred command running until its exit or canonical
+completion. Live-stream and saved-history command rows converge on the same process identity.
+Before its first process receipt, only an unambiguous matching command within five seconds
+can replace an inferred placeholder; distinct canonical commands never merge. Poll results update
+that same row. A bounded, turn-scoped identity cache also joins
+late canonical command records after their wrapper has finished, requiring the same command and
+execution interval. It retains no wrapper source or output. Unknown or ambiguous results retain
+the existing fallback rather than guessing which process ran.
 Structured assistant/reasoning echoes retain their ids and private compaction answers stay hidden.
 Initial replay advances only through a complete newline, retaining partial UTF-8/JSON records for
 the next append. File truncation/replacement resets the projector and requests a bounded history

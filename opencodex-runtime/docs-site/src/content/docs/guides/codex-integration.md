@@ -28,6 +28,119 @@ The choice is durable. Native mode stores `clientIntegrations.codex = false`, so
 `rmx start` does not silently inject routing again. Switching modes converges the Codex artifacts
 without stopping the proxy or Android Remote.
 
+Android's composer supports **No Project**, selecting an existing project, and
+**Add project folder**. See [Android projects and PC availability](/guides/android-project-picker/)
+for folder creation, name/path search, and automatic connection refresh.
+
+Opening or browsing an existing Codex chat on Android leaves the Desktop view
+where it is. Reconnecting, reading older messages, and expanding work activity
+also read history without opening that chat in Desktop. Sending a prompt may
+activate the original Desktop chat when its owner needs to be loaded; the bridge
+does not start a competing CLI session to continue it.
+
+The connection stays responsive while chats are idle or history is loading.
+Read-only followers promptly decline Desktop requests to handle other chats, so
+an open Android connection does not add a discovery timeout to a later send.
+If delivery cannot be confirmed, the bridge preserves history and does not
+automatically replay the prompt.
+
+With the native Rust Desktop connection, new Codex chats are discovered automatically
+while the bridge is running, normally within a few seconds. Discovery reads small pages
+of chat metadata through Codex CLI; older inventory pages are checked in the background.
+It reuses existing project folders and Android chat identities, preserves hidden chats,
+and does not switch Desktop's selected chat. Conversation history loads separately
+through the existing read-only history connection.
+
+Chats started on Android are saved by Codex in the same native profile. The Rust
+bridge also notifies Desktop to refresh its task list after accepted user messages
+and completed turns, so a new chat does not wait for an unrelated sidebar refresh.
+The notification preserves the selected Desktop chat and never claims execution
+ownership. Bursts are coalesced; if Desktop is offline, one pending refresh is
+retried when its connection returns. Bridge startup refreshes the list for saved
+Android-created chats as well. A **No Project** chat belongs under **Tasks**.
+
+When Desktop continues a chat that started on Android, the bridge verifies its
+existing Desktop owner and follows that same session. Android keeps the native
+chat ID and saved history, and later prompts go to that owner. The bridge checks
+ownership before sending to avoid starting a second writer. Small metadata checks
+also refresh running and completed states while Android stays on the chat list;
+unchanged chats do not repeatedly load their transcripts. These checks never
+switch Desktop's selected chat.
+
+In Codex chats, **Add** separates installed **Plugins**, configured **MCP servers**, and
+**Skills**. Search the sheet by name or description, then tap an entry to include its
+exact reference in your prompt. Disabled MCP servers cannot be selected; enable them
+in Codex's PC settings first. Selecting an entry does not install software or change
+permissions. Access mode remains in the composer's access selector.
+
+The Rust bridge reads these catalogs through Codex CLI's read-only APIs. Opening the
+menu does not start MCP servers or transmit their credentials to Android. Codex starts
+or uses the selected capabilities when processing the prompt; any required sign-in or
+approval still applies.
+
+The status panel's **Thread ID** is Codex's native chat ID, whether the chat started
+on Android or Desktop. Copying it copies that same ID. New chats show it once
+Codex has created the session. Remodex keeps its internal routing keys separate
+without moving or renaming your history.
+
+For a Codex chat still owned by Remodex, editing the latest prompt uses that chat's
+CLI connection even when the PC also has a Desktop connection configured. The
+bridge prepares a separate native history and saves the previous revision before
+applying the edit. It leaves the original history intact if preparation fails.
+The unchanged original revision is not rediscovered as a second Android chat.
+If you later continue that original conversation in Codex, it can appear again.
+
+The chat status panel shows Codex's last reported **Context** usage against its
+reported context window, plus the reported account **Usage limit**. These are
+different: context measures this conversation, while account limits are shared
+across your Codex usage. Desktop-owned chats recover context from Codex's saved
+usage events without resuming the chat. Account limits use Codex's read-only
+account API with a short cache, rather than an old chat's allowance. The latest measurements
+remain available when earlier messages or work activity are not loaded. Values
+update when Codex reports new measurements; unavailable values are never guessed.
+
+Long-running commands keep one activity row on Android while Codex polls for their results.
+Waiting for an execution cell updates that same command. The final saved command replaces its
+temporary activity instead of adding a duplicate.
+
+Android tool summaries use at most two lines. Tap a summary to open a details sheet with
+the recorded command or input, status, and output. For a row grouping several invocations,
+use **Previous call** and **Next call** to inspect each one. Output is read from Codex only
+when requested and shown in bounded pages; **More output** advances to the next page.
+**Refresh details** checks for output from a running tool. Codex may not have saved output
+yet or may retain only a truncated result; Remodex displays the available record without
+rerunning the command, resuming a session, or switching the Desktop chat.
+If a running tool has not reached saved history yet, its live command remains visible
+with **Running** and **No output yet**. Refresh after completion to load the saved output.
+
+The Codex **Add** menu includes **Upload file** as well as photos. Files are staged on
+the paired PC and referenced in the prompt; images use Codex's native image input.
+The updated native bridge supports resumable uploads up to 100 MiB per file and
+250 MiB combined, with eight attachments per message. See [Android uploads](/guides/connect-prototype/#uploading-attachments-from-android) for progress, retry, and model-input behavior. Legacy inline uploads retain their 10 MiB/file and 40 MiB/message limits.
+Tap an uploaded text-file link to preview it. The preview reads only that chat's
+referenced file and returns at most 256 KiB; it does not allow browsing the private
+upload folder or another chat's attachments.
+
+While a Codex chat is open, Android prepares activity for eligible responses already
+loaded in the conversation, starting with the most recent. This includes completed **Worked** sections and earlier
+live activity after reopening a running response. Expanding a prepared section displays its
+cached contents immediately. Preparation runs one response at a time with a bounded memory
+budget; an unusually large or newly opened response may still need more pages when expanded.
+Leaving the chat or backgrounding the app stops preparation. Older conversations still load
+only when requested.
+
+The live history window follows each new response, including responses started from Desktop.
+Progress text and its surrounding tools are restored together in chronological order; an
+older response boundary is not reused for a new task.
+
+Generic **Command Execution** rows remain visible during a running task and are hidden
+once they belong to its completed **Worked** section. Searches, file reads, file changes,
+other tool activities, and public progress messages remain in their original order.
+Collapsing a section stops an unfinished activity load; reopening resumes its retained cursor.
+Claude's activity display and loading policy are unchanged.
+While context compaction is running, the activity shimmer belongs
+to **Compacting context**, even if a delayed command update arrives afterward.
+
 ## Config injection
 
 `rmx init`, `rmx start`, and `rmx sync` call the injector. On the default loopback bind, it keeps
@@ -381,3 +494,23 @@ The desktop shell then offers **Start Proxy** from the same one-click control af
 When Remodex runs as a managed [background service](/reference/cli/#rmx-service), it sets
 `OCX_SERVICE=1` so a service-driven restart does **not** thrash the Codex config — only an explicit
 `rmx stop` / `rmx service stop` restores native Codex.
+
+For Desktop-owned chats, Steer is sent through the original Desktop owner with the message restore context and any already uploaded image input. The bridge accepts confirmation only for the expected turn. An unconfirmed or rejected steering message is not replayed automatically, and does not stop or replace the original task.
+
+Watching a Desktop-owned Codex task does not use a Remodex execution slot, so it does not prevent sending in another chat. After a connection drops, Steer and question answers briefly wait to reconnect to the same native turn. If that turn changes or the connection cannot be recovered, the bridge reports that nothing was sent. If a normal send races a task starting in Desktop, it is queued after that task.
+
+During automatic compaction within a running task, Codex can accept steering input for that task. A separate, manually started compaction task cannot be steered; its native rejection is shown without resending or interrupting it. Queue a follow-up to run after that task finishes.
+
+Android also shows images generated or viewed by Codex in their original activity positions. Tap **View Images** to load previews, then tap a preview to open the full image. Opening a chat does not download these images. A viewed image can come from outside the chat's original folder; the bridge shares only that image through a chat-scoped copy, without granting access to the surrounding folder.
+
+### Android commands and task outcomes
+
+The next Android/bridge update adds a composer command menu. Type `/` to see commands for model and permissions, plan mode, status and usage, file changes, skills, plugins, MCP servers, file mentions, and copying the last response. `/help` lists the supported commands. Terminal-only Codex commands are not advertised as Android actions.
+
+Use `/compact` without a numeric argument in an idle existing chat. The bridge invokes Codex's `thread/compact/start` operation with the same native thread ID. It does not send the command as a prompt, create a new chat, or replay an uncertain request. The command appears only when the connected bridge exposes this capability.
+
+Codex errors are retained in the transcript and shown with the provider's actual explanation, including remote compaction failures, bad requests, and usage limits. Retry notices remain distinct from terminal failures. A task ending with an error is marked failed; a progress paragraph is not relabeled as a final answer. Errors remain visible when Work is collapsed and when the chat is reopened.
+
+The thread list keeps status text on one line. Running uses blue shimmer and Compacting context uses white shimmer. Completed is static green; paused and other attention states are static yellow.
+
+Assistant-shared image and file links can resolve an exact file outside the project folder, including on mounted drives. This grants access to that linked file, not its parent directory. Thumbnail loading is bounded and offers retry on failure; full image bytes are fetched on tap. A missing or unmounted source must become available on the PC before it can be fetched.

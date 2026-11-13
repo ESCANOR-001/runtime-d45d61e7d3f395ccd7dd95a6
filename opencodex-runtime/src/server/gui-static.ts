@@ -18,7 +18,7 @@ const MIME_TYPES: Record<string, string> = {
   ".ico": "image/x-icon",
 };
 
-function findGuiDist(): string | null {
+export function findGuiDist(): string | null {
   const candidates = [
     join(import.meta.dir, "..", "..", "gui", "dist"),
     join(import.meta.dir, "..", "..", "..", "gui", "dist"),

@@ -1,4 +1,9 @@
+import { reconcileUpgradeCheckpoints } from './upgrade-claude-checkpoints';
+import { keyringAccount as nativeTunnelAccount } from './cloudflare-secret';
+import { resolveCloudflared as nativeTunnelExecutable } from './cloudflared';
+import { assertUpgradeSourceAvailable } from './upgrade-source-hold';
 import { ManagedClaudeCode } from "../claude-code/managed";
+import { searchProjectFolders } from "./folder-search";
 import { claudeProjectRoot, claudeProjectEntries, claudeProjectFile, claudeProjectDiff } from "../claude-code/project-files";
 import { confirmNativeTurnStopped, readNativeStopState, pauseNativeGoal, nativeStartDefinitelyRejected } from "./native-turn-lifecycle";
 import { codexAccountQuotaReport } from "./codex-account-usage";
@@ -21,6 +26,12 @@ import { basename, dirname, isAbsolute, join, parse, resolve } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
 import { getConfigDir } from "../config";
 import { getCodexHome } from "../codex/paths";
+import { UpgradeAdmission, UPGRADE_BUSY, assertSettledExport, emptyUpgradeDraft, exportOwnedUpgrade, readOwnedExportThread, type UpgradeExportChat } from './upgrade-export';
+import { annotateUpgradeAlias, desktopUpgradeAliases, readMissingDesktopUpgradeHeaders, retainUnavailableCodexMetadata, unmappedDraftSelectionIds } from './upgrade-desktop-inventory';
+import { upgradeProjects } from './upgrade-projects';
+import { assertUpgradeableConnection } from './upgrade-connection';
+import type { UpgradeRuntime } from './upgrade-startup';
+import { optionalUpgradeProfile, type UpgradeProfiles } from './upgrade-profiles';
 import { redactSecretString } from "../lib/redact";
 import { commandInvocation } from "../lib/win-exec";
 import type { ManagementModelRow } from "../server/management/model-rows";
@@ -74,6 +85,7 @@ import {
   type ProjectedThreadStreamState,
 } from "./thread-stream";
 import {
+  androidAttachmentRoot,
   stageAndroidAttachments,
   sweepOldAndroidAttachments,
 } from "./attachments";
@@ -91,6 +103,7 @@ import {
 } from "./desktop-session-stream";
 import {
   AndroidDesktopIpcLiveSync,
+  desktopIpcSocketPaths,
   DesktopIpcOwnershipError,
   type DesktopThreadOwnership,
   type DesktopThreadOwnershipState,
@@ -346,6 +359,7 @@ interface CodexRuntimeLike {
   start(): Promise<AndroidCodexClient>;
   stop(): Promise<void>;
   status?(): { connected: boolean; error?: string };
+  upgradeExecutable?(): Promise<string>;
 }
 
 export type AndroidRemoteGatewayOptions = {
@@ -2054,6 +2068,7 @@ export function androidRemoteSubscriptionFingerprint(value: unknown): string {
 export class AndroidRemoteGatewayController {
   private managedClaude: ManagedClaudeCode | null = null;
   claudeCode(): ManagedClaudeCode {
+    assertUpgradeSourceAvailable(this.store.stateRoot ?? getConfigDir());
     return this.managedClaude ??= new ManagedClaudeCode(join(this.store.stateRoot ?? getConfigDir(), "managed-claude-code"));
   }
   readonly auth: AndroidRemoteAuth;
@@ -2089,6 +2104,187 @@ export class AndroidRemoteGatewayController {
   private readonly sockets = new Set<ServerWebSocket<GatewayWsData>>();
   private readonly socketsByClient = new Map<string, Set<ServerWebSocket<GatewayWsData>>>();
   private readonly projects = new Map<string, DraftProject>();
+  private readonly upgradeAdmission = new UpgradeAdmission();
+
+  async nativeUpgradeRuntime(gui: string): Promise<UpgradeRuntime> {
+    if (this.gatewayStatus !== 'ready' || !this.server || !this.runtime.upgradeExecutable) throw new Error(UPGRADE_BUSY);
+    // Preserve the selected connection. An unused quick tunnel must not block
+    // an explicitly selected, listening LAN connection.
+    const settings = this.store.read().settings;
+    const inheritedQuick = this.cloudflareTunnel.quickUpgradeHandoff?.() ?? null;
+    assertUpgradeableConnection(settings, this.listeningOnLocalNetwork, this.cloudflareTunnel.state().status, Boolean(inheritedQuick));
+    const named = settings.tunnelMode === 'named' ? { hostname: settings.namedTunnelHostname, account: nativeTunnelAccount(), origin: `127.0.0.1:${this.boundPort}` } : undefined;
+    if (named && (!named.hostname || !(await this.cloudflareTunnel.configuration(settings)).hasNamedTunnelToken)) throw new Error('The saved named tunnel is unavailable; the current bridge remains active.');
+    const codex = await realpath(await this.runtime.upgradeExecutable());
+    const claudeProfile = await optionalUpgradeProfile(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), Boolean(process.env.CLAUDE_CONFIG_DIR));
+    const claude = claudeProfile ? await realpath(this.claudeCode().upgradeExecutable()) : undefined;
+    const profiles: UpgradeProfiles = { codex: await realpath(getCodexHome()), ...(claudeProfile ? { claude: claudeProfile } : {}) };
+    const catalog = record(await this.requireCodex().request('model/list', { limit: 200 }));
+    const defaults = Array.isArray(catalog?.data) ? catalog.data.filter((m: JsonRecord) => m.isDefault === true) : [];
+    const model = defaults.length === 1 ? stringValue(record(defaults[0])?.model, 256) : '';
+    if (!model) throw new Error('The native upgrade could not resolve the current default Codex model.');
+    const workspace = await realpath(homedir());
+    const socket = desktopIpcSocketPaths()[0];
+    if (!socket) throw new Error('Desktop connection discovery is unavailable on this platform.');
+    const host = this.server.hostname ?? '127.0.0.1';
+    const bind = `${host.includes(':') ? `[${host}]` : host}:${this.boundPort}`;
+    return { profiles, bind, publicUrl: this.pairingUrls()[0]!, gui: await realpath(gui), configuration: {
+      max_active_chats: 4, workspace,
+      connection: { dashboard_bind: "127.0.0.1:10100", label: this.environmentDescriptor().label,
+        ...(inheritedQuick ? { cloudflared: inheritedQuick.executable, inherited_quick_tunnel: {
+          ...inheritedQuick, origin: `127.0.0.1:${this.boundPort}`, environment_id: this.environmentId,
+        } } : {}),
+        ...(named ? { named_tunnel: named, cloudflared: await realpath((await nativeTunnelExecutable()).path) } : {}) },
+      codex: { executable: codex, profile: profiles.codex, model,
+        shared_server: { desktop_endpoint: { path: socket }, reader_executable: codex, reader_workspace: workspace,
+          ...(profiles.codex === await realpath(join(homedir(), ".codex")).catch(() => "") ? { activation: { kind: "system" } } : {}) } },
+      ...(claude ? { claude: { executable: claude, profile: claudeProfile, model: 'default',
+        remote_control: this.claudeCode().syncSettings().desktopSync } } : {}),
+    } };
+  }
+
+  private assertNativeUpgradeSettled(connection: ReturnType<AndroidRemoteStore['read']>, desktopChats: ReadonlySet<string>, claude: ManagedClaudeCode) {
+    // Use the owner captured before placing the source hold. The public getter
+    // intentionally rejects attempts to acquire workers after that boundary.
+    claude.assertUpgradeSettled();
+    // These questions are observations of the original Desktop owner. Its
+    // verified history reference retains them; closing this observer neither
+    // answers nor cancels them. Native requests owned here must still drain.
+    if (this.pendingRequests.size
+      || [...this.pendingDesktopUserInputs.values()].some(input => !desktopChats.has(input.nativeThreadId))
+      || [...this.knownActiveTurnIds.keys()].some(id => !desktopChats.has(this.nativeThreadId(id)))
+      || this.queuedTurns.size || this.queuedTurnStarts.size || this.queuedTurnStartFlights.size
+      || this.queuedSteerFlights.size || this.pendingSteerDeliveries.size || this.inFlightDispatches.size
+      || this.threadMutationFlights.size || JSON.stringify(this.store.read()) !== JSON.stringify(connection)) throw new Error(UPGRADE_BUSY);
+  }
+
+  /** Explicit local lifecycle operation. It never discovers or stops another
+   * bridge, Desktop process, or externally owned native session. */
+  async exportForNativeUpgrade(directory: string, profiles: UpgradeProfiles, stopOwner?: () => Promise<void>) {
+    const release = await this.upgradeAdmission.reserveWhenSettled();
+    let releaseClaude: (() => void) | undefined;
+    let delegated = false;
+    try {
+      const inheritedQuick = this.cloudflareTunnel.quickUpgradeHandoff?.() ?? null;
+      const codexProfile = profiles.codex;
+      if (!codexProfile || await realpath(codexProfile) !== await realpath(getCodexHome())
+        || profiles.claude !== await optionalUpgradeProfile(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), Boolean(process.env.CLAUDE_CONFIG_DIR))) throw new Error(UPGRADE_BUSY);
+      const claude = this.claudeCode();
+      releaseClaude = await claude.prepareUpgradeExport();
+      const saved = claude.upgradeExportRecords();
+      const claudeProfile = profiles.claude;
+      if (!claudeProfile && saved.sessions.length) throw new Error('Saved Claude chats need their original profile before upgrading. The current bridge remains active.');
+      const connection = structuredClone(this.store.read());
+      const desktopChats = new Set<string>();
+      const assertSettled = () => this.assertNativeUpgradeSettled(connection, desktopChats, claude);
+      const unavailable = new Set<string>();
+      const discovered = await readMissingDesktopUpgradeHeaders(this.requireCodex(), codexProfile,
+        new Set(connection.threadAliases.map(alias => alias.nativeThreadId)),
+        async id => await this.desktopIpc.hasLiveThreadOwner?.(id) ?? null,
+        { selections: new Set((connection.taskSelections ?? []).map(row => row.nativeThreadId)),
+          unmappedDrafts: unmappedDraftSelectionIds(connection),
+          retainUnavailable: id => unavailable.add(id) });
+      const exportedConnection = retainUnavailableCodexMetadata(connection, unavailable);
+      for (const alias of exportedConnection.threadAliases) {
+        const ownership = fallbackOwnershipState(this.desktopIpc, alias.nativeThreadId);
+        if (ownership.state === 'local-owned' && !ownership.everDesktopOwned) continue;
+        if ((await this.desktopIpc.hasLiveThreadOwner?.(alias.nativeThreadId)) == null) throw new Error(UPGRADE_BUSY);
+        const header = record(record(await this.requireCodex().request('thread/read', {
+          threadId: alias.nativeThreadId, includeTurns: false,
+        }))?.thread);
+        if (!header || header.id !== alias.nativeThreadId || typeof header.cwd !== 'string'
+          || !isAbsolute(header.cwd) || typeof header.path !== 'string') throw new Error(UPGRADE_BUSY);
+        // A Desktop folder move can outlive the phone's last cached alias.
+        // Reconcile only the exported copy and recheck it before handoff.
+        alias.cwd = header.cwd;
+        desktopChats.add(alias.nativeThreadId);
+        Object.assign(alias, { externalCodex: true });
+      }
+      const registered = await this.desktopWorkspaceReader(discovered);
+      if (registered.threads.length !== discovered.length
+        || registered.threads.some((thread, i) => thread.id !== discovered[i]?.id)) throw new Error(UPGRADE_BUSY);
+      const inventory = desktopUpgradeAliases(registered.threads, projectCodexShellSnapshot(registered.threads, 0));
+      const remoteIds = new Set(exportedConnection.threadAliases.map(alias => alias.remoteThreadId));
+      for (const alias of inventory.aliases) {
+        if (remoteIds.has(alias.remoteThreadId)) throw new Error(UPGRADE_BUSY);
+        remoteIds.add(alias.remoteThreadId);
+        desktopChats.add(alias.nativeThreadId);
+        exportedConnection.threadAliases.push(alias);
+      }
+      assertSettled();
+      const exportedProjects = upgradeProjects([
+        Array.isArray(this.shellCache?.projects) ? this.shellCache.projects as JsonRecord[] : [],
+        [...this.projects.values()], inventory.projects, registered.projects,
+      ], this.desktopProjectFallbackTimestamp);
+      const claudeTranscripts = new Map<string, string>();
+      const retainedClaudeDrafts: unknown[] = [];
+      if (claudeProfile) {
+        const projects = await readdir(join(claudeProfile, 'projects'), { withFileTypes: true }).catch(error => {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT' && saved.sessions.length === 0) return [];
+          throw error;
+        });
+        for (const session of saved.sessions) {
+          if (!/^[a-zA-Z0-9-]+$/.test(session.nativeId)) throw new Error(UPGRADE_BUSY);
+          const paths: string[] = [];
+          for (const project of projects) if (project.isDirectory()) {
+            const path = join(claudeProfile, 'projects', project.name, `${session.nativeId}.jsonl`);
+            try { if ((await stat(path)).isFile()) paths.push(path); }
+            catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+          }
+          if (!paths.length && emptyUpgradeDraft(session)) { retainedClaudeDrafts.push(session); continue; }
+          if (paths.length !== 1) throw new Error(UPGRADE_BUSY);
+          claudeTranscripts.set(session.thread.id, paths[0]!);
+        }
+      }
+      Object.assign(exportedConnection, { retainedClaudeDrafts });
+      const controller = this;
+      async function* chats(): AsyncGenerator<UpgradeExportChat> {
+        for (const alias of exportedConnection.threadAliases) {
+          const external = desktopChats.has(alias.nativeThreadId);
+          if (external) {
+            const native = record(record(await controller.requireCodex().request('thread/read', { threadId: alias.nativeThreadId, includeTurns: false }))?.thread);
+            if (!native || native.id !== alias.nativeThreadId || native.cwd !== alias.cwd || typeof native.path !== 'string') throw new Error(UPGRADE_BUSY);
+            yield { agent: 'codex', id: alias.remoteThreadId, desktopReference: true, transcript: native.path,
+              history: { threadId: alias.remoteThreadId, nativeId: alias.nativeThreadId } };
+            continue;
+          }
+          const native = await readOwnedExportThread(controller.requireCodex(), alias.nativeThreadId);
+          if (!native || !['idle', 'notLoaded'].includes(stringValue(record(native.status)?.type ?? native.status))) throw new Error(UPGRADE_BUSY);
+          const detail = record((external
+            ? projectCodexThreadDetail(annotateUpgradeAlias(native, alias), 0, { compactCompletedWork: true })
+            : await controller.readFullThreadDetail(alias.remoteThreadId)).thread);
+          if (!detail || !Array.isArray(native.turns)) throw new Error(UPGRADE_BUSY);
+          assertSettledExport(detail);
+          yield { agent: 'codex', id: alias.remoteThreadId, transcript: stringValue(native.path, 4096), history: {
+            version: 1, threadId: alias.remoteThreadId, nativeId: alias.nativeThreadId,
+            nativeStatus: record(native.status)?.type ?? native.status,
+            hasPendingApprovals: false, hasPendingUserInput: false, hasQueuedPrompts: false, hasActionableProposedPlan: false,
+            latestTurn: detail.latestTurn, messages: detail.messages, activities: detail.activities, proposedPlans: detail.proposedPlans,
+            updatedAt: detail.updatedAt, latestUserMessageAt: detail.latestUserMessageAt,
+            turns: native.turns.map((t: JsonRecord) => ({ publicId: t.id, nativeId: t.id, status: t.status === "failed" ? "error" : t.status })),
+          } };
+        }
+        if (!claudeProfile) return;
+        for (const session of saved.sessions) {
+          const transcript = claudeTranscripts.get(session.thread.id);
+          if (transcript) yield { agent: 'claude', id: session.thread.id, history: { ...await reconcileUpgradeCheckpoints(session, transcript), upgradePreserveUnmappedHistory: true }, transcript };
+        }
+      }
+      delegated = true;
+      return await exportOwnedUpgrade(directory, profiles, {
+        sourceRoot: this.store.stateRoot ?? getConfigDir(), assetRoots: { uploads: androidAttachmentRoot(), claudeUploads: androidAttachmentRoot(claude.root), images: join(claude.root, 'tool-images') },
+        environment: this.environmentId, connection: exportedConnection, projects: exportedProjects, claudeSettings: saved.settings,
+        chats: chats(), assertSettled, stop: async () => {
+          if (inheritedQuick) this.cloudflareTunnel.retainQuickForUpgrade!(inheritedQuick);
+          await this.stop(); await stopOwner?.();
+        }, release: () => { releaseClaude?.(); release(); },
+      });
+    } catch (error) {
+      // exportOwnedUpgrade keeps admission closed once it begins shutdown.
+      if (!delegated) { releaseClaude?.(); release(); }
+      throw error;
+    }
+  }
   private readonly drafts = new Map<string, DraftThread>();
   private readonly preferences = new Map<string, Partial<DraftThread>>();
   private readonly knownWorkspaceRoots = new Map<string, string>();
@@ -2310,6 +2506,7 @@ export class AndroidRemoteGatewayController {
     readonly store: AndroidRemoteStore,
     options: AndroidRemoteGatewayOptions = {},
   ) {
+    assertUpgradeSourceAvailable(store.stateRoot ?? getConfigDir());
     this.auth = new AndroidRemoteAuth(store, options.now);
     this.runtime = options.runtime ?? new AndroidCodexRuntime();
     this.now = options.now ?? Date.now;
@@ -2347,7 +2544,9 @@ export class AndroidRemoteGatewayController {
       this.publishMobileConnectionChange();
     });
     this.desktopSessions = options.desktopSessionStream ?? new DesktopSessionStream();
-    this.desktopProjectRegistrar = options.desktopProjectRegistrar ?? new CodexDesktopProjectRegistrar();
+    this.desktopProjectRegistrar = options.desktopProjectRegistrar ?? new CodexDesktopProjectRegistrar({
+      request: (method, params) => this.requireCodex().request(method, params),
+    });
     this.desktopWorkspaceReader = options.desktopWorkspaceReader
       ?? (threads => readDesktopWorkspaceSnapshot(threads));
     this.sessionCommandRecovery = options.sessionCommandRecovery
@@ -2619,6 +2818,8 @@ export class AndroidRemoteGatewayController {
   }
 
   async start(): Promise<void> {
+    this.upgradeAdmission.assertAvailable();
+    assertUpgradeSourceAvailable(this.store.stateRoot ?? getConfigDir());
     if (this.gatewayStatus === "ready") return;
     if (this.startFlight) return this.startFlight;
 
@@ -2666,6 +2867,8 @@ export class AndroidRemoteGatewayController {
   }
 
   private async startInternal(): Promise<void> {
+    this.upgradeAdmission.assertAvailable();
+    assertUpgradeSourceAvailable(this.store.stateRoot ?? getConfigDir());
     this.gatewayStatus = "starting";
     this.statusError = undefined;
     try {
@@ -2811,6 +3014,11 @@ export class AndroidRemoteGatewayController {
   }
 
   private async handleHttp(req: Request, server: Server<GatewayWsData>): Promise<Response | undefined> {
+    let leave: () => void;
+    try { leave = this.upgradeAdmission.enter(); } catch { return errorResponse(503, UPGRADE_BUSY); }
+    try { return await this.handleAdmittedHttp(req, server); } finally { leave(); }
+  }
+  private async handleAdmittedHttp(req: Request, server: Server<GatewayWsData>): Promise<Response | undefined> {
     if (!androidRemotePeerAllowed(server.requestIP(req)?.address)) {
       return errorResponse(403, "Use the same Wi-Fi or your verified remote link");
     }
@@ -3118,7 +3326,9 @@ export class AndroidRemoteGatewayController {
       return;
     }
     const params = record(message.params) ?? {};
+    let leave: (() => void) | undefined;
     try {
+      leave = this.upgradeAdmission.enter();
       if (ws.data.agent === "claude-code") {
         await this.claudeSocketMessage(ws, id, method, params);
         return;
@@ -3263,7 +3473,7 @@ export class AndroidRemoteGatewayController {
       socketError(ws, id, "This Remodex Android method is not available");
     } catch (error) {
       socketError(ws, id, error instanceof Error ? error.message : "Android Remote request failed");
-    }
+    } finally { leave?.(); }
   }
 
   private async claudeSocketMessage(ws: ServerWebSocket<GatewayWsData>, id: RequestId, method: string, params: JsonRecord): Promise<void> {
@@ -3895,6 +4105,24 @@ export class AndroidRemoteGatewayController {
     const partialPath = filesystemBrowsePathInput(params.partialPath, "folder path")!;
     const cwd = filesystemBrowsePathInput(params.cwd, "current project folder", true);
     const resolvedInputPath = resolveFilesystemBrowseTarget(partialPath, cwd);
+    if (params.query !== undefined) {
+      const query = filesystemBrowsePathInput(params.query, "folder path")!;
+      if (query.length > 256) throw new TypeError("Use a shorter search name");
+      return { parentPath: resolvedInputPath, searchQuery: query, ...await searchProjectFolders([
+        resolvedInputPath, homedir(), ...this.knownWorkspaceRoots.values(), parse(resolvedInputPath).root,
+      ], query) };
+    }
+    if (params.resolvePath === true) {
+      let target = resolvedInputPath;
+      try {
+        const details = await stat(target);
+        if (details.isFile()) target = dirname(target);
+        else if (!details.isDirectory()) throw new Error();
+        target = await realpath(target);
+      } catch { throw new TypeError("This path does not exist or cannot be opened. Search by name or enter an existing path."); }
+      // Preserve the existing autocomplete behavior for older callers.
+      return { ...await this.browseFilesystem({ partialPath: target.endsWith('/') || target.endsWith('\\') ? target : `${target}/` }), resolvedPath: true };
+    }
     const endsWithSeparator = /[\\/]$/u.test(partialPath) || partialPath === "~";
     const parentPath = endsWithSeparator ? resolvedInputPath : dirname(resolvedInputPath);
     const prefix = endsWithSeparator ? "" : basename(resolvedInputPath);
@@ -10758,7 +10986,32 @@ export class AndroidRemoteGatewayController {
   }
 
   private upsertProjectedActivity(value: unknown, row: JsonRecord): JsonRecord[] {
-    const current = projectedRows(value);
+    let current = projectedRows(value);
+    const processId = stringValue(record(row.payload)?.processId, 128);
+    if (row.kind === "commandExecution" && row.turnId) {
+      const inferred = record(row.payload)?.inferredCommand === true;
+      const counterparts = current.filter(candidate => {
+        if (candidate.id === row.id || candidate.kind !== row.kind || candidate.turnId !== row.turnId
+          || (record(candidate.payload)?.inferredCommand === true) === inferred) return false;
+        const candidatePayload = record(candidate.payload);
+        const candidateProcess = stringValue(candidatePayload?.processId, 128);
+        if (processId && candidateProcess) return processId === candidateProcess;
+        // Before the first process receipt, replace only an unambiguous live
+        // guess with the same command started at almost the same instant.
+        const identity = stringValue(record(row.payload)?.commandIdentity, 128);
+        return !!identity && identity === candidatePayload?.commandIdentity
+          && record(row.payload)?.status === "inProgress" && candidatePayload?.status === "inProgress"
+          && Math.abs(Date.parse(String(row.createdAt)) - Date.parse(String(candidate.createdAt))) <= 5_000;
+      });
+      const counterpart = counterparts.length === 1 ? counterparts[0] : undefined;
+      // The native stream and saved wrapper describe the same process. Keep
+      // the native identity regardless of arrival order, without merging two
+      // real commands that happen to share text or a recycled process id.
+      if (counterpart) {
+        if (inferred) return current.filter(candidate => candidate.id !== row.id);
+        current = current.filter(candidate => candidate !== counterpart);
+      }
+    }
     const id = stringValue(row.id, 128);
     const existingIndex = current.findIndex(candidate => stringValue(candidate.id, 128) === id);
     if (existingIndex >= 0) {

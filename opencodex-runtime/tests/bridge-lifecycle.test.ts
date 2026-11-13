@@ -101,11 +101,36 @@ describe("bridge stream lifecycle (RC1 / RC2)", () => {
 
   test("a true upstream stall while reading emits incomplete, closes, and cancels upstream", async () => {
     let cancelled = false;
+    let tick!: () => void;
+    let timerCleared = false;
+    const timerId = Symbol("stall timer");
+    let markStalled!: () => void;
+    const stalled = new Promise<void>(resolve => { markStalled = resolve; });
+    let releaseAdapter!: () => void;
+    const adapterReleased = new Promise<void>(resolve => { releaseAdapter = resolve; });
+    async function* stalledAdapter(): AsyncGenerator<AdapterEvent> {
+      yield { type: "text_delta", text: "partial" };
+      markStalled();
+      await adapterReleased;
+    }
     const stream = bridgeToResponsesSSE(
-      hangs(), "routed/model", undefined, undefined, undefined,
-      () => { cancelled = true; },
+      stalledAdapter(), "routed/model", undefined, undefined, undefined,
+      () => { cancelled = true; releaseAdapter(); },
       10,
-      { stallTimeoutSec: 1 },
+      {
+        stallTimeoutSec: 1,
+        timers: {
+          setInterval(handler, ms) {
+            expect(ms).toBe(10);
+            tick = handler;
+            return timerId;
+          },
+          clearInterval(id) {
+            expect(id).toBe(timerId);
+            timerCleared = true;
+          },
+        },
+      },
     );
 
     const reader = stream.getReader();
@@ -119,24 +144,28 @@ describe("bridge stream lifecycle (RC1 / RC2)", () => {
       }
     })();
     try {
-      await Promise.race([
-        completed,
-        // Measured: the stall closes the stream in ~1160ms. The gap between this
-        // guard and the test's own timeout is the budget a loaded CI runner can
-        // spend on drifted heartbeat ticks — 2500ms inside a 3000ms budget left
-        // 500ms, and a slow runner spent it. The stream is proven to close well
-        // inside 1500ms, so the guard sits at the point where something is
-        // genuinely wrong, and the test timeout gives the drift room.
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("stall stream did not close")), 4_000)),
-      ]);
+      // Wait for the real reader to request the stalled adapter's next item.
+      // Drive the existing timer seam instead of requiring Windows to schedule
+      // 100 ten-millisecond ticks before a competing wall-clock deadline.
+      await stalled;
+      tick(); // acknowledge the first text delta's upstream activity
+      for (let i = 0; i < 99; i++) tick();
+      expect(cancelled).toBe(false);
+      expect(timerCleared).toBe(false);
+      tick(); // one second of inactivity: close and cancel at the threshold
+      expect(cancelled).toBe(true);
+      expect(timerCleared).toBe(true);
+      await completed;
     } finally {
       await reader.cancel();
+      releaseAdapter();
     }
     const names = text.split("\n\n")
       .map(frame => frame.split("\n").find(line => line.startsWith("event: "))?.slice(7) ?? "")
       .filter(Boolean);
 
-    expect(names).toContain("response.incomplete");
+    expect(names.filter(name => name === "response.incomplete")).toHaveLength(1);
+    expect(text).toContain('"reason":"upstream_stall_timeout"');
     expect(names).not.toContain("response.completed");
     expect(cancelled).toBe(true);
   }, 6_000);

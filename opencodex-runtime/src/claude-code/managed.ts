@@ -10,6 +10,7 @@ import { atomicWriteFile } from '../config';
 import { redactSecretString } from '../lib/redact';
 import { commandInvocation } from '../lib/win-exec';
 import { stageAndroidAttachments, type StagedAndroidAttachments } from '../android-remote/attachments';
+import { ANDROID_REMOTE_PROJECTLESS_ID } from '../android-remote/store';
 import { createProjectedThreadStreamState, projectedThreadBoundedSnapshot, readProjectedOlderPage } from '../android-remote/thread-stream';
 import { claudeInputQueue, connectDesktop, interruptClaude } from './desktop-sync';
 import { claudeVerificationIssue } from './verification';
@@ -24,6 +25,7 @@ import { ClaudeAutoConnect } from './auto-connect';
 import { ClaudeToolImages } from './tool-images';
 import { claudeThinkingSummary, hasClaudeThinkingSummary } from './thinking-summary';
 import { ClaudeUsageReader } from './usage';
+import { assertSettledExport, UPGRADE_BUSY } from '../android-remote/upgrade-export';
 import { claudeModelLabels } from './model-presentation';
 import { ClaudeSyncRecovery, canRecoverClaudeSync } from './sync-recovery';
 import { connectRemoteClient, existingBridgeId, type RemoteClientConnect } from './remote-client';
@@ -81,7 +83,7 @@ function approvalDetail(name: string, input: Row): string {
 export class ManagedClaudeCode {
   private threads = new Map<string, StoredThread>();
   private projects = new Map<string, Row>();
-  private active = new Map<string, { query: Query; stopped: boolean; persistent: boolean; parked?: boolean; intentionalDisconnect?: boolean; backgroundTasks?: number; backgroundTaskIds?: Set<string>; flushResult?: () => void; abort?: AbortController; awaitingStart?: boolean; sentAt?: number; remoteEvents?: Set<string>; inbox: ReturnType<typeof claudeInputQueue>; done?: Promise<void> }>();
+  private active = new Map<string, { query: Query; stopped: boolean; persistent: boolean; retiring?: boolean; parked?: boolean; intentionalDisconnect?: boolean; backgroundTasks?: number; backgroundTaskIds?: Set<string>; flushResult?: () => void; abort?: AbortController; awaitingStart?: boolean; sentAt?: number; remoteEvents?: Set<string>; inbox: ReturnType<typeof claudeInputQueue>; done?: Promise<void> }>();
   private syncRecovery = new ClaudeSyncRecovery(id => this.reconnectStaleSync(id));
   private recoverySlots = new Set<string>();
   private capabilityInit = new Map<string, { query: Query; value: Row }>();
@@ -95,6 +97,77 @@ export class ManagedClaudeCode {
   private desktopSync = false;
   private restoring: Promise<void> | null = null;
   private closing = false;
+  private upgradeReserved = false;
+  private upgradeHistory = new Map<string, StoredThread>();
+
+  /** Local lifecycle hook; never exposed as a phone command. */
+  reserveUpgradeExport() {
+    if (this.upgradeReserved || this.closing) throw new Error(UPGRADE_BUSY);
+    this.assertUpgradeSettled();
+    this.upgradeReserved = true;
+    let released = false;
+    return () => { if (!released) { released = true; this.upgradeReserved = false; } };
+  }
+  /** Snapshot dormant history locally. Migration must not need a live relay,
+   * sign-in, or a second worker just to retain an existing Desktop chat. The
+   * native importer separately verifies every transcript before activation. */
+  async prepareUpgradeExport() {
+    if (this.upgradeReserved || this.closing) throw new Error(UPGRADE_BUSY);
+    this.assertUpgradeSettled(false, true);
+    this.upgradeReserved = true;
+    let released = false;
+    const release = () => { if (!released) { released = true; this.upgradeReserved = false; this.upgradeHistory.clear(); } };
+    try {
+      await this.refreshHistory(true);
+      const candidates = this.history.shells([...this.projects.values()]).filter(t => !this.threads.has(t.id));
+      const deadline = Date.now() + 60_000;
+      if (candidates.length + this.threads.size > 4096) throw new Error(UPGRADE_BUSY);
+      let historyBytes = 0;
+      for (const { id } of candidates) {
+        if (Date.now() >= deadline || this.closing) throw new Error(UPGRADE_BUSY);
+        this.assertUpgradeSettled(false, true);
+        const thread = structuredClone(await this.history.upgradeDetail(id, [...this.projects.values()]));
+        thread.activities = thread.activities.filter((a: Row) => a.kind !== 'claude.desktop-sync.updated');
+        thread.session = { threadId: id, providerName: 'claude', providerInstanceId: INSTANCE,
+          status: 'disconnected', statusConfidence: 'unknown', activeTurnId: null };
+        // Saved transcript content cannot prove the original owner's live state.
+        thread.latestTurn = null;
+        assertSettledExport(thread);
+        historyBytes += Buffer.byteLength(JSON.stringify(thread));
+        if (historyBytes > 512 * 1024 * 1024) throw new Error(UPGRADE_BUSY);
+        this.upgradeHistory.set(id, { version: 1, nativeId: thread.nativeSessionId,
+          resumed: true, thread, commands: [], external: true,
+          userUuids: thread.messages.filter((m: Row) => m.role === 'user').map((m: Row) => m.id) });
+      }
+      this.assertUpgradeSettled(true, true);
+      return release;
+    } catch (error) { release(); throw error; }
+  }
+  assertUpgradeSettled(requireHistory = true, allowUnverifiedExternal = false) {
+    if (this.pending.size || this.starting.size || this.recovering.size || this.recoverySlots.size
+      || this.threadMutations.size || this.branchImports.size
+      || requireHistory && this.history.shells([...this.projects.values()]).some(t => !this.threads.has(t.id) && !this.upgradeHistory.has(t.id))) throw new Error(UPGRADE_BUSY);
+    for (const s of this.threads.values()) {
+      assertSettledExport(s.thread);
+      const active = this.active.get(s.thread.id);
+      // External workers remain with their owner. Only a proven, committed
+      // observer cursor may migrate; closing this client must not stop them.
+      if (!allowUnverifiedExternal && !this.upgradeReserved && s.external && (!s.bridgeId || !Number.isSafeInteger(s.remoteSequence) || (s.remoteSequence ?? 0) <= 0)) throw new Error(UPGRADE_BUSY);
+      if (s.followUps?.length || s.deliveries?.some(d => d.state === 'offered')
+        || s.branchImportPending || active?.awaitingStart || active?.backgroundTasks) throw new Error(UPGRADE_BUSY);
+    }
+  }
+  upgradeExportRecords() {
+    this.assertUpgradeSettled();
+    return {
+      settings: { enabled: this.enabled, binary: this.binary, desktopSync: this.desktopSync,
+        projects: [...this.projects.values(), ...this.history.projects([...this.projects.values()])] },
+      sessions: [...this.threads.values(), ...this.upgradeHistory.values()].map(s => ({ ...structuredClone(s),
+        ...(s.external && (!s.bridgeId || !Number.isSafeInteger(s.remoteSequence) || (s.remoteSequence ?? 0) <= 0)
+          ? { upgradeNativeReplay: true } : {}) })),
+    };
+  }
+  private assertUpgradeAdmission() { if (this.upgradeReserved || this.closing) throw new Error(UPGRADE_BUSY); }
   private restoreAttempted = false;
   private pending = new Map<string, Pending>();
   private streamMessageIds = new Map<string, string>();
@@ -242,6 +315,10 @@ export class ManagedClaudeCode {
     this.branchImports.set(id, work); return work;
   }
   async prepareThread(id: string): Promise<void> {
+    this.assertUpgradeAdmission();
+    return this.prepareThreadInternal(id);
+  }
+  private async prepareThreadInternal(id: string): Promise<void> {
     this.viewed.set(id, Date.now());
     if (this.closing || this.recovering.has(id)) return;
     let s = this.threads.get(id);
@@ -249,7 +326,7 @@ export class ManagedClaudeCode {
     if (!s && this.history.has(id) && this.enabled && this.desktopSync) {
       const thread = structuredClone(await this.history.detail(id, [...this.projects.values()]));
       // Another subscription may have imported this session while history was loading.
-      if (this.threads.has(id)) return this.prepareThread(id);
+      if (this.threads.has(id)) return this.prepareThreadInternal(id);
       s = { version: 1, nativeId: thread.nativeSessionId, resumed: true, thread, commands: [], external: true };
       thread.activities = thread.activities.filter((a: Row) => a.kind !== 'claude.desktop-sync.updated');
       thread.session = { threadId: id, providerName: 'claude', providerInstanceId: INSTANCE, status: 'disconnected', statusConfidence: 'confirmed', activeTurnId: null };
@@ -271,6 +348,7 @@ export class ManagedClaudeCode {
   }
   /** Explicit repair only: a rejected server identity cannot safely be revived by changing credentials. */
   async recoverDesktop(id: string, mode: string, commandId: string, clientId: string) {
+    this.assertUpgradeAdmission();
     const result = await this.dispatch({ type: 'claude.desktop-sync.recover', threadId: id, mode, commandId }, clientId);
     const saved = this.requireThread(id);
     if (this.desktopState(saved) !== 'connected') throw new Error(str(saved.thread.activities.find((a: Row) => a.kind === 'claude.desktop-sync.updated')?.payload?.detail) || 'Claude Desktop is still disconnected. Open Status and retry.');
@@ -334,6 +412,7 @@ export class ManagedClaudeCode {
     };
   }
   async setAutoConnect(input: Row) {
+    this.assertUpgradeAdmission();
     if (Object.keys(input).length !== 1 || typeof input.enabled !== 'boolean') throw new TypeError('Provide only the automatic sync enabled boolean.');
     if (this.recovering.size || this.starting.size) throw new Error('Wait for Claude session startup or recovery to finish before changing sync.');
     if (input.enabled && !this.desktopSync && this.runningCount()) throw new Error('Finish Claude tasks before enabling Desktop sharing for the first time.');
@@ -349,6 +428,7 @@ export class ManagedClaudeCode {
     return { ...this.syncSettings(), autoConnect: result };
   }
   async configure(input: Row) {
+    this.assertUpgradeAdmission();
     if ('autoConnectNewSessions' in input) {
       if (Object.keys(input).length !== 1) throw new TypeError('Change automatic sync separately from other settings.');
       await this.setAutoConnect({ enabled: input.autoConnectNewSessions });
@@ -401,7 +481,7 @@ export class ManagedClaudeCode {
     }
   }
   private shouldRecoverSync(s: StoredThread) {
-    return this.enabled && this.desktopSync && !this.closing && !!s.bridgeId && s.resumed && !s.syncPaused && !s.thread.archivedAt && !s.thread.deletedAt;
+    return this.enabled && this.desktopSync && !this.closing && !this.upgradeReserved && !!s.bridgeId && s.resumed && !s.syncPaused && !s.thread.archivedAt && !s.thread.deletedAt;
   }
   private async reconnectStaleSync(id: string): Promise<'connected' | 'defer' | 'cancel'> {
     const s = this.threads.get(id);
@@ -462,6 +542,8 @@ export class ManagedClaudeCode {
     if (!path) throw new Error('Install Claude Code on this PC, run claude auth login with your subscription, then refresh.');
     return path;
   }
+  /** Local lifecycle metadata only; no credentials or worker is created. */
+  upgradeExecutable(): string { return this.executable(); }
   private environment() {
     const env = { ...process.env };
     // Never silently charge a separate API account or inherit Remodex proxy routing.
@@ -520,7 +602,10 @@ export class ManagedClaudeCode {
       observability: { logsDirectoryPath: '', localTracingEnabled: false, otlpTracesEnabled: false, otlpMetricsEnabled: false }, remodexMobileConnection: connection };
   }
   shell(): Row {
-    return { snapshotSequence: this.sequence, projects: [...this.projects.values(), ...this.history.projects([...this.projects.values()])], threads: [...this.threads.values()].filter(s => !s.thread.deletedAt).map(s => {
+    const general = [...this.threads.values()].find(s => !s.thread.deletedAt && s.thread.projectId === ANDROID_REMOTE_PROJECTLESS_ID);
+    const noProject = general ? [{ id: ANDROID_REMOTE_PROJECTLESS_ID, title: 'No Project', workspaceRoot: join(this.root, 'chat-workspaces'),
+      repositoryIdentity: null, defaultModelSelection: null, scripts: [], createdAt: general.thread.createdAt, updatedAt: general.thread.createdAt }] : [];
+    return { snapshotSequence: this.sequence, projects: [...noProject, ...this.projects.values(), ...this.history.projects([...this.projects.values()])], threads: [...this.threads.values()].filter(s => !s.thread.deletedAt).map(s => {
       const { messages, activities, checkpoints, proposedPlans, ...shell } = s.thread; return shell;
     }).concat(this.history.shells([...this.projects.values()]).filter(t => !this.threads.has(t.id))), nativeProjects: [], nativeThreads: [], updatedAt: now() };
   }
@@ -605,6 +690,7 @@ export class ManagedClaudeCode {
   }
 
   async sessionAction(input: Row, clientId: string): Promise<Row> {
+    this.assertUpgradeAdmission();
     const id = str(input.threadId), commandId = str(input.commandId);
     if (!this.enabled || !id || !commandId || commandId.length > 128) throw new TypeError('A Claude chat and command ID are required.');
     const key = `${clientId}:${id}:${commandId}`;
@@ -723,6 +809,7 @@ export class ManagedClaudeCode {
   }
 
   async dispatch(command: Row, clientId: string) {
+    this.assertUpgradeAdmission();
     if (!this.enabled) throw new TypeError('Enable Claude Code in the Remodex dashboard first.');
     const commandId = str(command.commandId);
     if (!commandId || commandId.length > 128) throw new TypeError('A command ID is required');
@@ -769,10 +856,17 @@ export class ManagedClaudeCode {
       if (!str(c.threadId) || str(c.threadId).length > 128) throw new TypeError('Session ID required');
       if (this.threads.has(c.threadId) || str(c.threadId).startsWith('claude-history-')) throw new TypeError('Session already exists or is read-only history.');
       if (this.ownedWorkerCount() >= MAX_ACTIVE && !this.idleWorker()) throw new TypeError('Four Claude Code tasks are running. Wait for one to finish or stop a task before creating another.');
-      const project = this.projects.get(str(c.projectId)) ?? this.history.projects([...this.projects.values()]).find(p => p.id === str(c.projectId));
-      if (!project) throw new TypeError('Select a Claude Code project folder before starting a task.');
-      if (!this.projects.has(project.id)) { this.projects.set(project.id, project); this.saveSettings(); }
       const timestamp = now(); const nativeId = randomUUID();
+      const projectless = c.workspaceKind === 'projectless';
+      // A general chat gets its own neutral workspace, never the last real project.
+      const scratch = join(this.root, 'chat-workspaces', nativeId);
+      const project = projectless
+        ? { id: ANDROID_REMOTE_PROJECTLESS_ID, title: 'No Project', workspaceRoot: scratch, repositoryIdentity: null,
+          defaultModelSelection: null, scripts: [], createdAt: timestamp, updatedAt: timestamp }
+        : this.projects.get(str(c.projectId)) ?? this.history.projects([...this.projects.values()]).find(p => p.id === str(c.projectId));
+      if (!project) throw new TypeError('Select a Claude Code project folder before starting a task.');
+      if (projectless) await mkdir(scratch, { recursive: true });
+      else if (!this.projects.has(project.id)) { this.projects.set(project.id, project); this.saveSettings(); }
       const thread: Row = { id: c.threadId, nativeSessionId: nativeId, projectId: project.id, title: 'New task',
         modelSelection: { instanceId: INSTANCE, model: str(c.modelSelection?.model) || 'sonnet', options: c.modelSelection?.options },
         runtimeMode: ['approval-required', 'auto-accept-edits', 'full-access'].includes(c.runtimeMode) ? c.runtimeMode : 'approval-required',
@@ -1138,6 +1232,10 @@ export class ManagedClaudeCode {
   private async runTurn(s: StoredThread, c: Row, key: string, clientId: string, prepared?: StagedAndroidAttachments | null) {
     const t = s.thread;
     if (s.external) { await this.startRemoteTurn(s, c, key, clientId, prepared); return; }
+    // Iterator return may await CLI/process cleanup after a result schedules the
+    // next queued turn. Never push that prompt into the retiring worker's inbox.
+    const retiring = this.active.get(t.id);
+    if (retiring?.retiring) await retiring.done;
     if (t.session.status === 'running') throw new TypeError('Claude Code is already working on this task. Stop it before sending another prompt.');
     if (!this.active.has(t.id) && this.ownedWorkerCount() >= MAX_ACTIVE && !this.idleWorker()) throw new TypeError('Four Claude Code tasks are running. Wait for one to finish or stop a task before starting another.');
     if ((t.messages?.length ?? 0) > 2000 || (t.activities?.length ?? 0) > 4000) throw new TypeError('Start a new task; this session has reached the Remodex history limit.');
@@ -1515,7 +1613,7 @@ export class ManagedClaudeCode {
           return { behavior: 'cancelled' };
         },
       } });
-      const worker = { query: q, stopped: false, parked: false, intentionalDisconnect: false, backgroundTasks: 0, backgroundTaskIds: new Set<string>(), flushResult: undefined as (() => void) | undefined, persistent: this.desktopSync, inbox, done: undefined as Promise<void> | undefined };
+      const worker = { query: q, stopped: false, retiring: false, parked: false, intentionalDisconnect: false, backgroundTasks: 0, backgroundTaskIds: new Set<string>(), flushResult: undefined as (() => void) | undefined, persistent: this.desktopSync, inbox, done: undefined as Promise<void> | undefined };
       this.active.set(t.id, worker);
       worker.done = (async () => {
         let result: SDKMessage | null = null;
@@ -1539,7 +1637,7 @@ export class ManagedClaudeCode {
             } else { this.event(s, event); if (event.type !== 'stream_event') this.save(s); }
             // Keep the CLI alive while its background tools run. Closing on the
             // foreground result would terminate those tools and lose their output.
-            if (flushResult() && !worker.persistent && t.session.status !== 'running') break;
+            if (flushResult() && !worker.persistent && t.session.status !== 'running') { worker.retiring = true; break; }
           }
           if (t.session.status === 'running') { this.disconnectedQueue(s); this.finish(s, 'interrupted', 'Claude Code disconnected. The prompt will not be replayed automatically.'); }
         }

@@ -31,6 +31,63 @@ function fixture(options: { noLink?: boolean; denied?: boolean } = {}) {
   const dispatch = (c: any) => service.dispatch({ threadId: id, commandId: crypto.randomUUID(), ...c }, 'phone');
   return { dir, service, open, emit, dispatch, historyMessages, q, get input() { return input; }, counts: () => ({ locals, forks, interrupted, connects }) };
 }
+test('upgrade exports unopened Desktop history without starting a temporary observer', async () => {
+  const f = fixture();
+  f.q.supportedModels = async () => {
+    // The transport normally commits this alongside an SSE event.
+    (f.service as any).threads.get(id).remoteSequence = 12;
+    return [];
+  };
+  try {
+    const release = await f.service.prepareUpgradeExport();
+    const saved = f.service.upgradeExportRecords().sessions;
+    expect(saved).toHaveLength(1);
+    expect(saved[0]).toMatchObject({ external: true, upgradeNativeReplay: true });
+    expect(saved[0].bridgeId).toBeUndefined();
+    expect(saved[0].remoteSequence).toBeUndefined();
+    expect(saved[0]!.thread.messages[0].text).toBe('Hello');
+    expect((f.service as any).active.size).toBe(0);
+    expect(f.counts()).toEqual({ locals: 0, forks: 0, interrupted: 0, connects: 0 });
+    await expect(f.dispatch({ type: 'thread.turn.start', message: { messageId: 'blocked', text: 'must not send' } })).rejects.toThrow('Upgrade');
+    release();
+    const again = await f.service.prepareUpgradeExport();
+    expect(f.counts().connects).toBe(0);
+    again();
+  } finally { await f.service.close(); }
+});
+
+test('upgrade keeps unopened history without requiring remote authorization or claiming a live cursor', async () => {
+  for (const options of [{ noLink: true }, { denied: true }, {}]) {
+    const f = fixture(options);
+    try {
+      const release = await f.service.prepareUpgradeExport();
+      const [saved] = f.service.upgradeExportRecords().sessions;
+      expect(saved).toMatchObject({ external: true, upgradeNativeReplay: true });
+      expect(saved.remoteSequence).toBeUndefined();
+      expect(saved.thread.messages[0].text).toBe('Hello');
+      expect(saved.thread.latestTurn).toBeNull();
+      expect(f.counts().connects).toBe(0);
+      release();
+      expect((await f.service.readDetail(id)).thread.messages[0].text).toBe('Hello');
+      expect((f.service as any).upgradeReserved).toBe(false);
+      expect((f.service as any).active.size).toBe(0);
+      expect(f.counts().locals).toBe(0);
+      expect(f.counts().interrupted).toBe(0);
+    } finally { await f.service.close(); }
+  }
+});
+
+test('upgrade leaves an already-attached Desktop observer connected', async () => {
+  const f = fixture(); await f.open();
+  (f.service as any).threads.get(id).remoteSequence = 9;
+  try {
+    const release = await f.service.prepareUpgradeExport();
+    expect((f.service as any).active.size).toBe(1);
+    expect(f.counts()).toEqual({ locals: 0, forks: 0, interrupted: 0, connects: 1 });
+    release();
+  } finally { await f.service.close(); }
+});
+
 test('opening an older saved Desktop projection repairs injected user text without reconnecting or sending', async () => {
   const f = fixture();
   const reminder = '<system-reminder>Desktop setup instructions</system-reminder>\n\n';

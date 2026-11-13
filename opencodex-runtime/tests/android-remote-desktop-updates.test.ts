@@ -3,6 +3,7 @@ import { createDesktopUpdateRoutes, liveUpdateJob, publicUpdateJob } from "../sr
 import { registryVersion, type RemoteUpdateCheck } from "../src/update/remote-check";
 import type { UpdateJobState } from "../src/update/job";
 import { AndroidRemoteGatewayController } from "../src/android-remote/gateway";
+import { UpgradeAdmission } from "../src/android-remote/upgrade-export";
 
 const check: RemoteUpdateCheck = {
   currentVersion: "1.0.0", latestVersion: "1.0.1", installer: "npm", channel: "latest",
@@ -22,6 +23,7 @@ describe("paired-phone desktop updates", () => {
   test("phone status awaits current activity independently of stale or missing sidebar data", async () => {
     let current = { known: true, running: 0 };
     const gateway = Object.assign(Object.create(AndroidRemoteGatewayController.prototype), {
+      upgradeAdmission: new UpgradeAdmission(),
       assets: { response: () => null, thumbnailResponse: async () => null },
       auth: { authenticateAccessToken: () => ({ client: { id: "test", scopes: ["terminal:operate"] } }) },
       shellCache: { threads: [{ session: { status: "idle", activeTurnId: null }, latestTurn: { state: "completed" } }] },
@@ -55,6 +57,7 @@ describe("paired-phone desktop updates", () => {
   test("gateway rejects missing or revoked phone credentials before reaching updater", async () => {
     let reached = false;
     const gateway = Object.assign(Object.create(AndroidRemoteGatewayController.prototype), {
+      upgradeAdmission: new UpgradeAdmission(),
       assets: { response: () => null, thumbnailResponse: async () => null },
       auth: { authenticateAccessToken: () => null },
       desktopUpdateRoutes: () => { reached = true; return Response.json({}); },

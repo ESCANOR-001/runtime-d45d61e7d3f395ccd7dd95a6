@@ -484,6 +484,14 @@ export class AndroidCodexRuntime {
     };
   }
 
+  /** Resolve the same CLI selection without starting another task server. */
+  async upgradeExecutable(): Promise<string> {
+    const selection = await this.selectRuntime();
+    const path = selection.runtime.command;
+    if (!path) throw new Error("The Codex runtime is unavailable for native upgrade");
+    return path;
+  }
+
   async start(): Promise<AndroidCodexClient> {
     if (this.stopFlight) throw new Error("Codex task runtime is stopping");
     const facade = this.facade ?? this.createFacade();

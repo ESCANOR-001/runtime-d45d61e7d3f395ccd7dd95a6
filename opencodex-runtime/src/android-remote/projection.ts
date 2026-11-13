@@ -1358,6 +1358,11 @@ function activityFromItem(
     ? summary
     : publicToolTitle(kind, item);
   const detail = undefined;
+  const commandActions = Array.isArray(item.commandActions) ? item.commandActions : [];
+  const identityCommand = kind === "commandExecution"
+    ? (commandActions.length === 1 ? text(record(commandActions[0])?.command) : "")
+      || publicCommandText(item.command)
+    : "";
   const payload: JsonRecord = kind === "reasoning"
     ? {
         itemId: id,
@@ -1389,6 +1394,12 @@ function activityFromItem(
     ? {
         itemId: id,
         itemType,
+        ...(identityCommand && identityCommand.length <= 64 * 1024
+          ? { commandIdentity: createHash("sha256").update(identityCommand.trim()).digest("hex") } : {}),
+        ...(kind === "commandExecution" && text(item.processId).trim()
+          ? { processId: text(item.processId).trim().slice(0, 128) } : {}),
+        ...(kind === "commandExecution" && item.androidRemoteInferredCommand === true
+          ? { inferredCommand: true } : {}),
         ...(status ? { status } : {}),
         ...(requestKind ? { requestKind } : {}),
         title,

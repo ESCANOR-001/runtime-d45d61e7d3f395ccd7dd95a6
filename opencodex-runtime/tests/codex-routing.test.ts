@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import { describe, expect, test, beforeEach, afterEach, spyOn } from "bun:test";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -34,6 +34,7 @@ import {
 } from "../src/codex/routing";
 import { clearPoolRotationState } from "../src/codex/pool-rotation";
 import { removeCodexAccountCredential, saveCodexAccountCredential } from "../src/codex/account-store";
+import * as accountStore from "../src/codex/account-store";
 import {
   clearAccountNeedsReauth,
   clearAccountQuota,
@@ -73,6 +74,24 @@ function saveTestCredential(id: string): void {
     expiresAt: Date.now() + 5 * 60_000,
     chatgptAccountId: `acct-${id}`,
   });
+}
+
+function withStableRoutingCredentials(check: () => void): void {
+  // The capacity tests never edit these credentials. Read the real fixtures
+  // once so thousands of routing calls exercise eviction, not repeated disk
+  // reads and Windows permission checks. Credential-change tests stay live.
+  const records = new Map(["a", "b"].map(id => [id, accountStore.readCodexAccountRecord(id)]));
+  for (const record of records.values()) expect(record?.credential).toBeDefined();
+  const credentialRead = spyOn(accountStore, "getCodexAccountCredential")
+    .mockImplementation(id => records.get(id)?.credential ?? null);
+  const recordRead = spyOn(accountStore, "readCodexAccountRecord")
+    .mockImplementation(id => records.get(id) ?? null);
+  try {
+    check();
+  } finally {
+    recordRead.mockRestore();
+    credentialRead.mockRestore();
+  }
 }
 
 const inspectionTick = () => new Promise(resolve => setTimeout(resolve, 5));
@@ -963,9 +982,9 @@ describe("codex routing", () => {
     )).toEqual({ status: "expired", accountId: "a" });
   });
 
-  // These stress cases fill the real 2,048-entry cap. Their deadline includes
-  // thousands of credential lookups on slower hosted machines, not one request.
-  test("thread affinity LRU cap evicts the oldest mapping", () => {
+  // Fill the real 2,048-entry cap with stable credentials, keeping every routing
+  // and eviction assertion independent of filesystem speed.
+  test("thread affinity LRU cap evicts the oldest mapping", () => withStableRoutingCredentials(() => {
     const config = makeConfig();
     updateAccountQuota("a", 10);
     updateAccountQuota("b", 10);
@@ -978,9 +997,9 @@ describe("codex routing", () => {
 
     expect(resolveCodexAccountForThread("lru-1", config, now + CODEX_THREAD_AFFINITY_MAX_ENTRIES + 1)).toBe("a");
     expect(resolveCodexAccountForThread("lru-0", config, now + CODEX_THREAD_AFFINITY_MAX_ENTRIES + 2)).toBe("b");
-  }, 20_000);
+  }), 20_000);
 
-  test("thread affinity LRU cap includes legacy and native quota scopes", () => {
+  test("thread affinity LRU cap includes legacy and native quota scopes", () => withStableRoutingCredentials(() => {
     const config = makeConfig();
     const now = 1_800_000_000_000;
     const threads = Math.floor(CODEX_THREAD_AFFINITY_MAX_ENTRIES / 3) + 1;
@@ -999,7 +1018,7 @@ describe("codex routing", () => {
     expect(resolveCodexAccountForThread("scoped-lru-0", config, after, "shared")).toBe("a");
     expect(resolveCodexAccountForThread("scoped-lru-0", config, after + 1, "spark")).toBe("a");
     expect(resolveCodexAccountForThread("scoped-lru-0", config, after + 2)).toBe("b");
-  }, 20_000);
+  }), 20_000);
 
   test("generation mismatch invalidates a mapped thread before reuse", () => {
     const config = makeConfig();

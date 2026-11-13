@@ -122,6 +122,11 @@ describe("systemd service unit", () => {
       "if (shouldLoadServiceProviderEnvironment(process.env)) loadServiceProviderEnvironmentFromFile(process.env);",
     );
 
+    const desktop = await readText("desktop/src-tauri/src/main.rs");
+    const actionAt = desktop.indexOf("fn run_desktop_cli_action");
+    const pointerAt = desktop.indexOf("OCX_PROVIDER_ENV_FILE", actionAt);
+    expect(actionAt).toBeGreaterThan(-1);
+    expect(pointerAt).toBeGreaterThan(actionAt);
   });
 
   test("uses unquoted append targets for service logs", () => {

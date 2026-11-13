@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { createDesktopFollowUpStore } from "../src/android-remote/desktop-follow-up-queue";
 import type { Socket } from "node:net";
 import {
-  AndroidDesktopIpcLiveSync,
+  AndroidDesktopIpcLiveSync as DesktopIpcLiveSync,
   DesktopIpcFrameReader,
   DesktopIpcTransport,
   buildDesktopStatePatches,
@@ -20,6 +20,14 @@ import {
 } from "../src/android-remote/desktop-ipc";
 
 type TransportHandlers = Parameters<DesktopIpcTransportLike["setHandlers"]>[0];
+
+// Exercise the actual IPC state machine, but never launch an installed Desktop
+// from a unit test. Tests of launch intent supply their own recording callback.
+class AndroidDesktopIpcLiveSync extends DesktopIpcLiveSync {
+  constructor(options: ConstructorParameters<typeof DesktopIpcLiveSync>[0]) {
+    super({ openUrl: async () => undefined, ...options });
+  }
+}
 
 class FakeLiveTransport implements DesktopIpcTransportLike {
   connected = true;
@@ -559,6 +567,9 @@ describe("Android Remote Codex Desktop IPC", () => {
     const hugeText = "z".repeat(3 * 1024 * 1024);
     const sync = new AndroidDesktopIpcLiveSync({
       transport,
+      // Large snapshot construction can outlast the follow retry. Keep that
+      // retry in the test double instead of launching a real Desktop window.
+      openUrl: async () => undefined,
       snapshotDebounceMs: 0,
       followConfirmMs: 60_000,
       readThread: async id => ({
@@ -602,6 +613,8 @@ describe("Android Remote Codex Desktop IPC", () => {
     const huge = "q".repeat(400_000);
     const sync = new AndroidDesktopIpcLiveSync({
       transport,
+      // This paging test must never launch an installed Desktop application.
+      openUrl: async () => undefined,
       snapshotDebounceMs: 0,
       readThread: async () => null,
       readThreadPage: async id => ({

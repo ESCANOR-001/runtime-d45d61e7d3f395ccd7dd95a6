@@ -46,6 +46,15 @@ const PUBLIC_PRODUCT_EMAILS = new Set([
   ["support", "remodex.net"].join("@"),
 ]);
 
+// Preserve these exact upstream copyright credits in the packaged licenses.
+// This is not a blanket exception for the file or for these addresses elsewhere.
+const RUST_LICENSE_CREDITS = new Set([
+  `Copyright (C) Jonas Schievink <${["jonasschievink", "gmail.com"].join("@")}>`,
+  `Copyright (c) 2016, Joseph Birr-Pixton <${["jpixton", "gmail.com"].join("@")}>`,
+  `Copyright (c) 2016 Joseph Birr-Pixton <${["jpixton", "gmail.com"].join("@")}>`,
+  `Copyright (c) 2023 Dirkjan Ochtman <${["dirkjan", "ochtman.nl"].join("@")}>`,
+]);
+
 /**
  * Exact fake probes preserved as historic scan evidence in the devlog publication
  * record. Keep this limited to that file and those values: the record proves all
@@ -213,6 +222,8 @@ function scanFile(file: string): Finding[] {
     /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi,
     match =>
       isAllowedEmail(file, match[0])
+      || (file === "experiments/rust-connect/THIRD_PARTY_NOTICES.txt"
+        && RUST_LICENSE_CREDITS.has(lineAt(text, match.index ?? 0).trim()))
       || (file.startsWith("devlog/") && isGitAttributionContext(lineAt(text, match.index ?? 0))),
   );
   addFindingsForPattern(

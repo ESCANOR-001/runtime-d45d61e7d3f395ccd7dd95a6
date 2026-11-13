@@ -15,6 +15,7 @@ import {
   applyProxyEnv,
   armClaudeCodeBaseline,
   loadConfig,
+  getConfigDir,
   saveConfig,
   websocketsEnabled,
 } from "../config";
@@ -66,7 +67,7 @@ import { CatalogGatherBusyError } from "../codex/catalog/provider-fetch";
 import { registerCodexWebSocket, tryReserveCodexWebSocket, unregisterCodexWebSocket, updateCodexWebSocketAuthContext } from "../codex/websocket-registry";
 import { startBackgroundUpdates, stopBackgroundUpdates } from "../update/background";
 import { setUpdateActivityReader } from "../update/activity";
-import { resolveGuiFilePath, rootFallbackPayload, serveGuiFile, serveSessionBootstrap } from "./gui-static";
+import { findGuiDist, resolveGuiFilePath, rootFallbackPayload, serveGuiFile, serveSessionBootstrap } from "./gui-static";
 export { resolveGuiFilePath, rootFallbackPayload } from "./gui-static";
 export { resolveAdapter } from "./adapter-resolve";
 import { formatErrorResponse, type ResponsesTerminalStatus } from "../bridge";
@@ -180,6 +181,7 @@ import { fetchAllModels, handleManagementAPI, VERSION, type ManagementApiDeps } 
 import { createAndroidRemoteStore } from "../android-remote/store";
 import { createAndroidRemoteGatewayController } from "../android-remote/gateway";
 import { startAndroidRemoteRecovery } from "../android-remote/startup-recovery";
+import { startUpgradeSource, type UpgradeStartupOwner } from "../android-remote/upgrade-startup";
 import { ManagedAndroidRemoteCloudflareTunnel } from "../android-remote/cloudflare-tunnel";
 import { listManagementModelRows } from "./management/model-rows";
 import { fetchProviderQuotaReports } from "../providers/quota";
@@ -406,6 +408,19 @@ export interface StartServerDeps {
   localAttestationSecret?: string;
   /** Optional readiness gate; a fresh pending gate is created when omitted. */
   readinessGate?: ReadinessGate;
+}
+
+const nativeUpgradeOwners = new WeakMap<Server<WsData>, Omit<UpgradeStartupOwner, 'published'>>();
+/** Attach to this exact source listener; never discover or stop a different
+ * process. The CLI supplies its PID/timer cleanup and final successful exit. */
+export async function startServerUpgradeSource(server: Server<WsData>, cleanup: () => boolean, published: () => void) {
+  const owner = nativeUpgradeOwners.get(server);
+  if (!owner) throw new Error('This listener does not support a native upgrade');
+  return startUpgradeSource({ ...owner, published, async export(directory, profiles) {
+    const result = await owner.export(directory, profiles);
+    if (!cleanup()) throw new Error('The source lifecycle did not finish; native startup was refused');
+    return result;
+  } });
 }
 
 /*
@@ -1668,6 +1683,20 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
   };
   setUpdateActivityReader(updateActivity);
   if (process.env.REMODEX_CONNECT_ONLY !== "1") startBackgroundUpdates(updateActivity);
+
+  if (process.env.REMODEX_CONNECT_ONLY === '1') nativeUpgradeOwners.set(server, {
+    sourceRoot: androidRemoteStore.stateRoot ?? getConfigDir(),
+    async runtime() {
+      if (getActiveTurnCount() !== 0 || isDraining()) throw new Error('Wait for current work before upgrading');
+      const gui = findGuiDist();
+      if (!gui) throw new Error('The packaged dashboard is unavailable for native upgrade');
+      const runtime = await androidRemoteController.nativeUpgradeRuntime(gui);
+      runtime.configuration.connection = { ...(runtime.configuration.connection as Record<string, unknown> | undefined), dashboard_bind: `127.0.0.1:${server.port}` };
+      return runtime;
+    },
+    export: (directory, profiles) => androidRemoteController.exportForNativeUpgrade(directory, profiles,
+      () => drainAndShutdown(server, config.shutdownTimeoutMs ?? 5000)),
+  });
 
   return server;
 }

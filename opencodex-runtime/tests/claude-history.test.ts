@@ -8,6 +8,37 @@ import { createProjectedThreadStreamState, projectedThreadBoundedSnapshot, readP
 const info = { sessionId: 'native-greeting', summary: 'Greeting', cwd: '/workspace/GlinkBot', createdAt: 1000, lastModified: 2000, fileSize: 200 };
 const msg = (type: string, uuid: string, content: any, parent_tool_use_id: string | null = null) => ({ type, uuid, message: { content }, parent_tool_use_id, timestamp: '2026-10-14T00:00:00.000Z' }) as any;
 
+test('migration reads larger native histories without weakening the phone limit or caching them', async () => {
+ let reads = 0;
+ const h = new ClaudeHistory({ list: async () => [{ ...info, fileSize: 112 * 1024 * 1024 }],
+   messages: async () => { reads++; return [msg('user', 'first', 'Keep the start'), msg('assistant', 'last', 'Keep the end')]; } });
+ await h.refresh(new Set());
+ await expect(h.detail('claude-history-native-greeting', [])).rejects.toThrow('too large');
+ expect(reads).toBe(0);
+ const result = await h.upgradeDetail('claude-history-native-greeting', []);
+ expect(result.messages.map((m: any) => m.id)).toEqual(['first', 'last']);
+ expect(h.cachedDetail('claude-history-native-greeting')).toBeUndefined();
+ const oversized = new ClaudeHistory({ list: async () => [{ ...info, fileSize: 513 * 1024 * 1024 }],
+   messages: async () => { throw new Error('must not read'); } });
+ await oversized.refresh(new Set());
+ await expect(oversized.upgradeDetail('claude-history-native-greeting', [])).rejects.toThrow('bounded migration');
+});
+
+test('native compaction metadata is omitted while identical human text remains visible', async () => {
+ const text = 'This session is being continued from a previous conversation.';
+ const entries = [
+   { ...msg('user', 'summary', text), isCompactSummary: true },
+   { ...msg('user', 'transcript-only', 'Internal display record'), isVisibleInTranscriptOnly: true },
+   msg('user', 'human', text), msg('assistant', 'answer', 'A real answer'),
+ ];
+ const before = structuredClone(entries);
+ const h = new ClaudeHistory({ list: async () => [info], messages: async () => entries });
+ await h.refresh(new Set()); const t = await h.detail('claude-history-native-greeting', []);
+ expect(t.messages.map((m: any) => m.id)).toEqual(['human', 'answer']);
+ expect(t.messages[1].turnId).toBe('history-human');
+ expect(entries).toEqual(before);
+});
+
 test('branch history uses the new UUIDs without publishing an imported Desktop duplicate', async () => {
  const h = new ClaudeHistory({ list: async () => [], info: async () => info,
    messages: async () => [msg('user', 'fork-user', 'Remember this'), msg('assistant', 'fork-answer', 'Remembered')] });

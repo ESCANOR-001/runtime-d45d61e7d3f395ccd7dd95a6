@@ -2080,7 +2080,8 @@ export class AndroidDesktopIpcLiveSync implements AndroidDesktopIpcSync {
         }
         reject(new Error("Codex Desktop did not publish the requested task state"));
       }, this.followerStateTimeoutMs);
-      timer.unref?.();
+      // The pending read owns this deadline even if its transport currently
+      // has no referenced handle. Resolution, rejection and stop clear it.
       const waiter = { resolve: resolvePromise, reject, timer };
       stateWaiter = waiter;
       const waiters = this.followerStateWaiters.get(threadId) ?? new Set();

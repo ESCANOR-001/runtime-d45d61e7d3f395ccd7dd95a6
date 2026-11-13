@@ -9,6 +9,7 @@
  * src/cli/index.ts — only the published npm `bin` routes through here.)
  */
 import { spawn, spawnSync } from "node:child_process";
+import { tryNativeConnect } from "./native-connect.mjs";
 import { randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
 import { existsSync, lstatSync, readFileSync, readdirSync } from "node:fs";
@@ -27,6 +28,14 @@ const PKG = "@remodex/rmx";
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
 const cliPath = join(here, "..", "src", "cli", "connect.ts");
+// Absence retains the compatible source lifecycle. A native package never
+// falls back to TypeScript after an attempted handoff or native startup error.
+try {
+  if (await tryNativeConnect(join(here, ".."))) process.exit(process.exitCode ?? 0);
+} catch (error) {
+  console.error(`Remodex: ${error.message}`);
+  process.exit(1);
+}
 if (["update", "__exact-update"].includes(process.argv[2])) {
   console.error("This private Remodex Connect prototype cannot replace the published npm package.");
   process.exit(64);

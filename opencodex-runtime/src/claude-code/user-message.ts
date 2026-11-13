@@ -18,6 +18,7 @@ export function claudeUserText(content: unknown): string {
 /** CLI control output has the user role but does not start an assistant turn. */
 export function isClaudeControlMessage(event: Record<string, unknown>, text: string): boolean {
   return event.isSynthetic === true || event.isMeta === true || event.shouldQuery === false
+    || event.isCompactSummary === true || event.isVisibleInTranscriptOnly === true
     || /^\s*<local-command-(?:stdout|stderr|caveat)>/.test(text)
     // The SDK history reader can omit isMeta on detached-task notifications.
     // Match its complete control envelope, not tags mentioned inside a prompt.

@@ -2,10 +2,19 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 process.env.REMODEX_CONNECT_ONLY = "1";
-process.env.OPENCODEX_HOME ||= join(homedir(), ".remodex-connect");
 
 const argumentsWithoutProof = process.argv.slice(2).filter(argument => !argument.startsWith("--ocx-internal-launch-proof="));
 const command = argumentsWithoutProof[0];
+// Older installed services invoke this path directly with Bun. Preserve that
+// registration on npm replacement and dispatch to the selected Rust generation.
+// @ts-expect-error npm entry modules run directly without a declaration build.
+const { tryNativeConnect } = await import('../../bin/native-connect.mjs');
+if (await tryNativeConnect(join(import.meta.dir, '../..'), argumentsWithoutProof)) {
+  process.exit(process.exitCode ?? 0);
+}
+// Apply the compatibility default only after native dispatch has had a chance
+// to recognize an existing historical installation.
+process.env.OPENCODEX_HOME ||= join(homedir(), ".remodex-connect");
 const commands = new Set(["onboard", "start", "stop", "restart", "status", "ready", "service", "tray", "gui", "__tray-host", "__tray-start", "__tray-restart", "doctor", "version", "--version", "-v"]);
 
 if (!command || command === "help" || command === "--help" || command === "-h") {

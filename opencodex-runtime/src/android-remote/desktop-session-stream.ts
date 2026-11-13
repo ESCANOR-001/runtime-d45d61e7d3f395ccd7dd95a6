@@ -12,6 +12,7 @@ import {
 } from "./user-message-identity";
 import { boundedTurnErrorMessage } from "./turn-activity";
 import { normalizedCompletedItem } from "./desktop-thread-item";
+import { commandPollSessionId, commandSessionOutput, savedCommandText } from "./command-session-output";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -308,6 +309,12 @@ export class DesktopSessionRecordProjector {
   private readonly structuredItemIds = new Set<string>();
   private readonly structuredToolCalls = new Set<string>();
   private readonly inferredToolWrappers = new Set<string>();
+  // Small, turn-scoped identities only: never retain wrapper source or results.
+  private readonly commandOrigins = new Map<string, {
+    id: string; command: string; startedAtMs: number; completedAtMs?: number; sessionId?: string;
+  }>();
+  private readonly commandPolls = new Map<string, string>();
+  private readonly commandCells = new Map<string, string>();
   private hasStructuredTools = false;
   private contextTurnId: string | null = null;
   private currentTurnId: string | null = null;
@@ -539,10 +546,16 @@ export class DesktopSessionRecordProjector {
       let replacesItemId = "";
       // Replace only an unambiguous inferred row. Different commands, parallel
       // calls, and additional commands inside one wrapper retain their own ids.
+      const processId = stringValue(item.processId);
+      const compatibleProcess = (callId: string): boolean => {
+        const sessionId = this.commandOrigins.get(callId)?.sessionId;
+        return !sessionId || item.type === "commandExecution" && (!processId || processId === sessionId);
+      };
       let candidates = [...this.pendingTools.entries()].filter(([callId, pending]) =>
-        !this.structuredToolCalls.has(callId) && pending.type === item.type && (
+        !this.structuredToolCalls.has(callId) && compatibleProcess(callId) && pending.type === item.type && (
           pending.id === id || (item.type === "commandExecution"
-            && stringValue(pending.command).trim() === stringValue(item.command).trim())
+            && (processId && this.commandOrigins.get(callId)?.sessionId === processId
+              || stringValue(pending.command).trim() === stringValue(item.command).trim()))
         ));
       if (candidates.length === 0 && !["agentMessage", "reasoning", "userMessage", "contextCompaction"].includes(stringValue(item.type))) {
         // Code-mode wrappers can contain several different tools (or poll an
@@ -550,13 +563,28 @@ export class DesktopSessionRecordProjector {
         // first real tool, not an additional Desktop command. Pair only while
         // one such wrapper is pending, and never merge two canonical items.
         candidates = [...this.pendingTools.entries()].filter(([callId, pending]) =>
-          pending.type !== "imageGeneration" && this.inferredToolWrappers.has(callId) && !this.structuredToolCalls.has(callId));
+          pending.type !== "imageGeneration" && compatibleProcess(callId)
+          && this.inferredToolWrappers.has(callId) && !this.structuredToolCalls.has(callId));
       }
       if (candidates.length === 1) {
         const [callId, pending] = candidates[0]!;
         if (pending.id !== id) replacesItemId = stringValue(pending.id);
         this.pendingTools.set(callId, item);
         this.structuredToolCalls.add(callId);
+        this.commandOrigins.delete(callId);
+      } else if (candidates.length === 0 && item.type === "commandExecution") {
+        // A completed wrapper can precede the saved command event. Match its
+        // command and execution interval, not just a repeated command string.
+        const start = payload.started_at_ms;
+        const command = savedCommandText(payload.item);
+        const finished = [...this.commandOrigins.entries()].filter(([, origin]) =>
+          origin.completedAtMs !== undefined && command && origin.command === command
+          && typeof start === "number" && start >= origin.startedAtMs && start <= origin.completedAtMs);
+        if (finished.length === 1) {
+          const [callId, origin] = finished[0]!;
+          if (origin.id !== id) replacesItemId = origin.id;
+          this.commandOrigins.delete(callId);
+        }
       }
       if (completed) {
         this.structuredItemIds.add(id);
@@ -693,6 +721,9 @@ export class DesktopSessionRecordProjector {
       this.structuredItemIds.clear();
       this.structuredToolCalls.clear();
       this.inferredToolWrappers.clear();
+      this.commandOrigins.clear();
+      this.commandPolls.clear();
+      this.commandCells.clear();
       this.hasStructuredTools = false;
       this.pendingTools.clear();
       this.currentTurnPlanMode =
@@ -738,6 +769,9 @@ export class DesktopSessionRecordProjector {
         this.pendingTools.clear();
         this.structuredToolCalls.clear();
         this.inferredToolWrappers.clear();
+        this.commandOrigins.clear();
+        this.commandPolls.clear();
+        this.commandCells.clear();
         this.pendingCompactionId = null;
       }
       return;
@@ -807,13 +841,38 @@ export class DesktopSessionRecordProjector {
       return;
     }
     if (["custom_tool_call", "function_call"].includes(payloadType)) {
+      const commandWaitCell = imageGenerationWaitCell(payload);
+      const waitingCommand = commandWaitCell ? this.commandCells.get(commandWaitCell) : undefined;
+      const waitCallId = stringValue(payload.call_id) || id;
+      if (waitingCommand !== undefined && waitCallId && (!waitingCommand || this.pendingTools.has(waitingCommand))) {
+        this.commandPolls.set(waitCallId, waitingCommand);
+        if (this.commandPolls.size > 64) this.commandPolls.delete(this.commandPolls.keys().next().value!);
+        return;
+      }
       const wrappedToolNames = stringValue(payload.input).matchAll(/\btools\.([A-Za-z0-9_]+)\s*\(/gu);
       const names = [...wrappedToolNames].map(match => match[1]);
       const onlyPollsCommand = payload.name === "write_stdin" || (payload.name === "exec"
         && names.length > 0 && names.every(name => name === "write_stdin"));
+      if (onlyPollsCommand) {
+        const sessionId = commandPollSessionId(payload);
+        const origin = sessionId ? [...this.commandOrigins.entries()].find(([, command]) =>
+          command.sessionId === sessionId && command.completedAtMs === undefined) : undefined;
+        const callId = stringValue(payload.call_id) || id;
+        if (origin && callId && this.pendingTools.has(origin[0])) {
+          this.commandPolls.set(callId, origin[0]);
+          if (this.commandPolls.size > 64) this.commandPolls.delete(this.commandPolls.keys().next().value!);
+          return;
+        }
+      }
       // Polling an existing process is not another command in Desktop's
       // timeline. Its canonical item will update if there is new output/state.
-      if (this.hasStructuredTools && onlyPollsCommand) return;
+      if (this.hasStructuredTools && onlyPollsCommand) {
+        // A poll after the canonical completion can still yield an exec cell.
+        // Suppress that cell's wait calls too; they are not additional tools.
+        this.commandPolls.set(stringValue(payload.call_id) || id, "");
+        if (this.commandPolls.size > 64) this.commandPolls.delete(this.commandPolls.keys().next().value!);
+        return;
+      }
       const planUpdate = planUpdateFromToolCall(payload);
       if (planUpdate) {
         this.emit({
@@ -830,6 +889,12 @@ export class DesktopSessionRecordProjector {
       if (waitingImage) this.pendingTools.delete(waitingImage[0]);
       this.pendingTools.set(callId, item);
       if (stringValue(payload.name) === "exec") this.inferredToolWrappers.add(callId);
+      if (item.type === "commandExecution" && !onlyPollsCommand) {
+        item.androidRemoteInferredCommand = true;
+        this.commandOrigins.set(callId, { id: stringValue(item.id),
+          command: stringValue(item.command).trim().slice(0, 64 * 1024), startedAtMs: at });
+        if (this.commandOrigins.size > 64) this.commandOrigins.delete(this.commandOrigins.keys().next().value!);
+      }
       this.emit({
         method: "item/started",
         params: { threadId: this.threadId, turnId, item, startedAtMs: at },
@@ -837,7 +902,17 @@ export class DesktopSessionRecordProjector {
       return;
     }
     if (["custom_tool_call_output", "function_call_output"].includes(payloadType)) {
-      const callId = stringValue(payload.call_id);
+      const outputCallId = stringValue(payload.call_id);
+      const callId = this.commandPolls.get(outputCallId) ?? outputCallId;
+      this.commandPolls.delete(outputCallId);
+      if (callId === "") {
+        const cell = runningImageGenerationCell(outputString(payload));
+        if (cell) {
+          this.commandCells.set(cell, "");
+          if (this.commandCells.size > 64) this.commandCells.delete(this.commandCells.keys().next().value!);
+        }
+        return;
+      }
       const pending = this.pendingTools.get(callId);
       if (!pending) return;
       const runningCell = pending.type === "imageGeneration" ? runningImageGenerationCell(outputString(payload)) : null;
@@ -845,25 +920,55 @@ export class DesktopSessionRecordProjector {
         this.pendingTools.set(callId, { ...pending, androidRemoteImageCellId: runningCell });
         return;
       }
-      this.pendingTools.delete(callId);
-      this.inferredToolWrappers.delete(callId);
-      if (this.structuredToolCalls.delete(callId) && pending.type !== "imageGeneration") return;
+      // The exec wrapper itself can yield while a process poll is running.
+      // Its later functions.wait result belongs to the same command as well.
+      const commandCell = pending.type === "commandExecution" ? runningImageGenerationCell(outputString(payload)) : null;
+      if (commandCell && this.commandOrigins.has(callId)) {
+        this.commandCells.set(commandCell, callId);
+        if (this.commandCells.size > 64) this.commandCells.delete(this.commandCells.keys().next().value!);
+        return;
+      }
+      for (const [cell, origin] of this.commandCells) if (origin === callId) this.commandCells.delete(cell);
+      if (this.structuredToolCalls.delete(callId) && pending.type !== "imageGeneration") {
+        this.pendingTools.delete(callId);
+        this.inferredToolWrappers.delete(callId);
+        this.commandOrigins.delete(callId);
+        return;
+      }
+      const execution = pending.type === "commandExecution" ? commandSessionOutput(payload) : null;
+      const running = execution !== null && execution.sessionId !== null && execution.exitCode === null;
+      const origin = this.commandOrigins.get(callId);
+      if (origin) {
+        if (running && execution?.sessionId) origin.sessionId = execution.sessionId;
+        else { origin.completedAtMs = at; delete origin.sessionId; }
+      }
       const output = outputString(payload);
-      const failed = failedOutput(output) || pending.androidRemoteImageFailed === true;
+      const failed = (execution ? execution.exitCode !== null && execution.exitCode !== 0 : failedOutput(output))
+        || pending.androidRemoteImageFailed === true;
+      const item = {
+        ...pending,
+        status: running ? "inProgress" : failed ? "failed" : "completed",
+        ...(pending.type === "imageGeneration" ? { generatedImages: generatedImagePaths([pending, payload]) } : {}),
+        ...(pending.type === "commandExecution" ? {
+          aggregatedOutput: execution
+            ? (stringValue(pending.aggregatedOutput) + execution.output).slice(-64 * 1024)
+            : output.slice(-64 * 1024),
+          exitCode: execution ? execution.exitCode : failed ? 1 : 0,
+          ...(execution?.sessionId ? { processId: execution.sessionId } : {}),
+        } : {}),
+      };
+      if (running) this.pendingTools.set(callId, item);
+      else {
+        this.pendingTools.delete(callId);
+        this.inferredToolWrappers.delete(callId);
+      }
       this.emit({
-        method: "item/completed",
+        method: running ? "item/started" : "item/completed",
         params: {
           threadId: this.threadId,
           turnId,
-          item: {
-            ...pending,
-            status: failed ? "failed" : "completed",
-            ...(pending.type === "imageGeneration" ? { generatedImages: generatedImagePaths([pending, payload]) } : {}),
-            ...(pending.type === "commandExecution"
-              ? { aggregatedOutput: output.slice(-64 * 1024), exitCode: failed ? 1 : 0 }
-              : {}),
-          },
-          completedAtMs: at,
+          item,
+          ...(running ? { startedAtMs: origin?.startedAtMs ?? at } : { completedAtMs: at }),
         },
       });
     }

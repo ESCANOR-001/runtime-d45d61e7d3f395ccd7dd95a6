@@ -13,7 +13,7 @@ const roots: string[] = [];
 // realpath can retain an 8.3 TEMP alias while the async API expands it.
 const temporaryRoot = await realpath(tmpdir());
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
-function fixture(modelCatalog?: ModelInfo[]) {
+function fixture(modelCatalog?: ModelInfo[], retirement?: Promise<void>) {
   let rejectSync = false;
   let failFork = false;
   let failBranchRead = false;
@@ -33,7 +33,7 @@ function fixture(modelCatalog?: ModelInfo[]) {
       close: () => { closed = true; wake?.(); },
       interrupt: async () => { events.push({ type: 'result', is_error: true, errors: ['Stopped'] }); wake?.(); },
       stopTask: async (taskId: string) => { events.push({ type: 'system', subtype: 'task_notification', task_id: taskId, status: 'stopped' }); wake?.(); },
-      async *[Symbol.asyncIterator]() { while (!closed) { if (events.length) yield events.shift(); else await new Promise<void>(r => { wake = r; }); } },
+      async *[Symbol.asyncIterator]() { try { while (!closed) { if (events.length) yield events.shift(); else await new Promise<void>(r => { wake = r; }); } } finally { await retirement; } },
     };
     if (input.options.sessionId || input.options.resume) runs.push({ input, q, emit: (e: any) => { events.push(e); wake?.(); } });
     return q;
@@ -53,6 +53,99 @@ function fixture(modelCatalog?: ModelInfo[]) {
   return { rejectSync: (v: boolean) => { rejectSync = v; }, failFork: () => { failFork = true; }, branchRows, reader, failBranchRead: (v: boolean) => { failBranchRead = v; }, forks, root, fake, service, runs, remoteCalls, dispatch, setup, send };
 }
 const flush = () => Bun.sleep(20);
+
+test('upgrade admission ignores settled deduplication receipts but blocks new controls until released', async () => {
+  const f = fixture(); await f.setup(); await flush();
+  try {
+    const release = f.service.reserveUpgradeExport();
+    expect(f.service.upgradeExportRecords().sessions).toHaveLength(1);
+    await expect(f.dispatch({ type: 'thread.meta.update', threadId: 'task', title: 'Blocked' })).rejects.toThrow('Upgrade');
+    await expect(f.service.configure({ enabled: false })).rejects.toThrow('Upgrade');
+    release();
+    await f.dispatch({ type: 'thread.meta.update', threadId: 'task', title: 'Allowed' });
+    await flush();
+    f.service.assertUpgradeSettled();
+    expect(f.service.detail('task').thread.title).toBe('Allowed');
+  } finally { await f.service.close(); }
+});
+
+test('external upgrade preserves its committed cursor and rejects unverified or pending delivery', async () => {
+  const f = fixture(); await f.setup(); await flush();
+  try {
+    const saved = (f.service as any).threads.get('task');
+    saved.external = true;
+    for (const sequence of [undefined, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      saved.bridgeId = 'cse_fixture'; saved.remoteSequence = sequence;
+      expect(() => f.service.reserveUpgradeExport()).toThrow('Upgrade');
+    }
+    saved.remoteSequence = 42; delete saved.bridgeId;
+    expect(() => f.service.reserveUpgradeExport()).toThrow('Upgrade');
+    saved.bridgeId = 'cse_fixture';
+    saved.deliveries = [{ state: 'offered' }];
+    expect(() => f.service.reserveUpgradeExport()).toThrow('Upgrade');
+    saved.deliveries = [];
+    const release = f.service.reserveUpgradeExport();
+    const exported = f.service.upgradeExportRecords().sessions[0]!;
+    expect(exported.external).toBe(true);
+    expect(exported.remoteSequence).toBe(42);
+    expect(exported.bridgeId).toBe('cse_fixture');
+    expect(f.runs).toHaveLength(0);
+    release();
+  } finally { await f.service.close(); }
+});
+
+test('upgrade snapshots dormant external history without opening a relay or changing its source', async () => {
+  const f = fixture(); await f.setup(); await flush();
+  const native = '11111111-2222-4333-8444-555555555555';
+  f.reader.list = async () => [{sessionId:native,cwd:join(f.root,'older-project'),summary:'Dormant',lastModified:1,fileSize:100}] as any;
+  f.branchRows.push({type:'user',uuid:'native-prompt',message:{role:'user',content:'Retain prompt'}},
+    {type:'assistant',uuid:'native-answer',message:{role:'assistant',content:'Retain answer'}});
+  const saved = (f.service as any).threads.get('task'); saved.external = true;
+  saved.bridgeId = 'cse_unverified'; saved.remoteSequence = 0;
+  try {
+    const original = JSON.stringify(saved);
+    const files = readdirSync(join(f.root,'sessions'));
+    const release = await f.service.prepareUpgradeExport();
+    const exported = f.service.upgradeExportRecords().sessions;
+    expect(exported).toHaveLength(2);
+    const dormant = exported.find(s => s.nativeId === native)!;
+    expect(dormant.thread.messages.map((m:any)=>m.text)).toEqual(['Retain prompt','Retain answer']);
+    expect(dormant.thread.session.statusConfidence).toBe('unknown');
+    expect(dormant.thread.latestTurn).toBeNull();
+    expect(f.service.upgradeExportRecords().settings.projects.some(p => p.id === dormant.thread.projectId && p.workspaceRoot === join(f.root,'older-project'))).toBe(true);
+    expect(dormant.external).toBe(true);
+    expect(dormant.bridgeId).toBeUndefined();
+    expect(dormant.upgradeNativeReplay).toBe(true);
+    expect(exported.find(s=>s.thread.id==='task')!.upgradeNativeReplay).toBe(true);
+    expect(JSON.stringify(saved)).toBe(original);
+    expect(readdirSync(join(f.root,'sessions'))).toEqual(files);
+    expect(f.runs).toHaveLength(0); expect(f.remoteCalls).toHaveLength(0);
+    await expect(f.dispatch({type:'thread.meta.update',threadId:'task',title:'Denied'})).rejects.toThrow('Upgrade');
+    release();
+    expect((f.service as any).upgradeHistory.size).toBe(0);
+    saved.deliveries = [{state:'offered'}];
+    await expect(f.service.prepareUpgradeExport()).rejects.toThrow('Upgrade');
+  } finally { await f.service.close(); }
+});
+
+test('No Project creates isolated durable Claude workspaces without inheriting a real project', async () => {
+  const f = fixture(); await f.setup();
+  try {
+    for (const id of ['general-one', 'general-two']) await f.dispatch({ type: 'thread.create', threadId: id,
+      projectId: 'codex-project-chats', workspaceKind: 'projectless', worktreePath: f.root });
+    const one = f.service.detail('general-one').thread;
+    const two = f.service.detail('general-two').thread;
+    expect(one.projectId).toBe('codex-project-chats');
+    expect(f.service.shell().projects.find((project: any) => project.id === one.projectId)?.title).toBe('No Project');
+    expect(one.worktreePath).not.toBe(f.root);
+    expect(one.worktreePath).not.toBe(two.worktreePath);
+    expect(statSync(one.worktreePath).isDirectory()).toBe(true);
+    await f.dispatch({ type: 'thread.turn.start', threadId: 'general-one', message: { text: 'Hello', messageId: 'hello' } });
+    expect(f.runs[0].input.options.cwd).toBe(one.worktreePath);
+    const saved = JSON.parse(readFileSync(join(f.root, 'sessions', `${one.nativeSessionId}.json`), 'utf8'));
+    expect(saved.thread.worktreePath).toBe(one.worktreePath);
+  } finally { await f.service.close(); }
+});
 
 test('branching preserves its source and resumes a separate native history with fresh approvals', async () => {
   const f = fixture(); await f.setup(); await f.service.configure({ desktopSync: true }); await f.send();
@@ -1012,6 +1105,28 @@ test('automatic connection off preserves a running shared chat and enabling it n
 });
 
 const followUp = (id: string, deliveryMode = 'queue') => ({ type: 'thread.turn.start', threadId: 'task', deliveryMode, message: { messageId: id, text: `Prompt ${id}`, attachments: [] } });
+
+test('queued Claude prompts wait for retiring non-shared workers before starting a new turn', async () => {
+  let release!: () => void;
+  const retired = new Promise<void>(resolve => { release = resolve; });
+  const f = fixture(undefined, retired);
+  try {
+    await f.setup(); await f.send(); await f.dispatch(followUp('after-retirement'));
+    f.runs[0].emit({ type: 'result', is_error: false });
+    await flush(); await flush();
+    expect(f.runs).toHaveLength(1);
+    expect(f.service.detail('task').thread.latestTurn.state).toBe('completed');
+    expect(f.service.detail('task').thread.messages.find((m: any) => m.id === 'after-retirement').phase).toBe('queued');
+    release();
+    for (let i=0;i<100 && f.runs.length<2;i++) await flush();
+    expect(f.runs).toHaveLength(2);
+    const prompt = await f.runs[1].input.prompt[Symbol.asyncIterator]().next();
+    expect(prompt.value.message.content[0].text).toBe('Prompt after-retirement');
+    expect(f.service.detail('task').thread.latestTurn.state).toBe('running');
+    f.runs[1].emit({type:'result',is_error:false}); await flush();
+    expect(f.service.detail('task').thread.latestTurn.state).toBe('completed');
+  } finally {release();await f.service.close();}
+});
 
 test('Claude queue is editable, reorderable, cancellable and drains once in FIFO order', async () => {
   const f = fixture(); await f.setup(); await f.service.configure({ desktopSync: true }); await f.send();

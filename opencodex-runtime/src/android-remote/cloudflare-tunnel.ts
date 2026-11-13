@@ -6,6 +6,7 @@ import {
 } from "./cloudflare-secret";
 import { resolveCloudflared, type CloudflaredExecutable } from "./cloudflared";
 import { lookup } from "node:dns/promises";
+import { nativeQuickLauncher, spawnNativeQuick } from './quick-native-launcher';
 
 const QUICK_TUNNEL_URL = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/iu;
 const TUNNEL_CONNECTION_REGISTERED = /\bRegistered tunnel connection\b/iu;
@@ -79,10 +80,14 @@ export interface AndroidRemoteCloudflareTunnel {
     expectedEnvironmentId: string;
   }): Promise<void>;
   stop(): Promise<void>;
+  quickUpgradeHandoff?(): { pid: number; executable: string; public_url: string } | null;
+  retainQuickForUpgrade?(expected: { pid: number; executable: string; public_url: string }): void;
   subscribe(listener: (state: AndroidRemoteCloudflareState) => void): () => void;
 }
 
 type TunnelProcess = {
+  pid?: number;
+  upgradeRetainable?: boolean;
   stdout: ReadableStream<Uint8Array>;
   stderr: ReadableStream<Uint8Array>;
   exited: Promise<number>;
@@ -91,7 +96,7 @@ type TunnelProcess = {
 
 export type AndroidRemoteCloudflareTunnelDeps = {
   resolveCloudflared: () => Promise<CloudflaredExecutable>;
-  spawn: (command: readonly string[], env?: Record<string, string | undefined>) => TunnelProcess;
+  spawn: (command: readonly string[], env?: Record<string, string | undefined>) => TunnelProcess | Promise<TunnelProcess>;
   fetch: typeof fetch;
   /** Diagnose ambiguous fetch errors using the same OS lookup as local clients. */
   lookupHostname?: (hostname: string) => Promise<unknown>;
@@ -107,7 +112,12 @@ export type AndroidRemoteCloudflareTunnelDeps = {
 
 const defaultDeps: AndroidRemoteCloudflareTunnelDeps = {
   resolveCloudflared: () => resolveCloudflared(),
-  spawn: (command, env) => Bun.spawn([...command], {
+  spawn: async (command, env) => {
+    if (process.platform === 'win32' && command.includes('--url')) {
+      const binary = await nativeQuickLauncher();
+      if (binary) return spawnNativeQuick(binary, command[0]!, new URL(command[command.indexOf('--url')+1]!).host, command[command.indexOf('--protocol')+1]!);
+    }
+    return Bun.spawn([...command], {
     // The supervisor restarts this background helper when it exits. Keep every
     // launch hidden so closing a console cannot trigger another visible window.
     windowsHide: true,
@@ -115,7 +125,7 @@ const defaultDeps: AndroidRemoteCloudflareTunnelDeps = {
     stdout: "pipe",
     stderr: "pipe",
     ...(env ? { env } : {}),
-  }) as unknown as TunnelProcess,
+  }) as unknown as TunnelProcess; },
   fetch,
   lookupHostname: hostname => lookup(hostname),
   sleep: milliseconds => Bun.sleep(milliseconds),
@@ -297,6 +307,7 @@ export class ManagedAndroidRemoteCloudflareTunnel implements AndroidRemoteCloudf
   private desiredKey = "";
   private generation = 0;
   private process: TunnelProcess | null = null;
+  private processExecutable: string | null = null;
   private registeredProcess: TunnelProcess | null = null;
   private verificationFlight: { process: TunnelProcess; result: Promise<PublicGatewayVerification> } | null = null;
   private hasNamedTunnelToken: boolean | null = null;
@@ -486,6 +497,27 @@ export class ManagedAndroidRemoteCloudflareTunnel implements AndroidRemoteCloudf
     this.publish(stopped(this.current.mode));
   }
 
+  quickUpgradeHandoff(): { pid: number; executable: string; public_url: string } | null {
+    if ((this.deps.platform ?? process.platform) !== 'win32' || this.current.mode !== 'quick'
+      || this.current.status !== 'ready' || !this.current.publicUrl || !this.process?.pid
+      || !this.process.upgradeRetainable || this.process !== this.registeredProcess || !this.processExecutable) return null;
+    return { pid: this.process.pid, executable: this.processExecutable, public_url: this.current.publicUrl };
+  }
+
+  retainQuickForUpgrade(expected: { pid: number; executable: string; public_url: string }): void {
+    if (JSON.stringify(this.quickUpgradeHandoff()) !== JSON.stringify(expected)) {
+      throw new Error('The temporary connection changed; the original bridge remains active.');
+    }
+    // The Rust launcher has pinned this exact process identity before requesting
+    // the export. Relinquish restart/kill ownership; the source exits normally
+    // after its durable export, while cloudflared keeps the phone's old address.
+    this.desiredKey = 'disabled';
+    ++this.generation;
+    this.process = null;
+    this.registeredProcess = null;
+    this.processExecutable = null;
+  }
+
   private currentGeneration(generation: number): boolean {
     return generation === this.generation && this.desiredKey !== "disabled";
   }
@@ -593,7 +625,7 @@ export class ManagedAndroidRemoteCloudflareTunnel implements AndroidRemoteCloudf
       // the last working protocol (HTTP/2 initially), then rotate only if no
       // connector reaches the edge within the bounded registration window.
       const protocolArgs = ["--protocol", protocol];
-      child = this.deps.spawn(
+      child = await this.deps.spawn(
         mode === "quick"
           ? [
               executable.path,
@@ -612,6 +644,7 @@ export class ManagedAndroidRemoteCloudflareTunnel implements AndroidRemoteCloudf
       token = null;
     }
     this.process = child;
+    this.processExecutable = executable.path;
 
     if (!this.currentGeneration(generation)) {
       if (this.process === child) this.process = null;

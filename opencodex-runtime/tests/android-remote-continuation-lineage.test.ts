@@ -181,6 +181,8 @@ for (const largeRecord of [false, true]) {
   });
 }
 
+// Constructing and scanning the >64 MiB fixture can exceed Bun's default 5s
+// budget late in the isolated full suite. Keep the rejection assertion intact.
 test("rejects a parent record above the 64 MiB recovery limit", async () => {
   const f = await setup();
   const prefix = encode([
@@ -194,7 +196,7 @@ test("rejects a parent record above the 64 MiB recovery limit", async () => {
   const result = await f.recovery.enrichThread({ id: "task", path: leaf, turns: [{ id: "native", items: [] }] });
   expect(ids(result)).toEqual(["native"]);
   expect(result.androidRemoteHistoryRecoveryError).toContain("could not be verified");
-});
+}, 15_000);
 
 test("resolves a linked ancestor with a different logical id and applies rollback across the boundary", async () => {
   const f = await setup();

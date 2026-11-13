@@ -70,13 +70,25 @@ export class ClaudeHistory {
     };
   }
   async detail(id: string, projects: Row[]): Promise<Row> {
+    return this.readDetail(id, projects, 16 * 1024 * 1024, true);
+  }
+  /** Migration runs one history at a time and retains no UI cache. Its native
+   * proof has a separate 512 MiB bound; the phone's interactive limit must not
+   * prevent importing older transcripts containing large tool payloads. */
+  async upgradeDetail(id: string, projects: Row[]): Promise<Row> {
+    return this.readDetail(id, projects, 512 * 1024 * 1024, false);
+  }
+  private async readDetail(id: string, projects: Row[], maxBytes: number, cache: boolean): Promise<Row> {
     const info = this.entries.get(id);
     if (!info) throw new TypeError('Claude Code history was not found. Refresh the chat list.');
     const cached = this.cached.get(id);
     if (cached?.stamp === info.lastModified) { cached.thread.projectId = this.shell(id, info, projects).projectId; return cached.thread; }
-    if ((info.fileSize ?? 0) > 16 * 1024 * 1024) throw new Error('This Claude history is too large to load on the phone. Open it in Claude Desktop.');
+    if ((info.fileSize ?? 0) > maxBytes) throw new Error(cache
+      ? 'This Claude history is too large to load on the phone. Open it in Claude Desktop.'
+      : 'This Claude transcript exceeds the bounded migration size. Its original history was retained.');
     const rows = await this.reader.messages(info.sessionId, { dir: info.cwd });
     const thread = { ...this.shell(id, info, projects), ...projectHistory(id, rows, info, this.images) };
+    if (!cache) return thread;
     this.cached.delete(id); this.cached.set(id, { stamp: info.lastModified, thread });
     while (this.cached.size > 4) this.cached.delete(this.cached.keys().next().value!);
     return thread;

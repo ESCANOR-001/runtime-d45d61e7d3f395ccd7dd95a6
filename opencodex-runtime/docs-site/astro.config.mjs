@@ -86,6 +86,7 @@ export default defineConfig({
             { label: "Model Routing", translations: { ko: "모델 라우팅", "zh-CN": "模型路由", ru: "Маршрутизация моделей", ja: "モデルルーティング" }, slug: "guides/model-routing" },
             { label: "Codex Integration", translations: { ko: "Codex 통합", "zh-CN": "Codex 集成", ru: "Интеграция с Codex", ja: "Codex 連携" }, slug: "guides/codex-integration" },
             { label: "Codex App Model Picker", translations: { ko: "Codex App 모델 선택기", "zh-CN": "Codex App 模型选择器", ru: "Выбор модели в Codex App", ja: "Codex App モデルピッカー" }, slug: "guides/codex-app-models" },
+            { label: "Android Projects and PCs", slug: "guides/android-project-picker" },
             { label: "Model Ordering", translations: { ko: "모델 정렬에 관하여", "zh-CN": "模型排序", ru: "Сортировка моделей", ja: "モデルの並び順" }, slug: "guides/model-ordering" },
             { label: "Combos", translations: { ko: "콤보", "zh-CN": "组合", ru: "Комбо", ja: "コンボ" }, slug: "guides/combos" },
             { label: "Claude Code", translations: { ko: "Claude Code", "zh-CN": "Claude Code", ru: "Claude Code", ja: "Claude Code" }, slug: "guides/claude-code" },

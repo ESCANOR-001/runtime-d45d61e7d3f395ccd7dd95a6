@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import * as childProcess from "node:child_process";
 import { spawn } from "node:child_process";
 import { readFileSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -450,7 +451,7 @@ describe("Windows Win32_Process owner enumeration (#476)", () => {
   });
 
   test.skipIf(process.platform !== "win32")(
-    "listWindowsSnapshots returns a current-user Codex-shaped process via real PowerShell enumeration",
+    "listWindowsSnapshots returns an isolated current-user fixture via real PowerShell enumeration",
     () => {
       // Use a real interpreter entrypoint, rather than mentioning Codex inside
       // a PowerShell comment (which must be excluded before owner lookups).
@@ -462,6 +463,30 @@ describe("Windows Win32_Process owner enumeration (#476)", () => {
         [fixtureEntry, "app-server", "integration-probe"],
         { stdio: "ignore", windowsHide: true },
       );
+      const execFileSync = childProcess.execFileSync;
+      const enumerateFixture = spyOn(childProcess, "execFileSync").mockImplementation(((file, args, options) => {
+        if (file !== "powershell.exe" || !Array.isArray(args)) {
+          throw new Error("Unexpected process enumeration command");
+        }
+        const scopedArgs = [...args];
+        const commandIndex = scopedArgs.indexOf("-Command") + 1;
+        if (commandIndex === 0 || !scopedArgs[commandIndex]) {
+          throw new Error("Missing PowerShell enumeration script");
+        }
+        // Keep real CIM enumeration, GetOwner, filtering and output parsing,
+        // but scope the input to our child. Another user's protected process or
+        // an unrelated process exiting mid-query must not poison this fixture.
+        // Production intentionally rejects incomplete machine-wide results.
+        scopedArgs[commandIndex] = [
+          "function Get-CimInstance {",
+          "  param([string]$ClassName)",
+          "  if ($ClassName -ne 'Win32_Process') { throw 'Unexpected CIM class' }",
+          `  CimCmdlets\\Get-CimInstance -ClassName $ClassName -Filter 'ProcessId = ${child.pid}'`,
+          "}",
+          scopedArgs[commandIndex],
+        ].join("\n");
+        return execFileSync(file, scopedArgs, options);
+      }) as typeof childProcess.execFileSync);
       try {
         expect(child.pid).toBeGreaterThan(1);
         // Brief settle so Win32_Process can observe the child. A loaded Windows
@@ -472,8 +497,11 @@ describe("Windows Win32_Process owner enumeration (#476)", () => {
         const enumerate = (): ReturnType<typeof listWindowsSnapshots> | undefined => {
           try {
             return listWindowsSnapshots();
-          } catch {
-            return undefined; // transient CIM deadline on a contended runner
+          } catch (error) {
+            // Only an actual deadline is transient. Never conceal ownership,
+            // script or parsing failures behind an empty result.
+            if ((error as NodeJS.ErrnoException).code !== "ETIMEDOUT") throw error;
+            return undefined;
           }
         };
         let snapshots = enumerate() ?? [];
@@ -493,6 +521,7 @@ describe("Windows Win32_Process owner enumeration (#476)", () => {
         expect(isCodexAppServerCommandLine(match!.commandLine)).toBe(true);
         expect(snapshots.every(snapshot => (snapshot.owner?.trim().length ?? 0) > 0)).toBe(true);
       } finally {
+        enumerateFixture.mockRestore();
         try {
           child.kill();
         } catch {
@@ -503,6 +532,17 @@ describe("Windows Win32_Process owner enumeration (#476)", () => {
     },
     { timeout: 35_000 },
   );
+
+  test("an unverified owner rejects the entire result, including verified rows", () => {
+    const enumeration = spyOn(childProcess, "execFileSync").mockReturnValue(
+      "123\tcodex.exe app-server\tTEST-PC\\fixture\n__OCX_ENUM_INCOMPLETE__\n",
+    );
+    try {
+      expect(() => listWindowsSnapshots()).toThrow("windows_enum_incomplete");
+    } finally {
+      enumeration.mockRestore();
+    }
+  });
 });
 
 /*

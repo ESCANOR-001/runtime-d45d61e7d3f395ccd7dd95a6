@@ -48,7 +48,7 @@ import { hydrateProviderEnvironment } from "../lib/provider-environment";
 import { assertServiceEnvironmentMatchesInstall, diagnoseService, isServiceOwnershipError, isServiceInstalled, requestServiceStop, serviceCommand, serviceEnvironmentOwnedHere, serviceStartableFromTray, serviceStatusSummary, stopServiceIfInstalled, uninstallServiceIfInstalled } from "../service";
 import { clearServiceStopRequest, isServiceStopRequested } from "../lib/service-stop-marker";
 import { startupHealthSummary } from "../codex/autostart-health";
-import { drainAndShutdown, isRecyclingForExit, startServer } from "../server";
+import { drainAndShutdown, isRecyclingForExit, startServer, startServerUpgradeSource } from "../server";
 import { injectSystemEnv, revertSystemEnv } from "../server/system-env";
 import { buildDesktop3pRegistry } from "../claude/desktop-3p";
 import { installShellHook, uninstallShellHook } from "../server/system-env";
@@ -372,6 +372,7 @@ async function handleStart(options: { block?: boolean } = {}) {
   };
 
   let shuttingDown = false;
+  let nativeUpgrade: Awaited<ReturnType<typeof startServerUpgradeSource>> | undefined;
   let shutdownStartedAt = 0;
   // Terminal Ctrl-C delivers SIGINT to the whole foreground group AND the launcher
   // forwards its own — two signals land within milliseconds. Treat a duplicate inside
@@ -392,6 +393,7 @@ async function handleStart(options: { block?: boolean } = {}) {
     void (async () => {
       try {
         await drainAndShutdown(server, config.shutdownTimeoutMs ?? 5000);
+        await nativeUpgrade?.close();
       } finally {
         const restored = syncCleanup(); // idempotent (cleaned-guard); also re-run by process.on("exit")
         process.exit(restored ? 0 : 1);
@@ -465,8 +467,17 @@ async function handleStart(options: { block?: boolean } = {}) {
   }
   try {
     const { ensureDefaultAutoUpdateScheduler } = await import("../update/auto-scheduler");
-    ensureDefaultAutoUpdateScheduler();
+    if (process.env.OCX_NATIVE_UPGRADE_SOURCE !== '1') ensureDefaultAutoUpdateScheduler();
   } catch { /* default updater provisioning must never block proxy startup */ }
+  if (isConnectRuntime()) {
+    try {
+      nativeUpgrade = await startServerUpgradeSource(server, syncCleanup, () => process.exit(0));
+    } catch {
+      // Existing interrupted attempts must not be overwritten just to make an
+      // update appear available. Ordinary source work can continue unchanged.
+      console.warn('Native upgrade registration is unavailable; existing recovery files were retained.');
+    }
+  }
   if (options.block ?? true) {
     setInterval(() => {}, 60_000);
     await new Promise<void>(() => {});

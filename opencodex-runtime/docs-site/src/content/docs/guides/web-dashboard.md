@@ -348,8 +348,10 @@ limited to 64 KiB and each structured tool object is limited to 128 KiB, 256 ent
 per array. Remodex labels truncated data instead of silently presenting it as complete.
 
 The Android composer accepts images and, when connected to Remodex, ordinary files selected from
-the phone. A prompt may contain up to eight attachments, each attachment may be up to 10 MB, and the
-combined decoded size may be up to 40 MB. Remodex stores them in a protected per-phone staging
+the phone. With the updated native bridge, a prompt may contain up to eight attachments,
+each up to 100 MiB and up to 250 MiB combined. Composer cards show upload progress and
+allow retrying failures; [resumable uploads](/guides/connect-prototype/#uploading-attachments-from-android)
+start when files are selected. Legacy inline uploads retain their 10 MiB/file and 40 MiB/message limits. Remodex stores them in a protected per-phone staging
 folder on the computer. Images are passed to Codex as native local images; other files are referenced
 by their protected computer-local path.
 

@@ -23,7 +23,7 @@ export class AndroidRemoteCloudflareSecretError extends Error {
   }
 }
 
-function keyringAccount(configDir = getConfigDir()): string {
+export function keyringAccount(configDir = getConfigDir()): string {
   return createHash("sha256")
     .update("opencodex-android-remote-cloudflare-v1\0")
     .update(configDir)

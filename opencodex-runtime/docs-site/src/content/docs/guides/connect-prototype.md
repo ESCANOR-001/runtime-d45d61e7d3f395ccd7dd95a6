@@ -5,7 +5,240 @@ description: Native Codex activity and read-only configuration in the unpublishe
 
 This page describes the **unpublished, private Connect fork**, not the existing npm release. Other universal-provider documentation in this source copy describes the legacy product and does not enable those features in Connect.
 
-Connect remains the `@remodex/rmx` npm package with the `rmx` command and a browser dashboard. There is no separate desktop application or native installer in this product's build or npm payload.
+Connect remains the `@remodex/rmx` npm package with the `rmx` command and a browser dashboard. There is no separate desktop application. The private native package includes Rust setup commands; a standalone OS installer is not provided.
+
+The native bridge checks for current chat-list changes whenever the phone opens
+its list connection, including on phones that omit the manual-refresh flag.
+Newly discovered chats receive their first status check in that same scan.
+An unchanged open chat is not resent when another chat changes. When one activity
+changes and the phone has the preceding update, the bridge sends that activity;
+other changes and reconnects still receive a complete current snapshot. One
+history reader remains available for an open chat or pending send while older
+background histories are being checked. These improvements use the existing
+Android protocol and do not require a new APK.
+
+The updated Android app retains a bounded, in-memory chat cache when returning
+to the thread list. Reopening a recent chat can show its downloaded messages
+while requesting a fresh snapshot. The cache belongs to the authenticated PC
+connection, keeps at most three chats within an 8 MiB budget, and is not written
+to disk. It does not mark cached task status as freshly confirmed. This phone-side
+improvement requires the updated APK; server-only updates cannot add it.
+
+Saved-history recovery uses bounded record buffers and reads indexed messages
+directly from ordinary history files. Compressed history is decoded in one
+forward pass per page. Neither path rewrites the original Codex history.
+
+## Native npm setup (unreleased)
+
+In a locally built native package, `rmx onboard` prepares a fresh Rust installation
+using the existing Codex and/or Claude Code CLI profiles. Install and sign in to
+the desired CLI first. `rmx start` prepares setup when needed and runs the native
+bridge; `rmx status`, `rmx restart` and `rmx stop` control that saved installation.
+Fresh setup does not launch the legacy Bun server or create a test chat.
+
+The first-run connection is Local Wi-Fi, with a loopback dashboard at port 10100
+and a phone listener at port 10105. `rmx onboard --port PORT` changes the initial
+dashboard port and uses `PORT + 5` for the phone. An advanced configuration may
+be supplied with `rmx onboard --config FILE`. Both ports must be available, and
+network/firewall settings must permit the phone connection. Native remote and
+background startup commands are described below; live Windows/macOS and
+Cloudflare-account qualification remain release gates.
+
+Keep the same `OPENCODEX_HOME` when upgrading (fresh default `~/.remodex-connect`).
+A single recognized older `.remodex` or `.opencodex` installation is reused;
+multiple recorded installations require an explicit `OPENCODEX_HOME`. Setup
+and pairing live outside npm's package files. Onboarding is idempotent and will
+not overwrite a configured installation. Missing generated configuration can be
+restored from its saved receipt; changed or conflicting recovery records produce
+an error while retaining existing data. Do not delete those records to retry.
+
+The native distribution uses the Rust executable directly for `rmx`, with no
+Node/Bun launcher or installation script. The executable's `package` command
+builds the private platform-specific archive from the executable and static
+dashboard. It verifies the executable's recorded hash when run from that package.
+
+Existing legacy Connect installations use `rmx start` to enter the verified
+export/upgrade path instead of fresh onboarding. The old running owner must
+provide the registered v1 handoff, or a previously closed-owner export must be
+available. `rmx migrate` prepares that handoff without starting the new server;
+`rmx start` activates it. The new package does not launch a TS compatibility owner.
+Releases lacking the handoff must first run a compatible source release; missing
+evidence stops the upgrade while preserving saved data. Compatibility source and
+public Bun library exports remain in the separate legacy product and its tests,
+outside the Rust-built package.
+Provider-proxy routing and persistent terminals are not represented as migrated
+features. These changes do not publish the native package or enable self-update
+from the older public package.
+
+## Native configuration, remote access and startup (unreleased)
+
+`rmx config show` returns the current revision and configuration. Save the
+`configuration` object to a JSON file, edit it, and validate with
+`rmx config check FILE`. Stop the bridge, then use
+`rmx config apply FILE --revision N` with the reviewed revision and restart.
+`rmx config rollback OLD_REVISION --revision CURRENT_REVISION` restores settings
+as a new revision, retaining current chat data and pairing. Profile switching is
+not allowed. Migrated installations keep their original upgrade evidence and
+must have completed their first native startup before editing.
+
+If a Codex update removes its old executable, use the same configuration flow to
+update `codex.executable` and `codex.shared_server.reader_executable` to the current
+installed program. Keep the existing profile, Desktop endpoint, reader workspace
+and activation settings. The new executable must exist; replacement programs are
+not selected or downloaded automatically.
+
+For remote access, stop the bridge and choose `rmx remote local --revision N`,
+`rmx remote quick --revision N`, or `rmx remote named HOST --revision N`.
+Named mode reads a connector token from piped standard input and stores it in the
+OS credential store. `rmx remote provision ACCOUNT_ID ZONE_ID HOST --revision N`
+accepts a scoped Cloudflare API token on stdin, provisions the tunnel/DNS, and
+stores only the resulting connector token. It requires Tunnel Edit, DNS Edit and
+zone read access. Never place tokens in command arguments. Linux requires a
+working Secret Service. Existing conflicting DNS and routes are left intact.
+
+Start the bridge and open the dashboard to verify the endpoint before reconnecting
+the phone. On Windows, a compatible running TS source can keep its temporary
+internet connector alive while Rust takes over. The upgrade retains the same
+internet address and pairing, including for a phone reopened after the handover.
+Ordinary Rust restarts retain that inherited connector too. If the source cannot
+prove it can retain a live temporary connection, the upgrade stops before shutting
+down the old server. Selecting Local Wi-Fi does not bypass that check.
+Remote provisioning is currently a native CLI flow;
+account discovery and a graphical provisioning wizard are not included.
+
+The native server refreshes its LAN addresses while running, so changing the PC's
+Wi-Fi or wired network updates the dashboard, new pairing codes and connected
+phones. Windows uses active Wi-Fi/Ethernet adapters with a usable gateway rather
+than retaining the address selected at startup. Address discovery runs outside
+chat handling and does not restart Codex or Claude workers.
+
+A network change restarts only the named-tunnel connector, retaining its hostname
+and phone pairings. Temporary tunnel failures tell Android that verification is
+pending; they do not instruct it to delete its saved remote address. Turning off
+remote access still removes that route. Quick tunnels retain their current
+connector during temporary verification failures to avoid changing the URL;
+if that helper exits or the PC restarts, its old temporary URL cannot be recovered.
+An inherited route reports that failure instead of silently changing the address.
+Use a named hostname for automatic remote recovery across a PC reboot or connector
+replacement. Fresh native quick tunnels also change when the server restarts;
+the retained-connector behavior applies to the verified Windows handover.
+A phone with only an obsolete LAN address needs a reachable
+saved remote route or a new pairing code to discover the PC's new address.
+
+For background startup, stop the bridge, run `rmx service prepare DIR` using a
+new absolute directory outside npm's package files, then `rmx service install DIR`
+and `rmx service start DIR`. The prepared directory pins the executable and
+dashboard. `rmx service status DIR` inspects the exact registration. Linux uses a
+user systemd service, macOS a LaunchAgent, and Windows a hidden logon task.
+These registrations do not require administrator credentials.
+
+Windows packages include a small `remodex-startup.exe` companion, also written
+in Rust. It opens no command window and keeps the startup task running until the
+server exits. New registrations use Windows' native Task Scheduler controls;
+they do not execute PowerShell or change script policy. Service preparation pins
+and checks both executables. Older PowerShell registrations must be stopped and
+replaced using a newly prepared directory. A source build needs both binaries:
+`cargo build --locked --bin remodex-connect-native --bin remodex-startup`.
+These changes do not guarantee antivirus clearance or remove publisher warnings.
+The Windows beta 3 implementation keeps the phone-facing executable in a persistent
+`windows-runtime` directory inside the saved installation. Package and startup
+folders can change without changing that executable's firewall path. Windows
+may request permission once when adopting it; subsequent updates and restarts
+reuse the existing rule. Setup reserves ports without opening temporary
+listeners. Remodex does not suppress firewall prompts or change Defender
+settings. Changed network profiles, deleted rules, or administrator policy may
+still require permission changes.
+
+If a Codex Desktop update removes its managed Windows CLI file, beta 3
+resolves the single replacement in the same installation when checking or
+opening a connection. It retains the saved chat/profile selection and does not
+search PATH for an unrelated replacement. Ambiguous or custom paths require an
+explicit selection rather than guessing.
+
+The beta 4 compatibility fix supports older npm 1.2.27 folders that lack
+`.opencodex-owner.json`, an uninstall record the old version only creates in an
+empty folder. Keep the original saved-data folder and the same `OPENCODEX_HOME`
+path spelling so the PC identity and phone pairing remain the same. The new
+reader still rejects an existing record that is damaged or belongs to another
+folder, and still verifies the saved connection and chat data. Beta 3
+does not include this fix. Do not create or remove that file to force migration.
+
+Windows rollback with the new CLI requires two Rust startup registrations. It can
+inspect/remove a stopped legacy PowerShell registration, but cannot reinstall it
+automatically if replacement fails; its files and chat data are retained.
+
+After an update, prepare a new directory, stop the old bridge, and run
+`rmx service replace NEW_DIR OLD_DIR`, followed by `rmx service start NEW_DIR`.
+The old executable is retained for rollback. Uninstalling the exact registration
+with `rmx service uninstall DIR` requires the bridge to be stopped and retains
+all state. Foreign service registrations are not replaced.
+Interrupted, unregistered preparation can be retried in a new directory while
+retaining the incomplete copy. Windows per-user task installation, start, stop,
+restart, replacement and startup after a Windows sign-in have been exercised
+locally. macOS service behavior still needs live qualification before release.
+
+For a Windows legacy upgrade started with `rmx start`, an enabled startup task
+belonging to the old profile is transferred automatically. Remodex checks that
+it can change the task and checks the new files before stopping the old server.
+It saves the old definition, then pins the new files after handover, disables the
+old entry and starts the Rust background task.
+Manual startup and disabled startup remain manual or disabled. A protected task
+that cannot be changed, a foreign task or a legacy WinSW system service stops the
+upgrade before shutdown; system-service migration is not supported by this candidate.
+Older npm releases without the verified handover still require a compatible source
+release first. These checks do not establish support for every historical version.
+
+`rmx features` lists native capabilities and retained product boundaries. The
+legacy tray, persistent interactive terminal, and preview-server manager are
+retired from **native Connect**; use the dashboard/service commands and the PC's
+project tools. The public Bun API, provider proxy, standalone relay, and legacy
+upgrade compatibility are retained separately. No broad TypeScript deletion or
+published-package deprecation occurs through this private implementation.
+
+The [native Connect compatibility policy](/guides/connect-compatibility) defines
+the support window, exact-version upgrade matrix, and evidence required before
+removing legacy backend code. Its release clock has not started.
+
+## Rust upgrade qualification (unreleased)
+
+The isolated Rust replacement can run with Codex, Claude Code, both, or neither
+configured. An unavailable agent is shown as unavailable; the bridge does not
+create a substitute agent profile or resend saved messages.
+
+The upgrade path preserves the original agent directories and phone pairing.
+A Codex-only installation does not need an unused Claude installation to export
+its history. An explicitly configured but missing or broken profile still blocks
+the upgrade, as does a saved chat whose required profile is unavailable. Repair
+that profile before retrying; an upgrade must not silently discard its chats.
+
+Codex histories may be stored as plain `.jsonl` files or compressed `.jsonl.zst`
+files. Migration reads either form without rewriting the original profile.
+Questions and running turns owned by Codex Desktop remain with that same owner
+when their original chat history is verified. Unfinished work owned by Remodex,
+including queued messages and pending replies, still blocks the handoff.
+Saved model choices for old phone drafts without a native chat are retained as
+inactive metadata; migration does not create a chat for them.
+
+Turning off Claude Desktop sharing does not prevent verified history from being
+migrated. The upgrade preserves that setting and the saved connection cursor;
+it does not enable sharing or start a replacement CLI for a Desktop-owned chat.
+
+Migration reads large histories separately from the phone's interactive history
+limit. It retains verified attachment bytes, including images embedded in older
+Claude transcripts after resizing. Saved interrupted or failed turns do not count
+as running work. Older prompt-ID ledgers and multiline titles are supported.
+Unmapped cached Claude messages remain visible history; migration does not replay
+them or invent native delivery records. Attachments and file-restore checkpoints
+still require verified native evidence.
+
+Selections and aliases for unavailable Codex chats, and unused Claude drafts with
+no transcript, are retained verbatim in the migration receipt for recovery. They
+are not converted into executable sessions. The source profiles and recovery
+copies remain in place. An unavailable native history for a nonempty managed
+chat, conflicting identity, or unverified attachment still blocks activation.
+
+These changes remain under qualification. They do not enable the published
+updater or make the experimental native package a supported production release.
 
 ## Dashboard sections
 
@@ -44,6 +277,10 @@ Update checks distinguish network failures, timeouts, unavailable release channe
 
 ## Onboarding without service installation
 
+The following describes the compatibility TypeScript onboarding flow. Native
+packages use the explicitly scoped setup path above; they do not silently launch
+this flow when native setup fails.
+
 On Windows, macOS, and Linux, `rmx onboard` prepares local settings, reuses a verified running instance or starts a hidden background process for the current user, then verifies a usable connection before reporting QR pairing ready. It does not install, repair, or require an operating-system service. Progress messages continue while waiting. Existing Codex settings remain untouched.
 
 Fresh Connect profiles use dashboard port 10100, Android gateway port 10105, and private Codex port 10106. Onboarding, service setup, recovery, and restart keep their configured ports. If a port is occupied or its existing peer is incompatible, setup reports the conflict rather than silently switching ports. Other listeners are left running. Gateway startup uses the same bounded retries on Windows, macOS, and Linux, showing a starting state while retrying.
@@ -64,7 +301,10 @@ On the phone, choose **Add connection** and scan the QR from the additional comp
 
 Saved computers remain available when adding another connection, including when confirmation of the new connection fails. A shared Wi-Fi address alone does not identify a computer: Windows, Linux, and macOS installations can reuse the same address. Remodex keeps their pairings separate and updates an existing saved computer only when its identity or issued phone credential matches.
 
-## Windows tray icon
+## Compatibility package: Windows tray icon
+
+This tray belongs to the retained TypeScript package. Native Connect retires it
+and directs users to the dashboard and `rmx service` commands instead.
 
 Run `rmx tray install` to add the Remodex icon beside the Windows clock and start it automatically when you sign in. The tray is separate from the background service: enabling the service alone does not install the icon. Windows may place it under the hidden-icons arrow.
 
@@ -104,26 +344,83 @@ This fork still needs fresh Windows installation and real-phone pairing checks b
 
 On Windows, service setup checks both the current and legacy task names. It repairs and reuses an existing task whose launcher belongs to the current profile, and creates a new task only when neither exists. Duplicate tasks, an unreadable task list, or another profile's launcher require attention before setup proceeds. The Advanced Settings page retains the last known status during a refresh and keeps a failed status request visible while retrying.
 
+### Android reconnect and list refresh
+
+The Rust bridge sends the complete saved chat list when a phone connects or
+explicitly refreshes it. A manual Codex refresh also schedules a read of the
+newest native chat page immediately, without waiting for the usual five-second
+inventory check. The saved list stays available while that read finishes.
+
+Background notifications do not resend an unchanged list or unchanged provider
+configuration. When just one list row changes, the bridge sends that row using
+the Android app's existing update format. If several rows change together, it
+sends a complete replacement so no changes are lost. Reconnecting always starts
+with a complete snapshot, including after a server restart.
+
 ### Android chat history
 
-Completed chats initially show the latest ten prompts with their replies and
-collapsed Work sections. A running chat prioritizes its current response and
-live activity, including steering messages, then fills in the remaining recent
-prompts in the background. Queued follow-ups stay visible while you steer the
-current response. Recovered responses whose original prompt is missing still
-load in bounded pages. Incomplete-history warnings remain visible during work.
-Scrolling toward older history prefetches the next ten prompts near the oldest
-two loaded prompts. Already loaded messages are reused when scrolling back.
-Network delays keep the existing conversation visible with a loading indicator.
+Some migrated Windows Codex profiles retain their saved chat files but have an
+empty paginated history index. The Rust bridge can still recover the last task's
+completed, stopped, or failed result from verified records in that chat's file,
+including compressed files. Finished chats keep their recorded completion time
+in the chat list. An unfinished, damaged, or partially written record keeps its
+status unverified. Recovering this result does not rebuild Codex's history index,
+claim a live Desktop connection, or resend a prompt.
 
-Expand Work to fetch its historical entries in bounded pages. Long Work sections
+When the native index is empty, opening a chat in the canonical
+paginated format also recovers its saved messages directly from that same file.
+The Rust reader keeps the original turn and message IDs, reads small pages, and
+does not rewrite the Codex profile. It projects saved display items only; model
+context and internal instructions are not conversation messages. Changed sources
+invalidate old page cursors so the chat can be reopened safely. Forks and reverts
+follow the exact saved source and cutoff, excluding later parent messages.
+Attached-agent history still requires a working native index; unsupported, damaged, or partial
+records produce an explicit error rather than a fabricated transcript.
+
+In the Rust bridge, Desktop-owned Codex chats initially load their latest three
+exchanges, including prompts and replies, or all available exchanges in a shorter
+chat. Work details remain collapsed. A running response also includes its recent
+live activity. Each new swipe toward older history or tap on **Load earlier messages**
+loads one earlier exchange. Receiving a page or a live update does not automatically
+request another page. Already loaded messages are reused when scrolling back.
+Network delays keep the existing conversation visible with a loading indicator.
+Other chat connections retain their own bounded history windows.
+
+Opening an existing Codex chat includes compact saved tool summaries and progress
+logs for its recent responses, including the running response, in native order.
+The opening Work display has a 160 KiB / 96-row budget, including rows already
+in the recent window. Small responses open complete; long responses start with
+their newest cached activity, and the Android app prepares the remaining Work
+after that first display. Background Work pages also send compact tool previews,
+keeping full command contents available through Details. A single large message
+is kept intact. The agent's
+working state retains its smaller window. Complete native Work scans remain
+complete across summary refreshes. Uncached activity still loads from Codex's
+paged history, and oversized responses remain pageable. Full command/output
+details and image bytes are fetched only when opened. Older conversation pages
+remain separate and load on request.
+
+Expand Work to inspect its entries. Uncached historical entries load in bounded pages. Desktop-owned Codex
+activity links remain tied to their original response when new turns arrive.
+Long Work sections
 include a **Load more work** action. Steering messages and answered questions
 from a finished turn are included in Work. The original prompt and final answer
-remain outside the fold, and unanswered questions stay visible. Resolving a question updates
+remain outside the fold, and unanswered questions stay visible. Codex questions offer
+**Skip** beside **Submit** (or **Next** for a group of questions). Skip leaves that
+question unanswered and advances through any remaining questions. Once the group is
+resolved, its answer controls disappear and remain dismissed after reconnecting.
+Blocking Codex CLI questions receive an empty answer list for skipped questions;
+Asynchronous Codex questions are dismissed in Remodex without sending a prompt
+or changing the running task. Skip never approves a tool action. Resolving a question updates
 its activity without replacing the loaded chat. Once delivery succeeds, the
 thread list and Android notification clear **User input needed** immediately,
 unless another question remains unanswered. Failed delivery keeps the question
 pending so you can retry.
+
+Asynchronous questions in chats created from Remodex use that chat's own Codex
+connection, including after the task finishes or the Windows server restarts.
+Submit continues the same chat, or sends the answer to its current running task.
+Questions from Codex Desktop chats still require their original Desktop connection.
 
 ### Recovering a chat after an interruption
 
@@ -177,6 +474,16 @@ checklist. Complete it on each PC where you want to use local Claude Code sessio
 
 For a chat started on Android, select Claude Code, the paired PC and a project
 folder, then send a message. Its shared session appears in Desktop's **Code** tab.
+The selected folder is the chat's working directory; ordinary folders do not
+need Git. Selecting an existing checkout reuses it without creating a worktree,
+switching branches, or running setup scripts. A stale branch selection requires
+refreshing the project picker. Use the isolated-worktree action when you want a
+separate checkout.
+Projects already registered on the PC can be outside its default project folder,
+including another drive or mounted volume. New chats use the saved project path;
+they do not fall back to the home folder or recreate an unavailable drive folder.
+If that location is unavailable, reconnect the drive or select another project,
+then retry the unsent prompt.
 For a chat started in Desktop, create a local Code session on that PC. Once
 Remote Control connects, open the same chat under Claude Code on Android.
 Connected sessions synchronize prompts, replies, tools, approvals and Stop.
@@ -266,6 +573,8 @@ Claude using its native priority input. Steer keeps the same session and convers
 Claude may interrupt its response or move a running tool into the background.
 Some foreground tools must finish before Claude can process a steering message.
 Use Queue when the original task should finish before the next prompt is sent.
+When Desktop sync is off, Remodex waits for the previous Claude worker to finish
+closing before starting the queued prompt in the same saved conversation.
 Queued messages have an actions menu to edit, move, cancel, or **Steer instead**.
 The queue holds up to 32 follow-ups on the paired PC, including any staged attachments.
 
@@ -358,6 +667,48 @@ any needed work. No automatic cleanup discards files or branches.
 
 ### Optional Claude Desktop sync
 
+The Rust bridge also has a local-session path under qualification. It discovers saved
+Claude Code conversations in the configured PC profile and imports their history in
+pages. Ordinary Claude website, Android, and Desktop Chat-tab conversations are not
+part of this catalog. Sending to a closed local session resumes its original native
+session ID without enabling Remote Control or forking its history.
+
+Stopping a local Claude task retains its prompt and work under the same turn and
+shows the stopped status. Claude's verified internal interruption markers and
+synthetic “No response requested” placeholders are not displayed as chat bubbles.
+Older imported copies are reconciled in pages without modifying Claude's original
+transcript. Actual user messages and provider error messages remain visible.
+
+For a session still open on the PC, the Linux and Windows prototypes use Claude's
+authenticated local peer inbox (a named pipe on Windows). Tap Send to queue;
+long-press Send to choose Queue or Steer. These
+are peer messages: Claude's inbound rules can hold or refuse them, existing direct
+instructions retain their authority, and permission dialogs still need a response
+on the PC. A socket write alone is not reported as confirmed delivery. This is not
+equivalent to direct human steering in the original terminal. Windows delivery has
+been checked with Claude Code 2.1.302; macOS remains unqualified. Existing Remote Control attachments
+retain their original transport.
+
+Release Send after holding it to select Queue or Steer. A slow local inbox
+acknowledgement remains pending while the original Claude process is alive; a
+30-second delay alone is not reported as failure. Remodex does not resend the
+message automatically. If Claude exits without confirming it, the delivery notice
+explains that its status is unconfirmed after saved history finishes loading.
+
+The Android list distinguishes confirmed **Completed**, **Stopped**, and **Failed**
+results from connection conditions such as **Reconnecting**, **Disconnected**,
+**Sign-in required**, **Verification required**, and **Folder unavailable**. A saved
+result can remain visible while offline; the status panel explains that it is saved
+and shows the connection issue. An owner waiting for PC input is **Paused**.
+
+Older shared chats also use the readable local transcript's last outcome when
+their sharing link is unavailable: **Completed**, **Paused**, or **Failed**. An
+unfinished transcript is labeled **Saved chat**, not Running. This evidence is
+read with a bounded tail scan and does not replace the original connection,
+resume another Claude process, or grant Send/Stop access. A newer prompt or a
+verified active owner takes precedence. An unverified Claude connection no longer
+shows a Stop button; its composer points to the connection details in Status.
+
 Enable **Sync with Claude Desktop (preview)** in **Agents → Claude Code**
 before starting a task. Open the task in Claude Desktop's **Code** tab using the
 same Claude account. Remodex remains the local session owner; Desktop connects
@@ -376,14 +727,21 @@ requires an eligible Claude subscription, network connectivity and a running PC.
 Sharing a session sends its conversation through Claude's Remote Control service.
 If sharing fails, its status is disconnected; ordinary Remodex access can continue.
 
-The preview keeps at most four workers. When a new or reopened managed chat needs
-a slot, Remodex parks the least recently used idle worker automatically. Its
+The Rust bridge keeps up to eight shared Claude connections, separately from
+the active-task budget (four by default). These are Remodex resource limits,
+not Claude account limits or a limit on saved chats. When a new prompt or an
+explicit reconnect needs a connection, Remodex releases an eligible idle
+connection automatically, preferring an observer socket before the least
+recently used managed worker. Its
 history and both session identities are retained; no archival is required. A
-parked chat temporarily shows disconnected in Desktop. Reopen it in Android or
-send a prompt there to reattach the original shared session. Running tasks and
-pending approvals are never selected for parking. If all four workers are
-running, finish or stop one before starting another. A Remodex restart reconnects previously
-shared tasks that were not deliberately paused or archived, using their original
+released managed chat temporarily shows disconnected in Desktop. Send a prompt
+there from Android or use Retry to reattach the original shared session. Reading
+saved history does not require a connection slot. Running tasks, background
+tasks, queued messages, and pending approvals or controls are protected. If
+every slot has active or pending work, wait for one to finish. Deliberately
+released connections stay dormant across restart so they cannot fill the pool
+again before a new chat starts. A Remodex restart reconnects other previously
+shared tasks that were not archived, using their original
 identities without replaying an accepted prompt or approval. An interrupted tool is not automatically rerun.
 Changes to sharing or the CLI path require running Claude tasks to finish first.
 
@@ -416,7 +774,7 @@ If creating the link fails after the copy, retry uses that copy instead of makin
 another one. No prompt or tool is automatically replayed. The dashboard's
 connected count includes only successfully shared workers.
 
-This integration pins Agent SDK 0.3.296 and guards its experimental Remote Control
+This integration pins Agent SDK 0.3.318 and guards its experimental Remote Control
 method at runtime. If that method is unavailable, or the original shared identity
 cannot be reattached, it reports an error rather than modifying Desktop or silently
 creating a replacement conversation. Linux has live device coverage; Windows and
@@ -500,6 +858,48 @@ readings are not shown as zero or as a connection failure; the panel directs use
 to Claude's Usage settings when subscription figures are unavailable.
 
 
+### Claude tools and local delivery
+
+The Rust bridge launches ordinary managed and resumed Claude chats with Claude's
+native default tools and normal user, project, and managed settings. Configured
+MCP servers, plugins, hooks, and permission rules can therefore participate as they
+do in the CLI. Remodex's per-chat permission selection still applies, and session
+permission grants do not rewrite the PC's settings files. Metadata-only capability
+checks disable hooks and send no model prompt. For explicitly isolated test
+profiles, set `claude.tools.settings_mode` to `"isolated"` in the native bridge
+configuration to retain restricted tools and isolated settings.
+
+The Android command catalog retains native command types, aliases, and argument
+hints. Built-in terminal controls are kept separate from prompt-backed skills;
+Android handles model, effort, permissions, Plan mode, status, context, usage,
+MCP, plugins, skills, reloads, branching, tracked-file restore, diff, copy and help
+as explicit controls. `/compact [instructions]` goes to Claude's native command
+handler only when the CLI advertises it, while idle; saved history is retained.
+`/clear` and other controls without an Android action explain how to use the PC
+instead of accidentally resetting or submitting a model prompt. `/rewind` opens
+the file-restore preview and keeps conversation history.
+
+Claude's **Auto** permission option maps to the native classifier mode, separately
+from Accept edits, Full access, and the reasoning picker's Auto. Native account,
+model and administrator restrictions still apply; refusals are surfaced and never
+fall back to bypassing permissions. A connection that reports MCP tool names without its
+connection state is labelled accordingly. Missing plugin metadata is not evidence
+that plugins are disabled.
+
+For a session owned by another local Claude process, Queue and Steer use its
+authenticated peer inbox without starting a second writer or enabling Remote
+Control. The original session's inbound-message policy and permissions apply.
+Receipt listeners remain open while delivery is pending, including held messages,
+until the original process exits, delivery is recorded, or Claude rejects the
+message. Pending offers persist their callback address and original process
+identity. On bridge restart, receipt listeners are restored without sending the
+prompt again. A dead or replaced owner cannot acknowledge the old offer. A receipt
+sent while the bridge was offline may be unavailable; native transcript evidence
+can still confirm delivery, otherwise its state remains unconfirmed. Uncertain
+delivery is never automatically retried. Native Windows uses
+local named pipes with process and user identity checks; Windows runtime
+qualification remains pending. Linux uses private Unix sockets.
+
 ### Claude activity details and images
 
 Claude Code activity rows show a shortened command or tool invocation. Tap the row
@@ -516,6 +916,35 @@ bounded references sent in the chat stream. Tap **View Images** to fetch small
 previews, then tap a preview for the full image. Each preview is authorized for
 its original chat. Remote image URLs and arbitrary paths in tool output are not
 fetched. Existing tool results that contained no image data cannot gain a preview
-retroactively. Codex's activity presentation is unchanged.
+retroactively. Tool-image decoding is bounded to eight images and 8 MiB per result;
+unsupported formats, invalid image data, and exceeded decoding limits produce an
+explanation alongside the activity while retaining available images. A live Claude
+event exceeding the 8 MiB event boundary reports that boundary explicitly; share
+large results as files. These limits protect memory and are separate from the
+Android upload limits below. Codex's activity presentation is unchanged.
 If an image fails to download, **Retry** refreshes its authorization and makes one
 new full-image request. It does not fetch the old and refreshed images in parallel.
+
+### Uploading attachments from Android
+
+The native Rust bridge accepts up to eight attachments per message, up to
+100 MiB per file and 250 MiB combined, for Codex and Claude Code. The Android
+composer starts transferring a selected file immediately in 512 KiB chunks.
+Each card shows confirmed transfer progress, verification, and readiness.
+Temporary connection failures resume from the PC's saved offset; a failed
+transfer offers Retry and Remove. Sending during an upload waits locally for
+all attachments, with a Cancel action that preserves the draft.
+If Android terminates the app before sending, select unsent attachments again;
+the saved composer draft retains prompt text, not attachment selections.
+
+These are phone-to-PC transfer limits, not model input limits. Originals stay
+on the PC. Large images use bounded previews for inline model input when
+possible; files outside the preview budget are supplied as local paths for
+the agent's file tools. Temporary uploads expire after 24 hours. Existing
+conversation attachments are preserved, and the bridge's disk quota still
+applies. Updating both the Android app and native bridge is required for
+resumable uploads; legacy inline requests retain their smaller limits.
+
+Saved photo previews use the attachment recorded in that chat, including Windows
+paths. They remain available after reconnecting or restarting the bridge; an
+attachment in another chat does not grant access to its private upload folder.
